@@ -66,7 +66,7 @@ public class TestHelper {
 
   public void setTable(Table table) {
     this.table = table;
-    conf.set(InputFormatConfig.TABLE_SCHEMA, SchemaParser.toJson(table.schema()));
+    conf.set(HiveSerDeConfig.TABLE_SCHEMA, SchemaParser.toJson(table.schema()));
   }
 
   public Table table() {

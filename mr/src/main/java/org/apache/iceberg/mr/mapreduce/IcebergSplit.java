@@ -27,7 +27,7 @@ import org.apache.hadoop.mapreduce.InputSplit;
 import org.apache.iceberg.CombinedScanTask;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.hadoop.Util;
-import org.apache.iceberg.mr.InputFormatConfig;
+import org.apache.iceberg.mr.HiveSerDeConfig;
 import org.apache.iceberg.mr.SerializationUtil;
 
 // Since this class extends `mapreduce.InputSplit and implements `mapred.InputSplit`, it can be returned by both MR v1
@@ -67,7 +67,7 @@ public class IcebergSplit extends InputSplit implements org.apache.hadoop.mapred
   @Override
   public String[] getLocations() {
     if (locations == null) {
-      boolean localityPreferred = conf.getBoolean(InputFormatConfig.LOCALITY, false);
+      boolean localityPreferred = conf.getBoolean(HiveSerDeConfig.LOCALITY, false);
       locations = localityPreferred ? Util.blockLocations(task, conf) : ANYWHERE;
     }
 

@@ -25,9 +25,9 @@ import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.expressions.Expression;
 
-public class InputFormatConfig {
+public final class HiveSerDeConfig {
 
-  private InputFormatConfig() {
+  private HiveSerDeConfig() {
   }
 
   // configuration values for Iceberg input formats
@@ -47,6 +47,7 @@ public class InputFormatConfig {
   public static final String CATALOG = "iceberg.mr.catalog";
   public static final String HADOOP_CATALOG_WAREHOUSE_LOCATION = "iceberg.mr.catalog.hadoop.warehouse.location";
   public static final String CATALOG_LOADER_CLASS = "iceberg.mr.catalog.loader.class";
+  public static final String WRITE_FILE_FORMAT = "iceberg.mr.write.file.format";
 
   public static final String CATALOG_NAME = "iceberg.catalog";
   public static final String HADOOP_CATALOG = "hadoop.catalog";
@@ -104,12 +105,12 @@ public class InputFormatConfig {
     }
 
     public ConfigBuilder reuseContainers(boolean reuse) {
-      conf.setBoolean(InputFormatConfig.REUSE_CONTAINERS, reuse);
+      conf.setBoolean(HiveSerDeConfig.REUSE_CONTAINERS, reuse);
       return this;
     }
 
     public ConfigBuilder caseSensitive(boolean caseSensitive) {
-      conf.setBoolean(InputFormatConfig.CASE_SENSITIVE, caseSensitive);
+      conf.setBoolean(HiveSerDeConfig.CASE_SENSITIVE, caseSensitive);
       return this;
     }
 
@@ -158,7 +159,7 @@ public class InputFormatConfig {
      * in filter is not completely satisfied.
      */
     public ConfigBuilder skipResidualFiltering() {
-      conf.setBoolean(InputFormatConfig.SKIP_RESIDUAL_FILTERING, true);
+      conf.setBoolean(HiveSerDeConfig.SKIP_RESIDUAL_FILTERING, true);
       return this;
     }
   }
