@@ -35,7 +35,7 @@ import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.hadoop.HadoopCatalog;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.hive.HiveCatalogs;
-import org.apache.iceberg.mr.InputFormatConfig;
+import org.apache.iceberg.mr.HiveSerDeConfig;
 import org.apache.iceberg.mr.TestCatalogs;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ObjectArrays;
@@ -112,7 +112,7 @@ abstract class TestTables {
     @Override
     public Map<String, String> properties() {
       return ImmutableMap.of(
-              InputFormatConfig.CATALOG_LOADER_CLASS, TestCatalogs.CustomHadoopCatalogLoader.class.getName(),
+              HiveSerDeConfig.CATALOG_LOADER_CLASS, TestCatalogs.CustomHadoopCatalogLoader.class.getName(),
               TestCatalogs.CustomHadoopCatalog.WAREHOUSE_LOCATION, warehouseLocation
       );
     }
@@ -134,8 +134,8 @@ abstract class TestTables {
     @Override
     public Map<String, String> properties() {
       return ImmutableMap.of(
-              InputFormatConfig.CATALOG, "hadoop",
-              InputFormatConfig.HADOOP_CATALOG_WAREHOUSE_LOCATION, warehouseLocation
+              HiveSerDeConfig.CATALOG, "hadoop",
+              HiveSerDeConfig.HADOOP_CATALOG_WAREHOUSE_LOCATION, warehouseLocation
       );
     }
   }
@@ -170,7 +170,7 @@ abstract class TestTables {
 
     @Override
     public Map<String, String> properties() {
-      return ImmutableMap.of(InputFormatConfig.CATALOG, "hive");
+      return ImmutableMap.of(HiveSerDeConfig.CATALOG, "hive");
     }
   }
 }

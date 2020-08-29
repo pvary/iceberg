@@ -63,7 +63,7 @@ public class TestCatalogs {
     HadoopTables tables = new HadoopTables();
     Table hadoopTable = tables.create(SCHEMA, temp.newFolder("hadoop_tables").toString());
 
-    conf.set(InputFormatConfig.TABLE_LOCATION, hadoopTable.location());
+    conf.set(HiveSerDeConfig.TABLE_LOCATION, hadoopTable.location());
 
     Assert.assertEquals(hadoopTable.location(), Catalogs.loadTable(conf).location());
   }
@@ -71,7 +71,7 @@ public class TestCatalogs {
   @Test
   public void testLoadTableFromCatalog() throws IOException {
     conf.set("warehouse.location", temp.newFolder("hadoop", "warehouse").toString());
-    conf.setClass(InputFormatConfig.CATALOG_LOADER_CLASS, CustomHadoopCatalogLoader.class, CatalogLoader.class);
+    conf.setClass(HiveSerDeConfig.CATALOG_LOADER_CLASS, CustomHadoopCatalogLoader.class, CatalogLoader.class);
 
     AssertHelpers.assertThrows(
             "Should complain about table identifier not set", IllegalArgumentException.class,
@@ -80,7 +80,7 @@ public class TestCatalogs {
     HadoopCatalog catalog = new CustomHadoopCatalog(conf);
     Table hadoopCatalogTable = catalog.createTable(TableIdentifier.of("table"), SCHEMA);
 
-    conf.set(InputFormatConfig.TABLE_IDENTIFIER, "table");
+    conf.set(HiveSerDeConfig.TABLE_IDENTIFIER, "table");
 
     Assert.assertEquals(hadoopCatalogTable.location(), Catalogs.loadTable(conf).location());
   }
@@ -89,25 +89,25 @@ public class TestCatalogs {
   public void testLoadCatalog() throws IOException {
     Assert.assertFalse(Catalogs.loadCatalog(conf).isPresent());
 
-    conf.set(InputFormatConfig.CATALOG, "foo");
+    conf.set(HiveSerDeConfig.CATALOG, "foo");
     AssertHelpers.assertThrows(
             "Should complain about catalog not supported", NoSuchNamespaceException.class,
             "is not supported", () -> Catalogs.loadCatalog(conf));
 
-    conf.set(InputFormatConfig.CATALOG, "hadoop");
+    conf.set(HiveSerDeConfig.CATALOG, "hadoop");
     Optional<Catalog> hadoopCatalog = Catalogs.loadCatalog(conf);
 
     Assert.assertTrue(hadoopCatalog.isPresent());
     Assert.assertTrue(hadoopCatalog.get() instanceof HadoopCatalog);
 
-    conf.set(InputFormatConfig.CATALOG, "hive");
+    conf.set(HiveSerDeConfig.CATALOG, "hive");
     Optional<Catalog> hiveCatalog = Catalogs.loadCatalog(conf);
 
     Assert.assertTrue(hiveCatalog.isPresent());
     Assert.assertTrue(hiveCatalog.get() instanceof HiveCatalog);
 
     conf.set("warehouse.location", temp.newFolder("hadoop", "warehouse").toString());
-    conf.setClass(InputFormatConfig.CATALOG_LOADER_CLASS, CustomHadoopCatalogLoader.class, CatalogLoader.class);
+    conf.setClass(HiveSerDeConfig.CATALOG_LOADER_CLASS, CustomHadoopCatalogLoader.class, CatalogLoader.class);
     Optional<Catalog> customHadoopCatalog = Catalogs.loadCatalog(conf);
 
     Assert.assertTrue(customHadoopCatalog.isPresent());

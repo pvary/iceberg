@@ -94,7 +94,7 @@ public class TestIcebergInputFormats {
   // before variables
   private Configuration conf;
   private TestHelper helper;
-  private InputFormatConfig.ConfigBuilder builder;
+  private HiveSerDeConfig.ConfigBuilder builder;
 
   // parametrized variables
   private final TestInputFormat.Factory<Record> testInputFormat;
@@ -109,7 +109,7 @@ public class TestIcebergInputFormats {
     Assert.assertTrue(location.delete());
 
     helper = new TestHelper(conf, tables, location.toString(), SCHEMA, SPEC, fileFormat, temp);
-    builder = new InputFormatConfig.ConfigBuilder(conf).readFrom(location.toString());
+    builder = new HiveSerDeConfig.ConfigBuilder(conf).readFrom(location.toString());
   }
 
   @Parameterized.Parameters
