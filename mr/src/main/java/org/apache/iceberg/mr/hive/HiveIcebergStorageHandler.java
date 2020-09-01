@@ -38,7 +38,7 @@ import org.apache.hadoop.mapred.OutputFormat;
 import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.mr.Catalogs;
-import org.apache.iceberg.mr.HiveSerDeConfig;
+import org.apache.iceberg.mr.InputFormatConfig;
 
 public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, HiveStorageHandler {
 
@@ -76,9 +76,9 @@ public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, H
     Properties props = tableDesc.getProperties();
     Table table = Catalogs.loadTable(conf, props);
 
-    map.put(HiveSerDeConfig.TABLE_IDENTIFIER, props.getProperty(NAME));
-    map.put(HiveSerDeConfig.TABLE_LOCATION, table.location());
-    map.put(HiveSerDeConfig.TABLE_SCHEMA, SchemaParser.toJson(table.schema()));
+    map.put(InputFormatConfig.TABLE_IDENTIFIER, props.getProperty(NAME));
+    map.put(InputFormatConfig.TABLE_LOCATION, table.location());
+    map.put(InputFormatConfig.TABLE_SCHEMA, SchemaParser.toJson(table.schema()));
   }
 
   @Override

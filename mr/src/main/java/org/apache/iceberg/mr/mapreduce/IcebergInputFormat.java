@@ -58,7 +58,7 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.mr.Catalogs;
-import org.apache.iceberg.mr.HiveSerDeConfig;
+import org.apache.iceberg.mr.InputFormatConfig;
 import org.apache.iceberg.mr.SerializationUtil;
 import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
@@ -81,9 +81,9 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
    *
    * @param job the {@code Job} to configure
    */
-  public static HiveSerDeConfig.ConfigBuilder configure(Job job) {
+  public static InputFormatConfig.ConfigBuilder configure(Job job) {
     job.setInputFormatClass(IcebergInputFormat.class);
-    return new HiveSerDeConfig.ConfigBuilder(job.getConfiguration());
+    return new InputFormatConfig.ConfigBuilder(job.getConfiguration());
   }
 
   @Override
@@ -91,38 +91,38 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
     Configuration conf = context.getConfiguration();
     Table table = Catalogs.loadTable(conf);
     TableScan scan = table.newScan()
-            .caseSensitive(conf.getBoolean(HiveSerDeConfig.CASE_SENSITIVE, true));
-    long snapshotId = conf.getLong(HiveSerDeConfig.SNAPSHOT_ID, -1);
+            .caseSensitive(conf.getBoolean(InputFormatConfig.CASE_SENSITIVE, true));
+    long snapshotId = conf.getLong(InputFormatConfig.SNAPSHOT_ID, -1);
     if (snapshotId != -1) {
       scan = scan.useSnapshot(snapshotId);
     }
-    long asOfTime = conf.getLong(HiveSerDeConfig.AS_OF_TIMESTAMP, -1);
+    long asOfTime = conf.getLong(InputFormatConfig.AS_OF_TIMESTAMP, -1);
     if (asOfTime != -1) {
       scan = scan.asOfTime(asOfTime);
     }
-    long splitSize = conf.getLong(HiveSerDeConfig.SPLIT_SIZE, 0);
+    long splitSize = conf.getLong(InputFormatConfig.SPLIT_SIZE, 0);
     if (splitSize > 0) {
       scan = scan.option(TableProperties.SPLIT_SIZE, String.valueOf(splitSize));
     }
-    String schemaStr = conf.get(HiveSerDeConfig.READ_SCHEMA);
+    String schemaStr = conf.get(InputFormatConfig.READ_SCHEMA);
     if (schemaStr != null) {
       scan.project(SchemaParser.fromJson(schemaStr));
     }
 
     // TODO add a filter parser to get rid of Serialization
-    Expression filter = SerializationUtil.deserializeFromBase64(conf.get(HiveSerDeConfig.FILTER_EXPRESSION));
+    Expression filter = SerializationUtil.deserializeFromBase64(conf.get(InputFormatConfig.FILTER_EXPRESSION));
     if (filter != null) {
       scan = scan.filter(filter);
     }
 
     List<InputSplit> splits = Lists.newArrayList();
-    boolean applyResidual = !conf.getBoolean(HiveSerDeConfig.SKIP_RESIDUAL_FILTERING, false);
-    HiveSerDeConfig.InMemoryDataModel model = conf.getEnum(HiveSerDeConfig.IN_MEMORY_DATA_MODEL,
-        HiveSerDeConfig.InMemoryDataModel.GENERIC);
+    boolean applyResidual = !conf.getBoolean(InputFormatConfig.SKIP_RESIDUAL_FILTERING, false);
+    InputFormatConfig.InMemoryDataModel model = conf.getEnum(InputFormatConfig.IN_MEMORY_DATA_MODEL,
+        InputFormatConfig.InMemoryDataModel.GENERIC);
     try (CloseableIterable<CombinedScanTask> tasksIterable = scan.planTasks()) {
       tasksIterable.forEach(task -> {
-        if (applyResidual && (model == HiveSerDeConfig.InMemoryDataModel.HIVE ||
-            model == HiveSerDeConfig.InMemoryDataModel.PIG)) {
+        if (applyResidual && (model == InputFormatConfig.InMemoryDataModel.HIVE ||
+            model == InputFormatConfig.InMemoryDataModel.PIG)) {
           // TODO: We do not support residual evaluation for HIVE and PIG in memory data model yet
           checkResiduals(task);
         }
@@ -158,7 +158,7 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
     private Schema expectedSchema;
     private boolean reuseContainers;
     private boolean caseSensitive;
-    private HiveSerDeConfig.InMemoryDataModel inMemoryDataModel;
+    private InputFormatConfig.InMemoryDataModel inMemoryDataModel;
     private Iterator<FileScanTask> tasks;
     private T currentRow;
     private CloseableIterator<T> currentIterator;
@@ -170,13 +170,13 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
       CombinedScanTask task = ((IcebergSplit) split).task();
       this.context = newContext;
       this.tasks = task.files().iterator();
-      this.tableSchema = SchemaParser.fromJson(conf.get(HiveSerDeConfig.TABLE_SCHEMA));
-      String readSchemaStr = conf.get(HiveSerDeConfig.READ_SCHEMA);
+      this.tableSchema = SchemaParser.fromJson(conf.get(InputFormatConfig.TABLE_SCHEMA));
+      String readSchemaStr = conf.get(InputFormatConfig.READ_SCHEMA);
       this.expectedSchema = readSchemaStr != null ? SchemaParser.fromJson(readSchemaStr) : tableSchema;
-      this.reuseContainers = conf.getBoolean(HiveSerDeConfig.REUSE_CONTAINERS, false);
-      this.caseSensitive = conf.getBoolean(HiveSerDeConfig.CASE_SENSITIVE, true);
-      this.inMemoryDataModel = conf.getEnum(HiveSerDeConfig.IN_MEMORY_DATA_MODEL,
-              HiveSerDeConfig.InMemoryDataModel.GENERIC);
+      this.reuseContainers = conf.getBoolean(InputFormatConfig.REUSE_CONTAINERS, false);
+      this.caseSensitive = conf.getBoolean(InputFormatConfig.CASE_SENSITIVE, true);
+      this.inMemoryDataModel = conf.getEnum(InputFormatConfig.IN_MEMORY_DATA_MODEL,
+              InputFormatConfig.InMemoryDataModel.GENERIC);
       this.currentIterator = open(tasks.next(), expectedSchema).iterator();
     }
 
@@ -247,7 +247,7 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
 
     private CloseableIterable<T> applyResidualFiltering(CloseableIterable<T> iter, Expression residual,
                                                         Schema readSchema) {
-      boolean applyResidual = !context.getConfiguration().getBoolean(HiveSerDeConfig.SKIP_RESIDUAL_FILTERING, false);
+      boolean applyResidual = !context.getConfiguration().getBoolean(InputFormatConfig.SKIP_RESIDUAL_FILTERING, false);
 
       if (applyResidual && residual != null && residual != Expressions.alwaysTrue()) {
         Evaluator filter = new Evaluator(readSchema.asStruct(), residual, caseSensitive);

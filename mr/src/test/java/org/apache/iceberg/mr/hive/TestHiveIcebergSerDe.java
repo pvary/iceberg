@@ -50,7 +50,7 @@ import org.apache.iceberg.Table;
 import org.apache.iceberg.data.RandomGenericData;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.hadoop.HadoopTables;
-import org.apache.iceberg.mr.HiveSerDeConfig;
+import org.apache.iceberg.mr.InputFormatConfig;
 import org.apache.iceberg.mr.TestHelper;
 import org.apache.iceberg.mr.hive.serde.objectinspector.IcebergObjectInspector;
 import org.apache.iceberg.mr.mapred.Container;
@@ -159,8 +159,8 @@ public class TestHiveIcebergSerDe {
   private Properties createUnpartitionedTable() {
     Table table = helper.createUnpartitionedTable();
     Properties props = new Properties();
-    props.put(HiveSerDeConfig.WRITE_FILE_FORMAT, FileFormat.ORC);
-    props.put(HiveSerDeConfig.TABLE_LOCATION, table.location());
+    props.put(InputFormatConfig.WRITE_FILE_FORMAT, FileFormat.ORC);
+    props.put(InputFormatConfig.TABLE_LOCATION, table.location());
     props.put("location", table.location());
     props.put(HiveConf.ConfVars.HIVEQUERYID.varname, "TestQuery_ORC");
     return props;

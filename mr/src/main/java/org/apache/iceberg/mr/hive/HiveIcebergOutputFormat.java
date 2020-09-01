@@ -52,7 +52,7 @@ import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.mr.Catalogs;
-import org.apache.iceberg.mr.HiveSerDeConfig;
+import org.apache.iceberg.mr.InputFormatConfig;
 import org.apache.iceberg.mr.mapreduce.IcebergWritable;
 import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
@@ -125,7 +125,7 @@ public class HiveIcebergOutputFormat extends OutputFormat<NullWritable, IcebergW
     private final FileFormat fileFormat;
 
     IcebergRecordWriter() throws IOException {
-      this.fileFormat = FileFormat.valueOf(overlayedConf.get(HiveSerDeConfig.WRITE_FILE_FORMAT).toUpperCase());
+      this.fileFormat = FileFormat.valueOf(overlayedConf.get(InputFormatConfig.WRITE_FILE_FORMAT).toUpperCase());
 
       String queryId = overlayedConf.get(HiveConf.ConfVars.HIVEQUERYID.varname);
       this.location = table.location() + "/" + queryId + UUID.randomUUID();

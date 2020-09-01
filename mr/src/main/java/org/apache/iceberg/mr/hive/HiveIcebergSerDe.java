@@ -59,14 +59,14 @@ import org.apache.iceberg.types.Types;
 
 public class HiveIcebergSerDe extends AbstractSerDe {
   private Table table;
-  private ObjectInspector objectInspector;
+  private ObjectInspector inspector;
 
   @Override
   public void initialize(@Nullable Configuration configuration, Properties serDeProperties) throws SerDeException {
     this.table = Catalogs.loadTable(configuration, serDeProperties);
 
     try {
-      this.objectInspector = IcebergObjectInspector.create(table.schema());
+      this.inspector = IcebergObjectInspector.create(table.schema());
     } catch (Exception e) {
       throw new SerDeException(e);
     }
@@ -94,35 +94,35 @@ public class HiveIcebergSerDe extends AbstractSerDe {
         record.setField(table.schema().findColumnName(i), null);
       } else {
         Type type = table.schema().columns().get(i).type();
-        ObjectInspector inspector = field.getFieldObjectInspector();
+        ObjectInspector fieldInspector = field.getFieldObjectInspector();
         switch (type.typeId()) {
           case BOOLEAN:
-            boolean boolVal = ((BooleanObjectInspector) inspector).get(value);
+            boolean boolVal = ((BooleanObjectInspector) fieldInspector).get(value);
             record.set(i, boolVal);
             break;
           case INTEGER:
-            int intVal = ((IntObjectInspector) inspector).get(value);
+            int intVal = ((IntObjectInspector) fieldInspector).get(value);
             record.set(i, intVal);
             break;
           case LONG:
-            long longVal = ((LongObjectInspector) inspector).get(value);
+            long longVal = ((LongObjectInspector) fieldInspector).get(value);
             record.set(i, longVal);
             break;
           case FLOAT:
-            float floatVal = ((FloatObjectInspector) inspector).get(value);
+            float floatVal = ((FloatObjectInspector) fieldInspector).get(value);
             record.set(i, floatVal);
             break;
           case DOUBLE:
-            double doubleVal = ((DoubleObjectInspector) inspector).get(value);
+            double doubleVal = ((DoubleObjectInspector) fieldInspector).get(value);
             record.set(i, doubleVal);
             break;
           case DATE:
-            Date dateVal = ((DateObjectInspector) inspector).getPrimitiveJavaObject(value);
+            Date dateVal = ((DateObjectInspector) fieldInspector).getPrimitiveJavaObject(value);
             record.set(i, dateVal.toLocalDate());
             break;
           case TIMESTAMP:
             // TODO: handle timezone in Hive 3.x where Hive type also has TZ
-            java.sql.Timestamp timestampVal = ((TimestampObjectInspector) inspector).getPrimitiveJavaObject(value);
+            java.sql.Timestamp timestampVal = ((TimestampObjectInspector) fieldInspector).getPrimitiveJavaObject(value);
             Types.TimestampType timestampType = (Types.TimestampType) table.schema().columns().get(i).type();
             if (timestampType.shouldAdjustToUTC()) {
               record.set(i, OffsetDateTime.ofInstant(timestampVal.toInstant(), ZoneId.of("UTC")));
@@ -131,25 +131,25 @@ public class HiveIcebergSerDe extends AbstractSerDe {
             }
             break;
           case STRING:
-            String stringVal = ((StringObjectInspector) inspector).getPrimitiveJavaObject(value);
+            String stringVal = ((StringObjectInspector) fieldInspector).getPrimitiveJavaObject(value);
             record.set(i, stringVal);
             break;
           case UUID:
-            String stringUuidVal = ((StringObjectInspector) inspector).getPrimitiveJavaObject(value);
+            String stringUuidVal = ((StringObjectInspector) fieldInspector).getPrimitiveJavaObject(value);
             // TODO: This will not work with Parquet. Parquet UUID expect byte[], others are expecting UUID
             record.set(i, UUID.fromString(stringUuidVal));
             break;
           case FIXED:
-            byte[] bytesVal = ((BinaryObjectInspector) inspector).getPrimitiveJavaObject(value);
+            byte[] bytesVal = ((BinaryObjectInspector) fieldInspector).getPrimitiveJavaObject(value);
             record.set(i, bytesVal);
             break;
           case BINARY:
-            byte[] binaryBytesVal = ((BinaryObjectInspector) inspector).getPrimitiveJavaObject(value);
+            byte[] binaryBytesVal = ((BinaryObjectInspector) fieldInspector).getPrimitiveJavaObject(value);
             record.set(i, ByteBuffer.wrap(binaryBytesVal));
             break;
           case DECIMAL:
             BigDecimal decimalVal =
-                ((HiveDecimalObjectInspector) inspector).getPrimitiveJavaObject(value).bigDecimalValue();
+                ((HiveDecimalObjectInspector) fieldInspector).getPrimitiveJavaObject(value).bigDecimalValue();
             record.set(i, decimalVal);
             break;
           case STRUCT:
@@ -176,6 +176,6 @@ public class HiveIcebergSerDe extends AbstractSerDe {
 
   @Override
   public ObjectInspector getObjectInspector() {
-    return objectInspector;
+    return inspector;
   }
 }
