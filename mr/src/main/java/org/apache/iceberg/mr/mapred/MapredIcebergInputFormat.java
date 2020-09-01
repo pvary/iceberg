@@ -35,7 +35,7 @@ import org.apache.hadoop.mapreduce.TaskAttemptID;
 import org.apache.hadoop.mapreduce.task.JobContextImpl;
 import org.apache.hadoop.mapreduce.task.TaskAttemptContextImpl;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.mr.HiveSerDeConfig;
+import org.apache.iceberg.mr.InputFormatConfig;
 import org.apache.iceberg.mr.mapreduce.IcebergSplit;
 import org.apache.iceberg.mr.mapreduce.IcebergSplitContainer;
 
@@ -58,9 +58,9 @@ public class MapredIcebergInputFormat<T> implements InputFormat<Void, Container<
    *
    * @param job the {@code JobConf} to configure
    */
-  public static HiveSerDeConfig.ConfigBuilder configure(JobConf job) {
+  public static InputFormatConfig.ConfigBuilder configure(JobConf job) {
     job.setInputFormat(MapredIcebergInputFormat.class);
-    return new HiveSerDeConfig.ConfigBuilder(job);
+    return new InputFormatConfig.ConfigBuilder(job);
   }
 
   @Override

@@ -32,7 +32,7 @@ import org.apache.iceberg.data.Record;
 import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.mr.Catalogs;
-import org.apache.iceberg.mr.HiveSerDeConfig;
+import org.apache.iceberg.mr.InputFormatConfig;
 import org.apache.iceberg.mr.TestHelper;
 import org.apache.iceberg.mr.hive.HiveIcebergOutputFormat.IcebergRecordWriter;
 import org.apache.iceberg.mr.mapreduce.IcebergWritable;
@@ -82,8 +82,8 @@ public class TestHiveIcebergOutputFormat {
   public void testGoodRow() throws Exception {
     Table table = helper.createUnpartitionedTable();
     Properties props = new Properties();
-    props.put(HiveSerDeConfig.WRITE_FILE_FORMAT, fileFormat.name());
-    props.put(HiveSerDeConfig.TABLE_LOCATION, table.location());
+    props.put(InputFormatConfig.WRITE_FILE_FORMAT, fileFormat.name());
+    props.put(InputFormatConfig.TABLE_LOCATION, table.location());
     props.put("location", table.location());
     props.put(HiveConf.ConfVars.HIVEQUERYID.varname, "TestQuery_" + fileFormat);
 

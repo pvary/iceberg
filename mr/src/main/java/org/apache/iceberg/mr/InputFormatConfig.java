@@ -25,9 +25,9 @@ import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.expressions.Expression;
 
-public final class HiveSerDeConfig {
+public final class InputFormatConfig {
 
-  private HiveSerDeConfig() {
+  private InputFormatConfig() {
   }
 
   // configuration values for Iceberg input formats
@@ -105,12 +105,12 @@ public final class HiveSerDeConfig {
     }
 
     public ConfigBuilder reuseContainers(boolean reuse) {
-      conf.setBoolean(HiveSerDeConfig.REUSE_CONTAINERS, reuse);
+      conf.setBoolean(InputFormatConfig.REUSE_CONTAINERS, reuse);
       return this;
     }
 
     public ConfigBuilder caseSensitive(boolean caseSensitive) {
-      conf.setBoolean(HiveSerDeConfig.CASE_SENSITIVE, caseSensitive);
+      conf.setBoolean(InputFormatConfig.CASE_SENSITIVE, caseSensitive);
       return this;
     }
 
@@ -159,7 +159,7 @@ public final class HiveSerDeConfig {
      * in filter is not completely satisfied.
      */
     public ConfigBuilder skipResidualFiltering() {
-      conf.setBoolean(HiveSerDeConfig.SKIP_RESIDUAL_FILTERING, true);
+      conf.setBoolean(InputFormatConfig.SKIP_RESIDUAL_FILTERING, true);
       return this;
     }
   }

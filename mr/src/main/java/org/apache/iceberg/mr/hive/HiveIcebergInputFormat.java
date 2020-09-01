@@ -33,7 +33,7 @@ import org.apache.hadoop.mapred.InputSplit;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.expressions.Expression;
-import org.apache.iceberg.mr.HiveSerDeConfig;
+import org.apache.iceberg.mr.InputFormatConfig;
 import org.apache.iceberg.mr.SerializationUtil;
 import org.apache.iceberg.mr.mapred.MapredIcebergInputFormat;
 import org.apache.iceberg.mr.mapreduce.IcebergSplit;
@@ -55,13 +55,13 @@ public class HiveIcebergInputFormat extends MapredIcebergInputFormat<Record>
       SearchArgument sarg = ConvertAstToSearchArg.create(job, exprNodeDesc);
       try {
         Expression filter = HiveIcebergFilterFactory.generateFilterExpression(sarg);
-        job.set(HiveSerDeConfig.FILTER_EXPRESSION, SerializationUtil.serializeToBase64(filter));
+        job.set(InputFormatConfig.FILTER_EXPRESSION, SerializationUtil.serializeToBase64(filter));
       } catch (UnsupportedOperationException e) {
         LOG.warn("Unable to create Iceberg filter, continuing without filter (will be applied by Hive later): ", e);
       }
     }
 
-    String location = job.get(HiveSerDeConfig.TABLE_LOCATION);
+    String location = job.get(InputFormatConfig.TABLE_LOCATION);
     return Arrays.stream(super.getSplits(job, numSplits))
                  .map(split -> new HiveIcebergSplit((IcebergSplit) split, location))
                  .toArray(InputSplit[]::new);

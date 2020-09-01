@@ -50,14 +50,14 @@ public final class Catalogs {
   /**
    * Load an Iceberg table using the catalog and table identifier (or table path) specified by the configuration.
    * Catalog resolution happens in this order:
-   * 1. Custom catalog if specified by {@link HiveSerDeConfig#CATALOG_LOADER_CLASS}
-   * 2. Hadoop or Hive catalog if specified by {@link HiveSerDeConfig#CATALOG}
+   * 1. Custom catalog if specified by {@link InputFormatConfig#CATALOG_LOADER_CLASS}
+   * 2. Hadoop or Hive catalog if specified by {@link InputFormatConfig#CATALOG}
    * 3. Hadoop Tables
    * @param conf a Hadoop conf
    * @return an Iceberg table
    */
   public static Table loadTable(Configuration conf) {
-    return loadTable(conf, conf.get(HiveSerDeConfig.TABLE_IDENTIFIER), conf.get(HiveSerDeConfig.TABLE_LOCATION));
+    return loadTable(conf, conf.get(InputFormatConfig.TABLE_IDENTIFIER), conf.get(InputFormatConfig.TABLE_LOCATION));
   }
 
   // For use in HiveIcebergSerDe and HiveIcebergStorageHandler
@@ -79,7 +79,7 @@ public final class Catalogs {
 
   @VisibleForTesting
   static Optional<Catalog> loadCatalog(Configuration conf) {
-    String catalogLoaderClass = conf.get(HiveSerDeConfig.CATALOG_LOADER_CLASS);
+    String catalogLoaderClass = conf.get(InputFormatConfig.CATALOG_LOADER_CLASS);
 
     if (catalogLoaderClass != null) {
       CatalogLoader loader = (CatalogLoader) DynConstructors.builder(CatalogLoader.class)
@@ -91,13 +91,13 @@ public final class Catalogs {
       return Optional.of(catalog);
     }
 
-    String catalogName = conf.get(HiveSerDeConfig.CATALOG);
+    String catalogName = conf.get(InputFormatConfig.CATALOG);
 
     if (catalogName != null) {
       Catalog catalog;
       switch (catalogName.toLowerCase()) {
         case HADOOP:
-          String warehouseLocation = conf.get(HiveSerDeConfig.HADOOP_CATALOG_WAREHOUSE_LOCATION);
+          String warehouseLocation = conf.get(InputFormatConfig.HADOOP_CATALOG_WAREHOUSE_LOCATION);
 
           catalog = (warehouseLocation != null) ? new HadoopCatalog(conf, warehouseLocation) : new HadoopCatalog(conf);
           LOG.info("Loaded Hadoop catalog {}", catalog);
