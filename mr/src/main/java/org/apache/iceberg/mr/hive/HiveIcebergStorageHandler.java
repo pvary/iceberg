@@ -43,6 +43,7 @@ import org.apache.iceberg.mr.InputFormatConfig;
 public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, HiveStorageHandler {
 
   private static final String NAME = "name";
+  private static final String WRITE_KEY = "HiveIcebergStorageHandler_write";
 
   private Configuration conf;
 
@@ -89,6 +90,7 @@ public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, H
     map.put(InputFormatConfig.TABLE_IDENTIFIER, props.getProperty(NAME));
     map.put(InputFormatConfig.TABLE_LOCATION, table.location());
     map.put(InputFormatConfig.TABLE_SCHEMA, SchemaParser.toJson(table.schema()));
+    map.put(WRITE_KEY, "true");
   }
 
   @Override
@@ -98,7 +100,10 @@ public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, H
 
   @Override
   public void configureJobConf(TableDesc tableDesc, JobConf jobConf) {
-    jobConf.set("mapred.output.committer.class", HiveIcebergOutputFormat.IcebergOutputCommitter.class.getName());
+    if (tableDesc != null && tableDesc.getJobProperties() != null &&
+        tableDesc.getJobProperties().get(WRITE_KEY) != null) {
+      jobConf.set("mapred.output.committer.class", HiveIcebergOutputFormat.IcebergOutputCommitter.class.getName());
+    }
   }
 
   @Override
