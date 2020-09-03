@@ -20,27 +20,39 @@
 package org.apache.iceberg.mr.hive;
 
 import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.io.Serializable;
+import java.nio.ByteBuffer;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Properties;
-import java.util.UUID;
+import java.util.Set;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
+import org.apache.hadoop.fs.LocatedFileStatus;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.RemoteIterator;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.hive.ql.exec.FileSinkOperator;
 import org.apache.hadoop.hive.ql.io.HiveOutputFormat;
 import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.io.Writable;
 import org.apache.hadoop.mapred.JobConf;
+import org.apache.hadoop.mapred.JobContext;
+import org.apache.hadoop.mapred.OutputCommitter;
+import org.apache.hadoop.mapred.OutputFormat;
 import org.apache.hadoop.mapred.Reporter;
-import org.apache.hadoop.mapreduce.JobContext;
-import org.apache.hadoop.mapreduce.OutputCommitter;
-import org.apache.hadoop.mapreduce.OutputFormat;
-import org.apache.hadoop.mapreduce.TaskAttemptContext;
+import org.apache.hadoop.mapred.TaskAttemptContext;
 import org.apache.hadoop.util.Progressable;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.Metrics;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
+import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.avro.Avro;
 import org.apache.iceberg.data.Record;
@@ -48,6 +60,7 @@ import org.apache.iceberg.data.avro.DataWriter;
 import org.apache.iceberg.data.orc.GenericOrcWriter;
 import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.hadoop.HadoopFileIO;
+import org.apache.iceberg.hadoop.Util;
 import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.OutputFile;
@@ -57,11 +70,19 @@ import org.apache.iceberg.mr.mapreduce.IcebergWritable;
 import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public class HiveIcebergOutputFormat extends OutputFormat<NullWritable, IcebergWritable>
-    implements HiveOutputFormat<NullWritable, IcebergWritable> {
+public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, IcebergWritable>,
+    HiveOutputFormat<NullWritable, IcebergWritable> {
+
+  private static final Logger LOG = LoggerFactory.getLogger(HiveIcebergOutputFormat.class);
+  private static final String COMMITTED_PREFIX = ".committed";
+
   private Configuration overlayedConf = null;
-  private Table table = null;
+  private String location = null;
+  private FileFormat fileFormat = null;
+  private Schema schema = null;
 
   @Override
   @SuppressWarnings("rawtypes")
@@ -71,7 +92,12 @@ public class HiveIcebergOutputFormat extends OutputFormat<NullWritable, IcebergW
                                                            Progressable progress)
       throws IOException {
     this.overlayedConf = createOverlayedConf(jc, tableAndSerDeProperties);
-    this.table = Catalogs.loadTable(this.overlayedConf, tableAndSerDeProperties);
+    String tableLocation = overlayedConf.get(InputFormatConfig.TABLE_LOCATION);
+    String queryId = overlayedConf.get(HiveConf.ConfVars.HIVEQUERYID.varname);
+    String taskId = overlayedConf.get("mapred.task.id");
+    this.location = tableLocation + "/" + queryId + "/" + taskId;
+    this.fileFormat = FileFormat.valueOf(overlayedConf.get(InputFormatConfig.WRITE_FILE_FORMAT).toUpperCase());
+    this.schema = SchemaParser.fromJson(overlayedConf.get(InputFormatConfig.TABLE_SCHEMA));
     return new IcebergRecordWriter();
   }
 
@@ -95,25 +121,8 @@ public class HiveIcebergOutputFormat extends OutputFormat<NullWritable, IcebergW
   }
 
   @Override
-  public org.apache.hadoop.mapreduce.RecordWriter<NullWritable, IcebergWritable> getRecordWriter(
-      TaskAttemptContext context)
-      throws IOException {
-    return new IcebergRecordWriter();
-  }
-
-  @Override
   public void checkOutputSpecs(FileSystem ignored, JobConf job) {
     // Not doing any check.
-  }
-
-  @Override
-  public void checkOutputSpecs(JobContext context) {
-    // Not doing any check.
-  }
-
-  @Override
-  public OutputCommitter getOutputCommitter(TaskAttemptContext context) {
-    return new IcebergOutputCommitter();
   }
 
   protected class IcebergRecordWriter extends org.apache.hadoop.mapreduce.RecordWriter<NullWritable, IcebergWritable>
@@ -121,22 +130,16 @@ public class HiveIcebergOutputFormat extends OutputFormat<NullWritable, IcebergW
           org.apache.hadoop.mapred.RecordWriter<NullWritable, IcebergWritable> {
 
     private final FileAppender<Record> appender;
-    private final String location;
-    private final FileFormat fileFormat;
+    private final FileIO io;
 
     IcebergRecordWriter() throws IOException {
-      this.fileFormat = FileFormat.valueOf(overlayedConf.get(InputFormatConfig.WRITE_FILE_FORMAT).toUpperCase());
-
-      String queryId = overlayedConf.get(HiveConf.ConfVars.HIVEQUERYID.varname);
-      this.location = table.location() + "/" + queryId + UUID.randomUUID();
-
-      FileIO io = new HadoopFileIO(overlayedConf);
+      io = new HadoopFileIO(overlayedConf);
       OutputFile dataFile = io.newOutputFile(location);
 
       switch (fileFormat) {
         case AVRO:
           this.appender = Avro.write(dataFile)
-              .schema(table.schema())
+              .schema(schema)
               .createWriterFunc(DataWriter::create)
               .named(fileFormat.name())
               .build();
@@ -144,7 +147,7 @@ public class HiveIcebergOutputFormat extends OutputFormat<NullWritable, IcebergW
 
         case PARQUET:
           this.appender = Parquet.write(dataFile)
-              .schema(table.schema())
+              .schema(schema)
               .createWriterFunc(GenericParquetWriter::buildWriter)
               .named(fileFormat.name())
               .build();
@@ -152,7 +155,7 @@ public class HiveIcebergOutputFormat extends OutputFormat<NullWritable, IcebergW
 
         case ORC:
           this.appender = ORC.write(dataFile)
-              .schema(table.schema())
+              .schema(schema)
               .createWriterFunc(GenericOrcWriter::buildWriter)
               .build();
           break;
@@ -160,6 +163,7 @@ public class HiveIcebergOutputFormat extends OutputFormat<NullWritable, IcebergW
         default:
           throw new UnsupportedOperationException("Cannot write format: " + fileFormat);
       }
+      LOG.info("IcebergRecordWriter is created in {} with {}", location, fileFormat);
     }
 
     @Override
@@ -178,20 +182,11 @@ public class HiveIcebergOutputFormat extends OutputFormat<NullWritable, IcebergW
     @Override
     public void close(boolean abort) throws IOException {
       appender.close();
-
-      DataFiles.Builder builder = DataFiles.builder(table.spec())
-          .withPath(location)
-          .withFormat(fileFormat)
-          .withFileSizeInBytes(appender.length())
-          .withMetrics(appender.metrics());
-
-      AppendFiles append = table.newAppend();
-      append = append.appendFile(builder.build());
-      append.commit();
+      createCommittedFileFor(io, location, fileFormat, appender.length(), appender.metrics());
     }
 
     @Override
-    public void close(TaskAttemptContext context) throws IOException {
+    public void close(org.apache.hadoop.mapreduce.TaskAttemptContext context) throws IOException {
       close(false);
     }
 
@@ -204,7 +199,7 @@ public class HiveIcebergOutputFormat extends OutputFormat<NullWritable, IcebergW
   /**
    * A dummy committer - not related to the Hive transactions.
    */
-  private static final class IcebergOutputCommitter extends OutputCommitter {
+  public static final class IcebergOutputCommitter extends OutputCommitter {
 
     @Override
     public void setupJob(JobContext jobContext) {
@@ -229,6 +224,116 @@ public class HiveIcebergOutputFormat extends OutputFormat<NullWritable, IcebergW
     @Override
     public void abortTask(TaskAttemptContext taskAttemptContext) {
       // do nothing.
+    }
+
+    @Override
+    public void commitJob(JobContext jobContext) throws IOException {
+      Configuration conf = jobContext.getJobConf();
+      Table table = Catalogs.loadTable(conf);
+      AppendFiles append = table.newAppend();
+      String queryId = conf.get(HiveConf.ConfVars.HIVEQUERYID.varname);
+      String location = conf.get(InputFormatConfig.TABLE_LOCATION);
+      Path resultPath = new Path(location, queryId);
+      FileSystem fs = Util.getFs(resultPath, conf);
+      RemoteIterator<LocatedFileStatus> fileStatuses = fs.listFiles(resultPath, false);
+      Set<String> filesToKeep = new HashSet<>();
+      Set<String> files = new HashSet<>();
+      while (fileStatuses.hasNext()) {
+        LocatedFileStatus status = fileStatuses.next();
+        String fileName = status.getPath().getName();
+        files.add(resultPath.toString() + "/" + fileName);
+        if (fileName.endsWith(COMMITTED_PREFIX)) {
+          LOG.debug("Reading committed file {}", fileName);
+          CommittedFileData cfd = readCommittedFile(table.io(), resultPath.toString() + "/" + fileName);
+          DataFiles.Builder builder = DataFiles.builder(PartitionSpec.unpartitioned())
+              .withPath(cfd.fileName)
+              .withFormat(cfd.fileFormat)
+              .withFileSizeInBytes(cfd.length)
+              .withMetrics(cfd.serializableMetrics.metrics());
+          append = append.appendFile(builder.build());
+          filesToKeep.add(cfd.fileName);
+        }
+      }
+      append.commit();
+      LOG.info("Iceberg write is committed for {} with files {}", table, filesToKeep);
+      files.removeAll(filesToKeep);
+      LOG.debug("Removing unused files: {}", files);
+      files.forEach(file -> table.io().deleteFile(file));
+      cleanupJob(jobContext);
+    }
+  }
+
+  private static void createCommittedFileFor(FileIO io, String location, FileFormat fileFormat, Long length,
+                                             Metrics metrics) throws IOException {
+    OutputFile commitFile = io.newOutputFile(location + COMMITTED_PREFIX);
+    ObjectOutputStream oos = new ObjectOutputStream(commitFile.createOrOverwrite());
+    oos.writeObject(new CommittedFileData(location, fileFormat, length, metrics));
+    oos.close();
+    LOG.debug("Iceberg committed file is created {}", commitFile);
+  }
+
+  private static CommittedFileData readCommittedFile(FileIO io, String committedFileLocation) throws IOException {
+    try (ObjectInputStream ois = new ObjectInputStream(io.newInputFile(committedFileLocation).newStream())) {
+      return (CommittedFileData) ois.readObject();
+    } catch (ClassNotFoundException cnfe) {
+      throw new IOException("Can not parse committed file: " + committedFileLocation, cnfe);
+    }
+  }
+
+  private static class CommittedFileData implements Serializable {
+    private String fileName;
+    private FileFormat fileFormat;
+    private Long length;
+    private SerializableMetrics serializableMetrics;
+
+    private CommittedFileData(String fileName, FileFormat fileFormat, Long length, Metrics metrics) {
+      this.fileName = fileName;
+      this.fileFormat = fileFormat;
+      this.length = length;
+      this.serializableMetrics = new SerializableMetrics(metrics);
+    }
+  }
+
+  /**
+   * We need this class, since Metrics in not Serializable (even though it implements the interface)
+   */
+  private static class SerializableMetrics implements Serializable {
+    private Long rowCount;
+    private Map<Integer, Long> columnSizes;
+    private Map<Integer, Long> valueCounts;
+    private Map<Integer, Long> nullValueCounts;
+    private Map<Integer, byte[]> lowerBounds = null;
+    private Map<Integer, byte[]> upperBounds = null;
+
+    private SerializableMetrics(Metrics original) {
+      rowCount = original.recordCount();
+      columnSizes = original.columnSizes();
+      valueCounts = original.valueCounts();
+      nullValueCounts = original.nullValueCounts();
+      if (original.lowerBounds() != null) {
+        lowerBounds = new HashMap<>(original.lowerBounds().size());
+        original.lowerBounds().forEach((k, v) -> lowerBounds.put(k, v.array()));
+      }
+      if (original.upperBounds() != null) {
+        upperBounds = new HashMap<>(original.upperBounds().size());
+        original.upperBounds().forEach((k, v) -> upperBounds.put(k, v.array()));
+      }
+    }
+
+    private Metrics metrics() {
+      final Map<Integer, ByteBuffer> metricsLowerBounds =
+          lowerBounds != null ? new HashMap<>(lowerBounds.size()) : null;
+      final Map<Integer, ByteBuffer> metricsUpperBounds =
+          lowerBounds != null ? new HashMap<>(upperBounds.size()) : null;
+
+      if (lowerBounds != null) {
+        lowerBounds.forEach((k, v) -> metricsLowerBounds.put(k, ByteBuffer.wrap(v)));
+      }
+      if (upperBounds != null) {
+        upperBounds.forEach((k, v) -> metricsUpperBounds.put(k, ByteBuffer.wrap(v)));
+      }
+
+      return new Metrics(rowCount, columnSizes, valueCounts, nullValueCounts, metricsLowerBounds, metricsUpperBounds);
     }
   }
 }
