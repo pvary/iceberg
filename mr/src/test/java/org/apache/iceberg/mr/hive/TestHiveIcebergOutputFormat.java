@@ -26,6 +26,10 @@ import java.util.Properties;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.mapred.JobConf;
+import org.apache.hadoop.mapred.JobContext;
+import org.apache.hadoop.mapred.JobContextImpl;
+import org.apache.hadoop.mapred.JobID;
+import org.apache.hadoop.mapred.OutputCommitter;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.Record;
@@ -99,6 +103,14 @@ public class TestHiveIcebergOutputFormat {
     writer.write(new IcebergWritable(record));
 
     writer.close(false);
+
+    OutputCommitter outputCommitter = new HiveIcebergOutputFormat.IcebergOutputCommitter();
+    // Create a dummy jobContext
+    JobContext jc = new JobContextImpl(new JobConf(conf), new JobID());
+    jc.getJobConf().set(InputFormatConfig.TABLE_LOCATION, table.location());
+    jc.getJobConf().set(HiveConf.ConfVars.HIVEQUERYID.varname, "TestQuery_" + fileFormat);
+
+    outputCommitter.commitJob(jc);
 
     // Reload the table, so we get the new data as well
     Table newTable = Catalogs.loadTable(conf, props);

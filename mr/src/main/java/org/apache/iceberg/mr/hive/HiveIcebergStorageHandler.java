@@ -83,7 +83,12 @@ public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, H
 
   @Override
   public void configureOutputJobProperties(TableDesc tableDesc, Map<String, String> map) {
+    Properties props = tableDesc.getProperties();
+    Table table = Catalogs.loadTable(conf, props);
 
+    map.put(InputFormatConfig.TABLE_IDENTIFIER, props.getProperty(NAME));
+    map.put(InputFormatConfig.TABLE_LOCATION, table.location());
+    map.put(InputFormatConfig.TABLE_SCHEMA, SchemaParser.toJson(table.schema()));
   }
 
   @Override
@@ -93,7 +98,7 @@ public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, H
 
   @Override
   public void configureJobConf(TableDesc tableDesc, JobConf jobConf) {
-
+    jobConf.set("mapred.output.committer.class", HiveIcebergOutputFormat.IcebergOutputCommitter.class.getName());
   }
 
   @Override
