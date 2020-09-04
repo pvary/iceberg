@@ -29,6 +29,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.LocatedFileStatus;
@@ -77,12 +78,18 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     HiveOutputFormat<NullWritable, IcebergWritable> {
 
   private static final Logger LOG = LoggerFactory.getLogger(HiveIcebergOutputFormat.class);
+  private static final String TASK_ATTEMPT_ID_KEY = "mapred.task.id";
   private static final String COMMITTED_PREFIX = ".committed";
 
+  // <TaskAttemptId, ClosedFileData> map to store the data needed to create DataFiles
+  // Stored in concurrent map, since some executor engines can share containers
+  private static final Map<String, ClosedFileData> fileData = new ConcurrentHashMap<>();
+
   private Configuration overlayedConf = null;
+  private String taskAttemptId = null;
+  private Schema schema = null;
   private String location = null;
   private FileFormat fileFormat = null;
-  private Schema schema = null;
 
   @Override
   @SuppressWarnings("rawtypes")
@@ -92,12 +99,11 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
                                                            Progressable progress)
       throws IOException {
     this.overlayedConf = createOverlayedConf(jc, tableAndSerDeProperties);
-    String tableLocation = overlayedConf.get(InputFormatConfig.TABLE_LOCATION);
-    String queryId = overlayedConf.get(HiveConf.ConfVars.HIVEQUERYID.varname);
-    String taskId = overlayedConf.get("mapred.task.id");
-    this.location = tableLocation + "/" + queryId + "/" + taskId;
-    this.fileFormat = FileFormat.valueOf(overlayedConf.get(InputFormatConfig.WRITE_FILE_FORMAT).toUpperCase());
+    this.taskAttemptId = overlayedConf.get(TASK_ATTEMPT_ID_KEY);
     this.schema = SchemaParser.fromJson(overlayedConf.get(InputFormatConfig.TABLE_SCHEMA));
+    this.location = generateLocation(overlayedConf);
+    this.fileFormat = FileFormat.valueOf(overlayedConf.get(InputFormatConfig.WRITE_FILE_FORMAT).toUpperCase());
+    fileData.remove(this.taskAttemptId);
     return new IcebergRecordWriter();
   }
 
@@ -111,6 +117,19 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
       newConf.set((String) prop.getKey(), (String) prop.getValue());
     }
     return newConf;
+  }
+
+  /**
+   * Generates file location based on the task configuration.
+   * Currently it uses tableLocation/queryId/taskAttemptId
+   * @param conf The job's configuration
+   * @return The directory to store the result files
+   */
+  private static String generateLocation(Configuration conf) {
+    String tableLocation = conf.get(InputFormatConfig.TABLE_LOCATION);
+    String queryId = conf.get(HiveConf.ConfVars.HIVEQUERYID.varname);
+    String taskAttemptId = conf.get(TASK_ATTEMPT_ID_KEY);
+    return tableLocation + "/" + queryId + "/" + taskAttemptId;
   }
 
   @Override
@@ -182,7 +201,9 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     @Override
     public void close(boolean abort) throws IOException {
       appender.close();
-      createCommittedFileFor(io, location, fileFormat, appender.length(), appender.metrics());
+      if (!abort) {
+        fileData.put(taskAttemptId, new ClosedFileData(location, fileFormat, appender.length(), appender.metrics()));
+      }
     }
 
     @Override
@@ -213,17 +234,18 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
 
     @Override
     public boolean needsTaskCommit(TaskAttemptContext taskAttemptContext) {
-      return false;
+      return true;
     }
 
     @Override
-    public void commitTask(TaskAttemptContext taskAttemptContext) {
-      // do nothing.
+    public void commitTask(TaskAttemptContext taskAttemptContext) throws IOException {
+      ClosedFileData closedFileData = fileData.remove(taskAttemptContext.getTaskAttemptID().toString());
+      createCommittedFileFor(new HadoopFileIO(taskAttemptContext.getJobConf()), closedFileData);
     }
 
     @Override
     public void abortTask(TaskAttemptContext taskAttemptContext) {
-      // do nothing.
+      fileData.remove(taskAttemptContext.getTaskAttemptID().toString());
     }
 
     @Override
@@ -244,7 +266,7 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
         files.add(resultPath.toString() + "/" + fileName);
         if (fileName.endsWith(COMMITTED_PREFIX)) {
           LOG.debug("Reading committed file {}", fileName);
-          CommittedFileData cfd = readCommittedFile(table.io(), resultPath.toString() + "/" + fileName);
+          ClosedFileData cfd = readCommittedFile(table.io(), resultPath.toString() + "/" + fileName);
           DataFiles.Builder builder = DataFiles.builder(PartitionSpec.unpartitioned())
               .withPath(cfd.fileName)
               .withFormat(cfd.fileFormat)
@@ -263,30 +285,29 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     }
   }
 
-  private static void createCommittedFileFor(FileIO io, String location, FileFormat fileFormat, Long length,
-                                             Metrics metrics) throws IOException {
-    OutputFile commitFile = io.newOutputFile(location + COMMITTED_PREFIX);
+  private static void createCommittedFileFor(FileIO io, ClosedFileData closedFileData) throws IOException {
+    OutputFile commitFile = io.newOutputFile(closedFileData.fileName + COMMITTED_PREFIX);
     ObjectOutputStream oos = new ObjectOutputStream(commitFile.createOrOverwrite());
-    oos.writeObject(new CommittedFileData(location, fileFormat, length, metrics));
+    oos.writeObject(closedFileData);
     oos.close();
     LOG.debug("Iceberg committed file is created {}", commitFile);
   }
 
-  private static CommittedFileData readCommittedFile(FileIO io, String committedFileLocation) throws IOException {
+  private static ClosedFileData readCommittedFile(FileIO io, String committedFileLocation) throws IOException {
     try (ObjectInputStream ois = new ObjectInputStream(io.newInputFile(committedFileLocation).newStream())) {
-      return (CommittedFileData) ois.readObject();
+      return (ClosedFileData) ois.readObject();
     } catch (ClassNotFoundException cnfe) {
       throw new IOException("Can not parse committed file: " + committedFileLocation, cnfe);
     }
   }
 
-  private static class CommittedFileData implements Serializable {
+  private static final class ClosedFileData implements Serializable {
     private String fileName;
     private FileFormat fileFormat;
     private Long length;
     private SerializableMetrics serializableMetrics;
 
-    private CommittedFileData(String fileName, FileFormat fileFormat, Long length, Metrics metrics) {
+    private ClosedFileData(String fileName, FileFormat fileFormat, Long length, Metrics metrics) {
       this.fileName = fileName;
       this.fileFormat = fileFormat;
       this.length = length;
@@ -297,7 +318,7 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
   /**
    * We need this class, since Metrics in not Serializable (even though it implements the interface)
    */
-  private static class SerializableMetrics implements Serializable {
+  private static final class SerializableMetrics implements Serializable {
     private Long rowCount;
     private Map<Integer, Long> columnSizes;
     private Map<Integer, Long> valueCounts;

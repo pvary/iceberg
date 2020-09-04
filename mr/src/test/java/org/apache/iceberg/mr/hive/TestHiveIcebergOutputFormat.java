@@ -30,6 +30,9 @@ import org.apache.hadoop.mapred.JobContext;
 import org.apache.hadoop.mapred.JobContextImpl;
 import org.apache.hadoop.mapred.JobID;
 import org.apache.hadoop.mapred.OutputCommitter;
+import org.apache.hadoop.mapred.TaskAttemptContext;
+import org.apache.hadoop.mapred.TaskAttemptContextImpl;
+import org.apache.hadoop.mapred.TaskAttemptID;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.Record;
@@ -91,10 +94,19 @@ public class TestHiveIcebergOutputFormat {
     props.put("location", table.location());
     props.put(HiveConf.ConfVars.HIVEQUERYID.varname, "TestQuery_" + fileFormat);
 
+    // Create a dummy jobContext and taskAttemptContext
+    JobConf jobConf = new JobConf(conf);
+    TaskAttemptID taskAttemptID = new TaskAttemptID();
+    jobConf.set(InputFormatConfig.TABLE_LOCATION, table.location());
+    jobConf.set("mapred.task.id", taskAttemptID.toString());
+    jobConf.set(HiveConf.ConfVars.HIVEQUERYID.varname, "TestQuery_" + fileFormat);
+    JobContext jc = new JobContextImpl(jobConf, new JobID());
+    TaskAttemptContext tc = new TaskAttemptContextImpl(jobConf, taskAttemptID);
+
     HiveIcebergOutputFormat outputFormat = new HiveIcebergOutputFormat();
 
     IcebergRecordWriter writer =
-        (IcebergRecordWriter) outputFormat.getHiveRecordWriter(new JobConf(conf),
+        (IcebergRecordWriter) outputFormat.getHiveRecordWriter(jobConf,
             null, null, false, props, null);
 
     // Write a row.
@@ -105,11 +117,8 @@ public class TestHiveIcebergOutputFormat {
     writer.close(false);
 
     OutputCommitter outputCommitter = new HiveIcebergOutputFormat.IcebergOutputCommitter();
-    // Create a dummy jobContext
-    JobContext jc = new JobContextImpl(new JobConf(conf), new JobID());
-    jc.getJobConf().set(InputFormatConfig.TABLE_LOCATION, table.location());
-    jc.getJobConf().set(HiveConf.ConfVars.HIVEQUERYID.varname, "TestQuery_" + fileFormat);
 
+    outputCommitter.commitTask(tc);
     outputCommitter.commitJob(jc);
 
     // Reload the table, so we get the new data as well
