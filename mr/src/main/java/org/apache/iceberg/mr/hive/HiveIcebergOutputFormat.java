@@ -24,12 +24,18 @@ import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.LocatedFileStatus;
@@ -48,6 +54,7 @@ import org.apache.hadoop.mapred.Reporter;
 import org.apache.hadoop.mapred.TaskAttemptContext;
 import org.apache.hadoop.util.Progressable;
 import org.apache.iceberg.AppendFiles;
+import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.Metrics;
@@ -71,6 +78,7 @@ import org.apache.iceberg.mr.mapreduce.IcebergWritable;
 import org.apache.iceberg.orc.ORC;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -79,7 +87,7 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
 
   private static final Logger LOG = LoggerFactory.getLogger(HiveIcebergOutputFormat.class);
   private static final String TASK_ATTEMPT_ID_KEY = "mapred.task.id";
-  private static final String COMMITTED_PREFIX = ".committed";
+  private static final String COMMITTED_EXTENSION = ".committed";
 
   // <TaskAttemptId, ClosedFileData> map to store the data needed to create DataFiles
   // Stored in concurrent map, since some executor engines can share containers
@@ -101,7 +109,7 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     this.overlayedConf = createOverlayedConf(jc, tableAndSerDeProperties);
     this.taskAttemptId = overlayedConf.get(TASK_ATTEMPT_ID_KEY);
     this.schema = SchemaParser.fromJson(overlayedConf.get(InputFormatConfig.TABLE_SCHEMA));
-    this.location = generateLocation(overlayedConf);
+    this.location = generateTaskLocation(overlayedConf);
     this.fileFormat = FileFormat.valueOf(overlayedConf.get(InputFormatConfig.WRITE_FILE_FORMAT).toUpperCase());
     fileData.remove(this.taskAttemptId);
     return new IcebergRecordWriter();
@@ -120,16 +128,26 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
   }
 
   /**
-   * Generates file location based on the task configuration.
-   * Currently it uses tableLocation/queryId/taskAttemptId
+   * Generates query directory location based on the configuration.
+   * Currently it uses tableLocation/queryId
    * @param conf The job's configuration
-   * @return The directory to store the result files
+   * @return The directory to store the query result files
    */
-  private static String generateLocation(Configuration conf) {
+  private static String generateQueryLocation(Configuration conf) {
     String tableLocation = conf.get(InputFormatConfig.TABLE_LOCATION);
     String queryId = conf.get(HiveConf.ConfVars.HIVEQUERYID.varname);
+    return tableLocation + "/" + queryId;
+  }
+
+  /**
+   * Generates file location based on the task configuration.
+   * Currently it uses QUERY_LOCATION/taskAttemptId.
+   * @param conf The job's configuration
+   * @return The file to store the results
+   */
+  private static String generateTaskLocation(Configuration conf) {
     String taskAttemptId = conf.get(TASK_ATTEMPT_ID_KEY);
-    return tableLocation + "/" + queryId + "/" + taskAttemptId;
+    return generateQueryLocation(conf) + "/" + taskAttemptId;
   }
 
   @Override
@@ -251,42 +269,90 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     @Override
     public void commitJob(JobContext jobContext) throws IOException {
       Configuration conf = jobContext.getJobConf();
+      Path queryResultPath = new Path(generateQueryLocation(conf));
       Table table = Catalogs.loadTable(conf);
-      AppendFiles append = table.newAppend();
-      String queryId = conf.get(HiveConf.ConfVars.HIVEQUERYID.varname);
-      String location = conf.get(InputFormatConfig.TABLE_LOCATION);
-      Path resultPath = new Path(location, queryId);
-      FileSystem fs = Util.getFs(resultPath, conf);
-      RemoteIterator<LocatedFileStatus> fileStatuses = fs.listFiles(resultPath, false);
-      Set<String> filesToKeep = new HashSet<>();
-      Set<String> files = new HashSet<>();
-      while (fileStatuses.hasNext()) {
-        LocatedFileStatus status = fileStatuses.next();
-        String fileName = status.getPath().getName();
-        files.add(resultPath.toString() + "/" + fileName);
-        if (fileName.endsWith(COMMITTED_PREFIX)) {
-          LOG.debug("Reading committed file {}", fileName);
-          ClosedFileData cfd = readCommittedFile(table.io(), resultPath.toString() + "/" + fileName);
-          DataFiles.Builder builder = DataFiles.builder(PartitionSpec.unpartitioned())
-              .withPath(cfd.fileName)
-              .withFormat(cfd.fileFormat)
-              .withFileSizeInBytes(cfd.length)
-              .withMetrics(cfd.serializableMetrics.metrics());
-          append = append.appendFile(builder.build());
-          filesToKeep.add(cfd.fileName);
+
+      ExecutorService executor = null;
+      try {
+        // Creating executor service for parallel handling of file reads and deletes
+        executor = Executors.newFixedThreadPool(
+            conf.getInt(InputFormatConfig.WRITE_THREAD_POOL_SIZE, InputFormatConfig.WRITE_THREAD_POOL_SIZE_DEFAULT),
+            new ThreadFactoryBuilder()
+                .setDaemon(false)
+                .setPriority(Thread.NORM_PRIORITY)
+                .setNameFormat("iceberg-commit-pool-%d")
+                .build());
+
+        Set<String> taskTmpFiles = new HashSet<>();
+        Set<Future<DataFile>> dataFiles = new HashSet<>();
+        FileSystem fs = Util.getFs(queryResultPath, conf);
+
+        // Listing the task result directory and reading .committed files
+        RemoteIterator<LocatedFileStatus> taskFileStatuses = fs.listFiles(queryResultPath, false);
+        while (taskFileStatuses.hasNext()) {
+          LocatedFileStatus taskFile = taskFileStatuses.next();
+          String taskFileName = queryResultPath + "/" + taskFile.getPath().getName();
+          taskTmpFiles.add(taskFileName);
+          if (taskFileName.endsWith(COMMITTED_EXTENSION)) {
+            dataFiles.add(executor.submit(() -> {
+              LOG.debug("Reading committed file {}", taskFileName);
+              ClosedFileData cfd = readCommittedFile(table.io(), taskFileName);
+              DataFiles.Builder builder = DataFiles.builder(PartitionSpec.unpartitioned())
+                  .withPath(cfd.fileName)
+                  .withFormat(cfd.fileFormat)
+                  .withFileSizeInBytes(cfd.length)
+                  .withMetrics(cfd.serializableMetrics.metrics());
+              DataFile dataFile = builder.build();
+              return dataFile;
+            }));
+          }
+        }
+
+        // Appending data files to the table
+        AppendFiles append = table.newAppend();
+        Set<String> filesToKeep = new HashSet<>(dataFiles.size());
+        for (Future<DataFile> task : dataFiles) {
+          try {
+            DataFile dataFile = task.get();
+            append.appendFile(dataFile);
+            String dataFilePath = dataFile.path().toString();
+            filesToKeep.add(dataFilePath);
+            taskTmpFiles.remove(dataFilePath);
+          } catch (InterruptedException | ExecutionException e) {
+            throw new IOException("Committing task is interrupted", e);
+          }
+        }
+        append.commit();
+        LOG.info("Iceberg write is committed for {} with files {}", table, filesToKeep);
+
+        // Cleaning up temporary files
+        LOG.debug("Removing unused files: {}", taskTmpFiles);
+        Collection<Future<?>> deleteTasks = new ArrayList<>(taskTmpFiles.size());
+        for (String file : taskTmpFiles) {
+          deleteTasks.add(executor.submit(() -> table.io().deleteFile(file)));
+        }
+
+        for (Future<?> task : deleteTasks) {
+          try {
+            task.get();
+          } catch (InterruptedException | ExecutionException e) {
+            LOG.warn("Deleting files is unsuccessful", e);
+          }
+        }
+
+        // Calling super to cleanupJob if something more is needed
+        cleanupJob(jobContext);
+
+      } finally {
+        if (executor != null) {
+          executor.shutdown();
         }
       }
-      append.commit();
-      LOG.info("Iceberg write is committed for {} with files {}", table, filesToKeep);
-      files.removeAll(filesToKeep);
-      LOG.debug("Removing unused files: {}", files);
-      files.forEach(file -> table.io().deleteFile(file));
-      cleanupJob(jobContext);
     }
   }
 
   private static void createCommittedFileFor(FileIO io, ClosedFileData closedFileData) throws IOException {
-    OutputFile commitFile = io.newOutputFile(closedFileData.fileName + COMMITTED_PREFIX);
+    OutputFile commitFile = io.newOutputFile(closedFileData.fileName + COMMITTED_EXTENSION);
     ObjectOutputStream oos = new ObjectOutputStream(commitFile.createOrOverwrite());
     oos.writeObject(closedFileData);
     oos.close();

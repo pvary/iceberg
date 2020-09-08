@@ -20,6 +20,7 @@
 package org.apache.iceberg.mr.hive;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
@@ -34,6 +35,7 @@ import org.apache.hadoop.mapred.TaskAttemptContext;
 import org.apache.hadoop.mapred.TaskAttemptContextImpl;
 import org.apache.hadoop.mapred.TaskAttemptID;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.hadoop.HadoopFileIO;
@@ -58,19 +60,21 @@ public class TestHiveIcebergOutputFormat {
 
   @Rule
   public TemporaryFolder temp = new TemporaryFolder();
-  private static final Configuration conf = new Configuration();
-
-  private TestHelper helper;
-
-  // parametrized variables
-  private final FileFormat fileFormat;
 
   @Parameterized.Parameters(name = "{0}")
   public static Object[] parameters() {
     return TESTED_FILE_FORMATS;
   }
 
-  public TestHiveIcebergOutputFormat(String fileFormat) throws IOException {
+  // parametrized variables
+  private final FileFormat fileFormat;
+
+  private static final Configuration conf = new Configuration();
+  private TestHelper helper;
+  private Table table;
+  private TestOutputFormat testOutputFormat;
+
+  public TestHiveIcebergOutputFormat(String fileFormat) {
     this.fileFormat = FileFormat.valueOf(fileFormat.toUpperCase(Locale.ENGLISH));
   }
 
@@ -83,49 +87,113 @@ public class TestHiveIcebergOutputFormat {
         null,
         fileFormat,
         temp);
+
+    table = helper.createUnpartitionedTable();
+    testOutputFormat = new TestOutputFormat(table, fileFormat);
   }
 
   @Test
-  public void testGoodRow() throws Exception {
-    Table table = helper.createUnpartitionedTable();
-    Properties props = new Properties();
-    props.put(InputFormatConfig.WRITE_FILE_FORMAT, fileFormat.name());
-    props.put(InputFormatConfig.TABLE_LOCATION, table.location());
-    props.put("location", table.location());
-    props.put(HiveConf.ConfVars.HIVEQUERYID.varname, "TestQuery_" + fileFormat);
-
-    // Create a dummy jobContext and taskAttemptContext
-    JobConf jobConf = new JobConf(conf);
-    TaskAttemptID taskAttemptID = new TaskAttemptID();
-    jobConf.set(InputFormatConfig.TABLE_LOCATION, table.location());
-    jobConf.set("mapred.task.id", taskAttemptID.toString());
-    jobConf.set(HiveConf.ConfVars.HIVEQUERYID.varname, "TestQuery_" + fileFormat);
-    JobContext jc = new JobContextImpl(jobConf, new JobID());
-    TaskAttemptContext tc = new TaskAttemptContextImpl(jobConf, taskAttemptID);
-
-    HiveIcebergOutputFormat outputFormat = new HiveIcebergOutputFormat();
-
-    IcebergRecordWriter writer =
-        (IcebergRecordWriter) outputFormat.getHiveRecordWriter(jobConf,
-            null, null, false, props, null);
-
+  public void testWriteRow() throws IOException {
     // Write a row.
-    Record record = HiveIcebergSerDeTestUtils.getTestRecord(FileFormat.PARQUET.equals(fileFormat));
+    List<Record> records =
+        Arrays.asList(new Record[] { HiveIcebergSerDeTestUtils.getTestRecord(FileFormat.PARQUET.equals(fileFormat)) });
 
-    writer.write(new IcebergWritable(record));
+    testOutputFormat.write(records);
+    testOutputFormat.validate(records);
+  }
 
-    writer.close(false);
+  @Test
+  public void testNullRow() throws IOException {
+    // FIXME: ORC file does not read back the row consisting only of nulls. The data in the files seems ok.
+    if (FileFormat.ORC.equals(fileFormat)) {
+      return;
+    }
+    // Write a row.
+    List<Record> records = Arrays.asList(new Record[] { HiveIcebergSerDeTestUtils.getNullTestRecord() });
 
-    OutputCommitter outputCommitter = new HiveIcebergOutputFormat.IcebergOutputCommitter();
+    testOutputFormat.write(records);
+    testOutputFormat.validate(records);
+  }
 
-    outputCommitter.commitTask(tc);
-    outputCommitter.commitJob(jc);
+  @Test
+  public void testMultipleRows() throws IOException {
+    // Write 2 rows. One with nulls too.
+    List<Record> records = Arrays.asList(new Record[] {
+        HiveIcebergSerDeTestUtils.getTestRecord(FileFormat.PARQUET.equals(fileFormat)),
+        HiveIcebergSerDeTestUtils.getNullTestRecord()
+    });
 
-    // Reload the table, so we get the new data as well
-    Table newTable = Catalogs.loadTable(conf, props);
-    List<Record> records = HiveIcebergSerDeTestUtils.load(new HadoopFileIO(conf), newTable);
+    testOutputFormat.write(records);
+    testOutputFormat.validate(records);
+  }
 
-    Assert.assertEquals(1, records.size());
-    HiveIcebergSerDeTestUtils.assertEquals(record, records.get(0));
+  @Test
+  public void testRandomRecords() throws IOException {
+    // Write 30 random rows
+    // FIXME: Parquet appender expect byte[] instead of UUID when writing values.
+    if (FileFormat.PARQUET.equals(fileFormat)) {
+      return;
+    }
+
+    List<Record> records = helper.generateRandomRecords(30, 0L);
+
+    testOutputFormat.write(records);
+    testOutputFormat.validate(records);
+  }
+
+  private static class TestOutputFormat {
+    private Configuration configuration;
+    private Properties serDeProperties;
+    private JobConf jobConf;
+    private JobContext jobContext;
+    private TaskAttemptContext taskAttemptContext;
+
+    private TestOutputFormat(Table table, FileFormat fileFormat) {
+      configuration = new Configuration();
+
+      // Create the SerDeProperties
+      serDeProperties = new Properties();
+      serDeProperties.put(InputFormatConfig.WRITE_FILE_FORMAT, fileFormat.name());
+      serDeProperties.put(InputFormatConfig.TABLE_LOCATION, table.location());
+      serDeProperties.put(InputFormatConfig.TABLE_SCHEMA, SchemaParser.toJson(table.schema()));
+      serDeProperties.put("location", table.location());
+      serDeProperties.put(HiveConf.ConfVars.HIVEQUERYID.varname, "TestQuery_" + fileFormat);
+
+      // Create a dummy jobContext and taskAttemptContext
+      jobConf = new JobConf(configuration);
+      TaskAttemptID taskAttemptID = new TaskAttemptID();
+      jobConf.set(InputFormatConfig.TABLE_LOCATION, table.location());
+      jobConf.set("mapred.task.attempt.id", taskAttemptID.toString());
+      jobConf.set(HiveConf.ConfVars.HIVEQUERYID.varname, "TestQuery_" + fileFormat);
+      jobContext = new JobContextImpl(jobConf, new JobID());
+      taskAttemptContext = new TaskAttemptContextImpl(jobConf, taskAttemptID);
+    }
+
+    private void write(List<Record> records) throws IOException {
+      HiveIcebergOutputFormat outputFormat = new HiveIcebergOutputFormat();
+      OutputCommitter outputCommitter = new HiveIcebergOutputFormat.IcebergOutputCommitter();
+
+      IcebergRecordWriter writer =
+          (IcebergRecordWriter) outputFormat.getHiveRecordWriter(jobConf,
+              null, null, false, serDeProperties, null);
+
+      records.forEach(record -> writer.write(new IcebergWritable(record)));
+
+      writer.close(false);
+
+      outputCommitter.commitTask(taskAttemptContext);
+      outputCommitter.commitJob(jobContext);
+    }
+
+    private void validate(List<Record> expected) {
+      // Reload the table, so we get the new data as well
+      Table newTable = Catalogs.loadTable(configuration, serDeProperties);
+      List<Record> records = HiveIcebergSerDeTestUtils.load(new HadoopFileIO(configuration), newTable);
+
+      Assert.assertEquals(expected.size(), records.size());
+      for (int i = 0; i < expected.size(); ++i) {
+        HiveIcebergSerDeTestUtils.assertEquals(expected.get(i), records.get(i));
+      }
+    }
   }
 }

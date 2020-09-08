@@ -61,28 +61,28 @@ import org.junit.Assert;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import static org.apache.iceberg.types.Types.NestedField.required;
+import static org.apache.iceberg.types.Types.NestedField.optional;
 
 public class HiveIcebergSerDeTestUtils {
   private static final Logger LOG = LoggerFactory.getLogger(HiveIcebergSerDeTestUtils.class);
 
   // TODO: Can this be a constant all around the Iceberg tests?
   public static final Schema FULL_SCHEMA = new Schema(
-      required(1, "boolean_type", Types.BooleanType.get()),
-      required(2, "integer_type", Types.IntegerType.get()),
-      required(3, "long_type", Types.LongType.get()),
-      required(4, "float_type", Types.FloatType.get()),
-      required(5, "double_type", Types.DoubleType.get()),
-      required(6, "date_type", Types.DateType.get()),
+      optional(1, "boolean_type", Types.BooleanType.get()),
+      optional(2, "integer_type", Types.IntegerType.get()),
+      optional(3, "long_type", Types.LongType.get()),
+      optional(4, "float_type", Types.FloatType.get()),
+      optional(5, "double_type", Types.DoubleType.get()),
+      optional(6, "date_type", Types.DateType.get()),
       // TimeType is not supported
       // required(7, "time_type", Types.TimeType.get()),
-      required(7, "tsTz", Types.TimestampType.withZone()),
-      required(8, "ts", Types.TimestampType.withoutZone()),
-      required(9, "string_type", Types.StringType.get()),
-      required(10, "uuid_type", Types.UUIDType.get()),
-      required(11, "fixed_type", Types.FixedType.ofLength(3)),
-      required(12, "binary_type", Types.BinaryType.get()),
-      required(13, "decimal_type", Types.DecimalType.of(38, 10)));
+      optional(7, "tsTz", Types.TimestampType.withZone()),
+      optional(8, "ts", Types.TimestampType.withoutZone()),
+      optional(9, "string_type", Types.StringType.get()),
+      optional(10, "uuid_type", Types.UUIDType.get()),
+      optional(11, "fixed_type", Types.FixedType.ofLength(3)),
+      optional(12, "binary_type", Types.BinaryType.get()),
+      optional(13, "decimal_type", Types.DecimalType.of(38, 10)));
 
   private HiveIcebergSerDeTestUtils() {
     // Empty constuctor for the utility class
@@ -111,6 +111,16 @@ public class HiveIcebergSerDeTestUtils {
     record.set(10, new byte[] {0, 1, 2});
     record.set(11, ByteBuffer.wrap(new byte[] {0, 1, 2, 3}));
     record.set(12, new BigDecimal("0.0000000013"));
+
+    return record;
+  }
+
+  public static Record getNullTestRecord() {
+    Record record = GenericRecord.create(HiveIcebergSerDeTestUtils.FULL_SCHEMA);
+
+    for (int i = 0; i < HiveIcebergSerDeTestUtils.FULL_SCHEMA.columns().size(); i++) {
+      record.set(i, null);
+    }
 
     return record;
   }
