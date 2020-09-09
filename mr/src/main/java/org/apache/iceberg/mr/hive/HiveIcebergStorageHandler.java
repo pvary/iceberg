@@ -43,7 +43,7 @@ import org.apache.iceberg.mr.InputFormatConfig;
 public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, HiveStorageHandler {
 
   private static final String NAME = "name";
-  private static final String WRITE_KEY = "HiveIcebergStorageHandler_write";
+  protected static final String WRITE_KEY = "HiveIcebergStorageHandler_write";
 
   private Configuration conf;
 

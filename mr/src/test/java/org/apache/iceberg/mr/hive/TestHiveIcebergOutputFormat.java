@@ -22,6 +22,7 @@ package org.apache.iceberg.mr.hive;
 import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
@@ -155,6 +156,12 @@ public class TestHiveIcebergOutputFormat {
     testOutputFormat.validate(records);
   }
 
+  @Test
+  public void testEmptyWrite() throws IOException {
+    testOutputFormat.writeEmpty();
+    testOutputFormat.validate(Collections.emptyList());
+  }
+
   private static class TestOutputFormat {
     private Configuration configuration;
     private Properties serDeProperties;
@@ -179,8 +186,16 @@ public class TestHiveIcebergOutputFormat {
       jobConf.set(InputFormatConfig.TABLE_LOCATION, table.location());
       jobConf.set("mapred.task.id", taskAttemptID.toString());
       jobConf.set(HiveConf.ConfVars.HIVEQUERYID.varname, "TestQuery_" + fileFormat);
+      jobConf.setBoolean(HiveIcebergStorageHandler.WRITE_KEY, true);
       jobContext = new JobContextImpl(jobConf, new JobID());
       taskAttemptContext = new TaskAttemptContextImpl(jobConf, taskAttemptID);
+    }
+
+    private void writeEmpty() throws IOException {
+      OutputCommitter outputCommitter = new HiveIcebergOutputFormat.IcebergOutputCommitter();
+
+      outputCommitter.commitTask(taskAttemptContext);
+      outputCommitter.commitJob(jobContext);
     }
 
     private void write(List<Record> records, boolean withAbort) throws IOException {
@@ -233,15 +248,20 @@ public class TestHiveIcebergOutputFormat {
       //                         \ task-0.committed
       // We definitely do not want more files in the directory
 
-      TableScan scan = newTable.newScan();
-      String dataFilePath = scan.planFiles().iterator().next().file().path().toString();
-      File parentDir = new File(dataFilePath).getParentFile();
-      String expectedBaseLocaton = newTable.location() + "/" + jobConf.get(HiveConf.ConfVars.HIVEQUERYID.varname) +
+      String expectedBaseLocation = newTable.location() + "/" + jobConf.get(HiveConf.ConfVars.HIVEQUERYID.varname) +
           "/" + taskAttemptContext.getTaskAttemptID().getJobID();
-      Assert.assertEquals(expectedBaseLocaton, parentDir.getPath());
-      Set<String> fileList = Sets.newHashSet(parentDir.list((dir, name) -> !name.startsWith(".")));
-      Assert.assertEquals(fileList,
-          Sets.newHashSet(new String[] {"task-0.committed", taskAttemptContext.getTaskAttemptID().toString()}));
+      Set<String> fileList = Sets.newHashSet(new File(expectedBaseLocation).list((dir, name) -> !name.startsWith(".")));
+
+      if (records.size() > 0) {
+        TableScan scan = newTable.newScan();
+        String dataFilePath = scan.planFiles().iterator().next().file().path().toString();
+        File parentDir = new File(dataFilePath).getParentFile();
+        Assert.assertEquals(expectedBaseLocation, parentDir.getPath());
+        Assert.assertEquals(fileList,
+            Sets.newHashSet(new String[] {"task-0.committed", taskAttemptContext.getTaskAttemptID().toString()}));
+      } else {
+        Assert.assertEquals(fileList, Sets.newHashSet(new String[] {"task-0.committed"}));
+      }
     }
   }
 }

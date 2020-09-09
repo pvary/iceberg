@@ -48,6 +48,7 @@ import org.apache.hadoop.mapred.Reporter;
 import org.apache.hadoop.mapred.TaskAttemptContext;
 import org.apache.hadoop.mapred.TaskAttemptID;
 import org.apache.hadoop.mapreduce.JobID;
+import org.apache.hadoop.mapreduce.TaskType;
 import org.apache.hadoop.util.Progressable;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
@@ -277,11 +278,20 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     @Override
     public void commitTask(TaskAttemptContext context) throws IOException {
       ClosedFileData closedFileData = fileData.remove(context.getTaskAttemptID());
+      String commitFileLocation = generateCommitFileLocation(context.getJobConf(), context.getTaskAttemptID());
 
       // If we created a new data file, then create the committed file for this
       if (closedFileData != null) {
-        String commitFileLocation = generateCommitFileLocation(context.getJobConf(), context.getTaskAttemptID());
         createCommittedFileFor(new HadoopFileIO(context.getJobConf()), closedFileData, commitFileLocation);
+      } else {
+        TaskType taskType = context.getTaskAttemptID().getTaskID().getTaskType();
+        boolean isWrite = context.getJobConf().getBoolean(HiveIcebergStorageHandler.WRITE_KEY, false);
+        boolean mapOnly = context.getJobConf().getNumReduceTasks() == 0;
+
+        // If we writing and the task is either reducer or a map in a map-only job then write an empty commit file
+        if (isWrite && (TaskType.REDUCE.equals(taskType) || (TaskType.MAP.equals(taskType) && mapOnly))) {
+          createCommittedFileFor(new HadoopFileIO(context.getJobConf()), new ClosedFileData(), commitFileLocation);
+        }
       }
     }
 
@@ -329,23 +339,31 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
             .run(taskId -> {
               String taskFileName = generateCommitFileLocation(conf, jobContext.getJobID(), taskId);
               ClosedFileData cfd = readCommittedFile(table.io(), taskFileName);
-              DataFiles.Builder builder = DataFiles.builder(PartitionSpec.unpartitioned())
-                  .withPath(cfd.fileName)
-                  .withFormat(cfd.fileFormat)
-                  .withFileSizeInBytes(cfd.length)
-                  .withMetrics(cfd.serializableMetrics.metrics());
-              dataFiles.add(builder.build());
+
+              // If the data is not empty add to the table
+              if (!cfd.empty) {
+                DataFiles.Builder builder = DataFiles.builder(PartitionSpec.unpartitioned())
+                    .withPath(cfd.fileName)
+                    .withFormat(cfd.fileFormat)
+                    .withFileSizeInBytes(cfd.length)
+                    .withMetrics(cfd.serializableMetrics.metrics());
+                dataFiles.add(builder.build());
+              }
             });
 
-        // Appending data files to the table
-        AppendFiles append = table.newAppend();
-        Set<String> addedFiles = new HashSet<>(dataFiles.size());
-        dataFiles.forEach(dataFile -> {
-          append.appendFile(dataFile);
-          addedFiles.add(dataFile.path().toString());
-        });
-        append.commit();
-        LOG.info("Iceberg write is committed for {} with files {}", table, addedFiles);
+        if (dataFiles.size() > 0) {
+          // Appending data files to the table
+          AppendFiles append = table.newAppend();
+          Set<String> addedFiles = new HashSet<>(dataFiles.size());
+          dataFiles.forEach(dataFile -> {
+            append.appendFile(dataFile);
+            addedFiles.add(dataFile.path().toString());
+          });
+          append.commit();
+          LOG.info("Iceberg write is committed for {} with files {}", table, addedFiles);
+        } else {
+          LOG.info("Iceberg write is committed for {} with no new files", table);
+        }
 
         // Calling super to cleanupJob if something more is needed
         cleanupJob(jobContext);
@@ -377,16 +395,26 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
   }
 
   private static final class ClosedFileData implements Serializable {
-    private String fileName;
-    private FileFormat fileFormat;
-    private Long length;
-    private SerializableMetrics serializableMetrics;
+    private final boolean empty;
+    private final String fileName;
+    private final FileFormat fileFormat;
+    private final Long length;
+    private final SerializableMetrics serializableMetrics;
 
     private ClosedFileData(String fileName, FileFormat fileFormat, Long length, Metrics metrics) {
+      this.empty = false;
       this.fileName = fileName;
       this.fileFormat = fileFormat;
       this.length = length;
       this.serializableMetrics = new SerializableMetrics(metrics);
+    }
+
+    private ClosedFileData() {
+      this.empty = true;
+      this.fileName = null;
+      this.fileFormat = null;
+      this.length = null;
+      this.serializableMetrics = null;
     }
   }
 
