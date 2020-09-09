@@ -19,11 +19,13 @@
 
 package org.apache.iceberg.mr.hive;
 
+import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.Properties;
+import java.util.Set;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hive.conf.HiveConf;
 import org.apache.hadoop.mapred.JobConf;
@@ -37,6 +39,7 @@ import org.apache.hadoop.mapred.TaskAttemptID;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableScan;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.hadoop.HadoopTables;
@@ -45,6 +48,7 @@ import org.apache.iceberg.mr.InputFormatConfig;
 import org.apache.iceberg.mr.TestHelper;
 import org.apache.iceberg.mr.hive.HiveIcebergOutputFormat.IcebergRecordWriter;
 import org.apache.iceberg.mr.mapreduce.IcebergWritable;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Rule;
@@ -98,7 +102,7 @@ public class TestHiveIcebergOutputFormat {
     List<Record> records =
         Arrays.asList(new Record[] { HiveIcebergSerDeTestUtils.getTestRecord(FileFormat.PARQUET.equals(fileFormat)) });
 
-    testOutputFormat.write(records);
+    testOutputFormat.write(records, false);
     testOutputFormat.validate(records);
   }
 
@@ -111,7 +115,7 @@ public class TestHiveIcebergOutputFormat {
     // Write a row.
     List<Record> records = Arrays.asList(new Record[] { HiveIcebergSerDeTestUtils.getNullTestRecord() });
 
-    testOutputFormat.write(records);
+    testOutputFormat.write(records, false);
     testOutputFormat.validate(records);
   }
 
@@ -123,7 +127,7 @@ public class TestHiveIcebergOutputFormat {
         HiveIcebergSerDeTestUtils.getNullTestRecord()
     });
 
-    testOutputFormat.write(records);
+    testOutputFormat.write(records, false);
     testOutputFormat.validate(records);
   }
 
@@ -137,7 +141,17 @@ public class TestHiveIcebergOutputFormat {
 
     List<Record> records = helper.generateRandomRecords(30, 0L);
 
-    testOutputFormat.write(records);
+    testOutputFormat.write(records, false);
+    testOutputFormat.validate(records);
+  }
+
+  @Test
+  public void testWithAbortedTask() throws IOException {
+    // Write a row.
+    List<Record> records =
+        Arrays.asList(new Record[] { HiveIcebergSerDeTestUtils.getTestRecord(FileFormat.PARQUET.equals(fileFormat)) });
+
+    testOutputFormat.write(records, true);
     testOutputFormat.validate(records);
   }
 
@@ -163,15 +177,33 @@ public class TestHiveIcebergOutputFormat {
       jobConf = new JobConf(configuration);
       TaskAttemptID taskAttemptID = new TaskAttemptID();
       jobConf.set(InputFormatConfig.TABLE_LOCATION, table.location());
-      jobConf.set("mapred.task.attempt.id", taskAttemptID.toString());
+      jobConf.set("mapred.task.id", taskAttemptID.toString());
       jobConf.set(HiveConf.ConfVars.HIVEQUERYID.varname, "TestQuery_" + fileFormat);
       jobContext = new JobContextImpl(jobConf, new JobID());
       taskAttemptContext = new TaskAttemptContextImpl(jobConf, taskAttemptID);
     }
 
-    private void write(List<Record> records) throws IOException {
+    private void write(List<Record> records, boolean withAbort) throws IOException {
       HiveIcebergOutputFormat outputFormat = new HiveIcebergOutputFormat();
       OutputCommitter outputCommitter = new HiveIcebergOutputFormat.IcebergOutputCommitter();
+
+      if (withAbort) {
+        IcebergRecordWriter writer =
+            (IcebergRecordWriter) outputFormat.getHiveRecordWriter(jobConf,
+                null, null, false, serDeProperties, null);
+
+        records.forEach(record -> writer.write(new IcebergWritable(record)));
+
+        writer.close(false);
+
+        // Abort the previous task
+        outputCommitter.abortTask(taskAttemptContext);
+
+        // Create and set the new task attempt id
+        TaskAttemptID newId = new TaskAttemptID(taskAttemptContext.getTaskAttemptID().getTaskID(), 1);
+        jobConf.set("mapred.task.id", newId.toString());
+        taskAttemptContext = new TaskAttemptContextImpl(jobConf, newId);
+      }
 
       IcebergRecordWriter writer =
           (IcebergRecordWriter) outputFormat.getHiveRecordWriter(jobConf,
@@ -185,7 +217,7 @@ public class TestHiveIcebergOutputFormat {
       outputCommitter.commitJob(jobContext);
     }
 
-    private void validate(List<Record> expected) {
+    private void validate(List<Record> expected) throws IOException {
       // Reload the table, so we get the new data as well
       Table newTable = Catalogs.loadTable(configuration, serDeProperties);
       List<Record> records = HiveIcebergSerDeTestUtils.load(new HadoopFileIO(configuration), newTable);
@@ -194,6 +226,19 @@ public class TestHiveIcebergOutputFormat {
       for (int i = 0; i < expected.size(); ++i) {
         HiveIcebergSerDeTestUtils.assertEquals(expected.get(i), records.get(i));
       }
+
+      // Check the number of the files, and the content of the directory
+      // We expect the following dir structure
+      // table + attemptFile
+      //       \ 0.committed
+      // We definitely do not want more files in the directory
+
+      TableScan scan = newTable.newScan();
+      String dataFilePath = scan.planFiles().iterator().next().file().path().toString();
+      File parentDir = new File(dataFilePath).getParentFile();
+      Set<String> fileList = Sets.newHashSet(parentDir.list((dir, name) -> !name.startsWith(".")));
+      Assert.assertEquals(fileList,
+          Sets.newHashSet(new String[] {"0.committed", taskAttemptContext.getTaskAttemptID().toString()}));
     }
   }
 }
