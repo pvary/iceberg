@@ -230,7 +230,7 @@ public class TestHiveIcebergOutputFormat {
       // Check the number of the files, and the content of the directory
       // We expect the following dir structure
       // table - queryId - jobId + attemptFile
-      //                         \ 0.committed
+      //                         \ task-0.committed
       // We definitely do not want more files in the directory
 
       TableScan scan = newTable.newScan();
