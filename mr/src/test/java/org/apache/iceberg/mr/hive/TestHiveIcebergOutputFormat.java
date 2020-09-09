@@ -229,16 +229,19 @@ public class TestHiveIcebergOutputFormat {
 
       // Check the number of the files, and the content of the directory
       // We expect the following dir structure
-      // table + attemptFile
-      //       \ 0.committed
+      // table - queryId - jobId + attemptFile
+      //                         \ 0.committed
       // We definitely do not want more files in the directory
 
       TableScan scan = newTable.newScan();
       String dataFilePath = scan.planFiles().iterator().next().file().path().toString();
       File parentDir = new File(dataFilePath).getParentFile();
+      String expectedBaseLocaton = newTable.location() + "/" + jobConf.get(HiveConf.ConfVars.HIVEQUERYID.varname) +
+          "/" + taskAttemptContext.getTaskAttemptID().getJobID();
+      Assert.assertEquals(expectedBaseLocaton, parentDir.getPath());
       Set<String> fileList = Sets.newHashSet(parentDir.list((dir, name) -> !name.startsWith(".")));
       Assert.assertEquals(fileList,
-          Sets.newHashSet(new String[] {"0.committed", taskAttemptContext.getTaskAttemptID().toString()}));
+          Sets.newHashSet(new String[] {"task-0.committed", taskAttemptContext.getTaskAttemptID().toString()}));
     }
   }
 }

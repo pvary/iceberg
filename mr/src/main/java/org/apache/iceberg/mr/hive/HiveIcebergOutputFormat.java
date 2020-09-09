@@ -46,6 +46,8 @@ import org.apache.hadoop.mapred.OutputCommitter;
 import org.apache.hadoop.mapred.OutputFormat;
 import org.apache.hadoop.mapred.Reporter;
 import org.apache.hadoop.mapred.TaskAttemptContext;
+import org.apache.hadoop.mapred.TaskAttemptID;
+import org.apache.hadoop.mapreduce.JobID;
 import org.apache.hadoop.util.Progressable;
 import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
@@ -86,12 +88,11 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
 
   // <TaskAttemptId, ClosedFileData> map to store the data needed to create DataFiles
   // Stored in concurrent map, since some executor engines can share containers
-  private static final Map<String, ClosedFileData> fileData = new ConcurrentHashMap<>();
+  private static final Map<TaskAttemptID, ClosedFileData> fileData = new ConcurrentHashMap<>();
 
   private Configuration overlayedConf = null;
-  private String taskAttemptId = null;
+  private TaskAttemptID taskAttemptId = null;
   private Schema schema = null;
-  private String location = null;
   private FileFormat fileFormat = null;
 
   @Override
@@ -100,14 +101,13 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
       boolean isCompressed, Properties tableAndSerDeProperties, Progressable progress) throws IOException {
 
     this.overlayedConf = createOverlayedConf(jc, tableAndSerDeProperties);
-    this.taskAttemptId = overlayedConf.get(TASK_ATTEMPT_ID_KEY);
+    this.taskAttemptId = TaskAttemptID.forName(overlayedConf.get(TASK_ATTEMPT_ID_KEY));
     this.schema = SchemaParser.fromJson(overlayedConf.get(InputFormatConfig.TABLE_SCHEMA));
-    this.location = generateTaskLocation(overlayedConf, taskAttemptId);
     this.fileFormat = FileFormat.valueOf(overlayedConf.get(InputFormatConfig.WRITE_FILE_FORMAT).toUpperCase());
 
     fileData.remove(this.taskAttemptId);
 
-    return new IcebergRecordWriter();
+    return new IcebergRecordWriter(generateDataFileLocation(overlayedConf, taskAttemptId));
   }
 
   /**
@@ -135,21 +135,44 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
   }
 
   /**
-   * Generates file location based on the task configuration.
-   * Currently it uses QUERY_LOCATION/taskAttemptId.
+   * Generates datafile location based on the task configuration.
+   * Currently it uses QUERY_LOCATION/jobId/taskAttemptId.
    * @param conf The job's configuration
-   * @param taskAttemptId The TaskAttemptID already queried from the conf
+   * @param taskAttemptId The TaskAttemptID for the task
    * @return The file to store the results
    */
-  private static String generateTaskLocation(Configuration conf, String taskAttemptId) {
-    return generateQueryLocation(conf) + "/" + taskAttemptId;
+  private static String generateDataFileLocation(Configuration conf, TaskAttemptID taskAttemptId) {
+    return generateQueryLocation(conf) + "/" + taskAttemptId.getJobID() + "/" + taskAttemptId.toString();
+  }
+
+  /**
+   * Generates commit file location based on the task configuration and a specific task id.
+   * Currently it uses QUERY_LOCATION/jobId/task-[0..numTasks].committed.
+   * @param conf The job's configuration
+   * @param jobId The jobId for the task
+   * @param taskId The taskId for the commit file
+   * @return The file to store the results
+   */
+  private static String generateCommitFileLocation(Configuration conf, JobID jobId, int taskId) {
+    return generateQueryLocation(conf) + "/" + jobId + "/task-" + taskId + COMMITTED_EXTENSION;
+  }
+
+  /**
+   * Generates commit file location based on the task configuration.
+   * Currently it uses QUERY_LOCATION/jobId/task-[0..numTasks].committed.
+   * @param conf The job's configuration
+   * @param taskAttemptId The TaskAttemptID for the task
+   * @return The file to store the results
+   */
+  private static String generateCommitFileLocation(Configuration conf, TaskAttemptID taskAttemptId) {
+    return generateCommitFileLocation(conf, taskAttemptId.getJobID(), taskAttemptId.getTaskID().getId());
   }
 
   @Override
   public org.apache.hadoop.mapred.RecordWriter<NullWritable, IcebergWritable> getRecordWriter(FileSystem ignored,
-      JobConf job, String name, Progressable progress) throws IOException {
+      JobConf job, String name, Progressable progress) {
 
-    return new IcebergRecordWriter();
+    throw new UnsupportedOperationException("Please implement if needed");
   }
 
   @Override
@@ -160,10 +183,12 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
   protected class IcebergRecordWriter extends org.apache.hadoop.mapreduce.RecordWriter<NullWritable, IcebergWritable>
       implements FileSinkOperator.RecordWriter, org.apache.hadoop.mapred.RecordWriter<NullWritable, IcebergWritable> {
 
+    private final String location;
     private final FileAppender<Record> appender;
     private final FileIO io;
 
-    IcebergRecordWriter() throws IOException {
+    IcebergRecordWriter(String location) throws IOException {
+      this.location = location;
       io = new HadoopFileIO(overlayedConf);
       OutputFile dataFile = io.newOutputFile(location);
 
@@ -250,28 +275,25 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     }
 
     @Override
-    public void commitTask(TaskAttemptContext taskAttemptContext) throws IOException {
-      ClosedFileData closedFileData = fileData.remove(taskAttemptContext.getTaskAttemptID().toString());
+    public void commitTask(TaskAttemptContext context) throws IOException {
+      ClosedFileData closedFileData = fileData.remove(context.getTaskAttemptID());
 
       // If we created a new data file, then create the committed file for this
       if (closedFileData != null) {
-        String commitFileLocation = generateQueryLocation(taskAttemptContext.getJobConf()) + "/" +
-            taskAttemptContext.getTaskAttemptID().getTaskID().getId() + COMMITTED_EXTENSION;
-        createCommittedFileFor(new HadoopFileIO(taskAttemptContext.getJobConf()), closedFileData, commitFileLocation);
+        String commitFileLocation = generateCommitFileLocation(context.getJobConf(), context.getTaskAttemptID());
+        createCommittedFileFor(new HadoopFileIO(context.getJobConf()), closedFileData, commitFileLocation);
       }
     }
 
     @Override
-    public void abortTask(TaskAttemptContext taskAttemptContext) {
-      String taskAttemptId = taskAttemptContext.getTaskAttemptID().toString();
-      String taskLocation = generateTaskLocation(taskAttemptContext.getJobConf(), taskAttemptId);
-      FileIO io = new HadoopFileIO(taskAttemptContext.getJobConf());
+    public void abortTask(TaskAttemptContext context) {
+      FileIO io = new HadoopFileIO(context.getJobConf());
 
       // Clean up local cache for metadata
-      fileData.remove(taskAttemptId);
+      fileData.remove(context.getTaskAttemptID());
 
       // Remove the result file for the failed task
-      Tasks.foreach(taskLocation)
+      Tasks.foreach(generateDataFileLocation(context.getJobConf(), context.getTaskAttemptID()))
           .retry(3)
           .suppressFailureWhenFinished()
           .onFailure((file, exc) -> LOG.warn("Failed on to remove {} on abort", file, exc))
@@ -284,7 +306,6 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
       // If there are reducers, then every reducer will generate a result file.
       // If this is a map only task, then every mapper will generate a result file.
       int expectedFiles = conf.getNumReduceTasks() != 0 ? conf.getNumReduceTasks() : conf.getNumMapTasks();
-      Path queryResultPath = new Path(generateQueryLocation(conf));
       Table table = Catalogs.loadTable(conf);
 
       ExecutorService executor = null;
@@ -300,13 +321,13 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
 
         Set<DataFile> dataFiles = new ConcurrentHashMap<>().newKeySet();
 
-        // Reading the committed files. The assumption here is that the taskIds are generated in sequencial order
+        // Reading the committed files. The assumption here is that the taskIds are generated in sequential order
         // starting from 0.
         Tasks.range(expectedFiles)
             .executeWith(executor)
             .retry(3)
             .run(taskId -> {
-              String taskFileName = queryResultPath + "/" + taskId + COMMITTED_EXTENSION;
+              String taskFileName = generateCommitFileLocation(conf, jobContext.getJobID(), taskId);
               ClosedFileData cfd = readCommittedFile(table.io(), taskFileName);
               DataFiles.Builder builder = DataFiles.builder(PartitionSpec.unpartitioned())
                   .withPath(cfd.fileName)
