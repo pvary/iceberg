@@ -186,7 +186,6 @@ public class TestHiveIcebergOutputFormat {
       jobConf.set(InputFormatConfig.TABLE_LOCATION, table.location());
       jobConf.set("mapred.task.id", taskAttemptID.toString());
       jobConf.set(HiveConf.ConfVars.HIVEQUERYID.varname, "TestQuery_" + fileFormat);
-      jobConf.setBoolean(HiveIcebergStorageHandler.WRITE_KEY, true);
       jobContext = new JobContextImpl(jobConf, new JobID());
       taskAttemptContext = new TaskAttemptContextImpl(jobConf, taskAttemptID);
     }
