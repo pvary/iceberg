@@ -271,28 +271,25 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     }
 
     @Override
-    public boolean needsTaskCommit(TaskAttemptContext taskAttemptContext) {
-      return true;
+    public boolean needsTaskCommit(TaskAttemptContext context) {
+      // We need to commit if this is the last phase of a MapReduce process
+      return TaskType.REDUCE.equals(context.getTaskAttemptID().getTaskID().getTaskType()) ||
+          context.getJobConf().getNumReduceTasks() == 0;
     }
 
     @Override
     public void commitTask(TaskAttemptContext context) throws IOException {
-      ClosedFileData closedFileData = fileData.remove(context.getTaskAttemptID());
       String commitFileLocation = generateCommitFileLocation(context.getJobConf(), context.getTaskAttemptID());
 
-      // If we created a new data file, then create the committed file for this
-      if (closedFileData != null) {
-        createCommittedFileFor(new HadoopFileIO(context.getJobConf()), closedFileData, commitFileLocation);
-      } else {
-        TaskType taskType = context.getTaskAttemptID().getTaskID().getTaskType();
-        boolean isWrite = context.getJobConf().getBoolean(HiveIcebergStorageHandler.WRITE_KEY, false);
-        boolean mapOnly = context.getJobConf().getNumReduceTasks() == 0;
+      ClosedFileData closedFileData = fileData.remove(context.getTaskAttemptID());
 
-        // If we writing and the task is either reducer or a map in a map-only job then write an empty commit file
-        if (isWrite && (TaskType.REDUCE.equals(taskType) || (TaskType.MAP.equals(taskType) && mapOnly))) {
-          createCommittedFileFor(new HadoopFileIO(context.getJobConf()), new ClosedFileData(), commitFileLocation);
-        }
+      // Generate empty closed file data
+      if (closedFileData == null) {
+        closedFileData = new ClosedFileData();
       }
+
+      // Create the committed file for the task
+      createCommittedFileFor(new HadoopFileIO(context.getJobConf()), closedFileData, commitFileLocation);
     }
 
     @Override
@@ -306,7 +303,7 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
       Tasks.foreach(generateDataFileLocation(context.getJobConf(), context.getTaskAttemptID()))
           .retry(3)
           .suppressFailureWhenFinished()
-          .onFailure((file, exc) -> LOG.warn("Failed on to remove {} on abort", file, exc))
+          .onFailure((file, exc) -> LOG.debug("Failed on to remove {} on abort", file, exc))
           .run(file -> io.deleteFile(file));
     }
 
