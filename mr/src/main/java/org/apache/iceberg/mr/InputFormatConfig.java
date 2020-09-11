@@ -47,6 +47,8 @@ public final class InputFormatConfig {
   public static final String CATALOG = "iceberg.mr.catalog";
   public static final String HADOOP_CATALOG_WAREHOUSE_LOCATION = "iceberg.mr.catalog.hadoop.warehouse.location";
   public static final String CATALOG_LOADER_CLASS = "iceberg.mr.catalog.loader.class";
+
+  // TODO: Find a better place for the OutputFormat configuration, or rename the class
   public static final String WRITE_FILE_FORMAT = "iceberg.mr.write.file.format";
   public static final String WRITE_THREAD_POOL_SIZE = "iceberg.mr.write.thread.pool.size";
   public static final int WRITE_THREAD_POOL_SIZE_DEFAULT = 10;

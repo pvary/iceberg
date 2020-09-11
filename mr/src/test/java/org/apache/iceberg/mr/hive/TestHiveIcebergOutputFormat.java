@@ -37,6 +37,7 @@ import org.apache.hadoop.mapred.OutputCommitter;
 import org.apache.hadoop.mapred.TaskAttemptContext;
 import org.apache.hadoop.mapred.TaskAttemptContextImpl;
 import org.apache.hadoop.mapred.TaskAttemptID;
+import org.apache.hadoop.mapreduce.JobStatus;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Table;
@@ -103,7 +104,7 @@ public class TestHiveIcebergOutputFormat {
     List<Record> records =
         Arrays.asList(new Record[] { HiveIcebergSerDeTestUtils.getTestRecord(FileFormat.PARQUET.equals(fileFormat)) });
 
-    testOutputFormat.write(records, false);
+    testOutputFormat.write(records, false, false);
     testOutputFormat.validate(records);
   }
 
@@ -116,7 +117,7 @@ public class TestHiveIcebergOutputFormat {
     // Write a row.
     List<Record> records = Arrays.asList(new Record[] { HiveIcebergSerDeTestUtils.getNullTestRecord() });
 
-    testOutputFormat.write(records, false);
+    testOutputFormat.write(records, false, false);
     testOutputFormat.validate(records);
   }
 
@@ -128,7 +129,7 @@ public class TestHiveIcebergOutputFormat {
         HiveIcebergSerDeTestUtils.getNullTestRecord()
     });
 
-    testOutputFormat.write(records, false);
+    testOutputFormat.write(records, false, false);
     testOutputFormat.validate(records);
   }
 
@@ -142,7 +143,7 @@ public class TestHiveIcebergOutputFormat {
 
     List<Record> records = helper.generateRandomRecords(30, 0L);
 
-    testOutputFormat.write(records, false);
+    testOutputFormat.write(records, false, false);
     testOutputFormat.validate(records);
   }
 
@@ -152,7 +153,7 @@ public class TestHiveIcebergOutputFormat {
     List<Record> records =
         Arrays.asList(new Record[] { HiveIcebergSerDeTestUtils.getTestRecord(FileFormat.PARQUET.equals(fileFormat)) });
 
-    testOutputFormat.write(records, true);
+    testOutputFormat.write(records, true, false);
     testOutputFormat.validate(records);
   }
 
@@ -162,12 +163,23 @@ public class TestHiveIcebergOutputFormat {
     testOutputFormat.validate(Collections.emptyList());
   }
 
+  @Test
+  public void testAbortJob() throws IOException {
+    // Write a row.
+    List<Record> records =
+        Arrays.asList(new Record[] { HiveIcebergSerDeTestUtils.getTestRecord(FileFormat.PARQUET.equals(fileFormat)) });
+
+    testOutputFormat.write(records, true, true);
+    testOutputFormat.validate(Collections.emptyList());
+  }
+
   private static class TestOutputFormat {
     private Configuration configuration;
     private Properties serDeProperties;
     private JobConf jobConf;
     private JobContext jobContext;
     private TaskAttemptContext taskAttemptContext;
+    private boolean jobAborted;
 
     private TestOutputFormat(Table table, FileFormat fileFormat) {
       configuration = new Configuration();
@@ -197,11 +209,11 @@ public class TestHiveIcebergOutputFormat {
       outputCommitter.commitJob(jobContext);
     }
 
-    private void write(List<Record> records, boolean withAbort) throws IOException {
+    private void write(List<Record> records, boolean withAbortedTask, boolean withAbortJob) throws IOException {
       HiveIcebergOutputFormat outputFormat = new HiveIcebergOutputFormat();
       OutputCommitter outputCommitter = new HiveIcebergOutputFormat.IcebergOutputCommitter();
 
-      if (withAbort) {
+      if (withAbortedTask) {
         IcebergRecordWriter writer =
             (IcebergRecordWriter) outputFormat.getHiveRecordWriter(jobConf,
                 null, null, false, serDeProperties, null);
@@ -228,7 +240,13 @@ public class TestHiveIcebergOutputFormat {
       writer.close(false);
 
       outputCommitter.commitTask(taskAttemptContext);
-      outputCommitter.commitJob(jobContext);
+      if (withAbortJob) {
+        outputCommitter.abortJob(jobContext, JobStatus.State.KILLED);
+        jobAborted = true;
+      } else {
+        outputCommitter.commitJob(jobContext);
+        jobAborted = false;
+      }
     }
 
     private void validate(List<Record> expected) throws IOException {
@@ -249,17 +267,27 @@ public class TestHiveIcebergOutputFormat {
 
       String expectedBaseLocation = newTable.location() + "/" + jobConf.get(HiveConf.ConfVars.HIVEQUERYID.varname) +
           "/" + taskAttemptContext.getTaskAttemptID().getJobID();
-      Set<String> fileList = Sets.newHashSet(new File(expectedBaseLocation).list((dir, name) -> !name.startsWith(".")));
 
-      if (records.size() > 0) {
-        TableScan scan = newTable.newScan();
-        String dataFilePath = scan.planFiles().iterator().next().file().path().toString();
-        File parentDir = new File(dataFilePath).getParentFile();
-        Assert.assertEquals(expectedBaseLocation, parentDir.getPath());
-        Assert.assertEquals(fileList,
-            Sets.newHashSet(new String[] {"task-0.committed", taskAttemptContext.getTaskAttemptID().toString()}));
+      if (!jobAborted) {
+        Set<String> fileList = Sets.newHashSet(new File(expectedBaseLocation).list((dir, name) -> !name.startsWith(".")));
+
+        if (records.size() > 0) {
+          TableScan scan = newTable.newScan();
+          String dataFilePath = scan.planFiles().iterator().next().file().path().toString();
+          File parentDir = new File(dataFilePath).getParentFile();
+
+          Assert.assertEquals(expectedBaseLocation, parentDir.getPath());
+          Assert.assertEquals(fileList,
+              Sets.newHashSet(new String[]{"task-0.committed", taskAttemptContext.getTaskAttemptID().toString()}));
+
+        } else {
+          Assert.assertEquals(fileList, Sets.newHashSet(new String[]{"task-0.committed"}));
+
+        }
       } else {
-        Assert.assertEquals(fileList, Sets.newHashSet(new String[] {"task-0.committed"}));
+        // If the job is aborted, we expect that the job directory is removed
+
+        Assert.assertFalse(new File(expectedBaseLocation).exists());
       }
     }
   }
