@@ -269,7 +269,8 @@ public class TestHiveIcebergOutputFormat {
           "/" + taskAttemptContext.getTaskAttemptID().getJobID();
 
       if (!jobAborted) {
-        Set<String> fileList = Sets.newHashSet(new File(expectedBaseLocation).list((dir, name) -> !name.startsWith(".")));
+        Set<String> fileList =
+            Sets.newHashSet(new File(expectedBaseLocation).list((dir, name) -> !name.startsWith(".")));
 
         if (records.size() > 0) {
           TableScan scan = newTable.newScan();
