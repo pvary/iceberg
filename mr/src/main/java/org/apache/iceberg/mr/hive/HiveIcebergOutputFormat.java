@@ -65,7 +65,9 @@ import org.apache.iceberg.data.avro.DataWriter;
 import org.apache.iceberg.data.orc.GenericOrcWriter;
 import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.exceptions.NotFoundException;
+import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.hadoop.HadoopFileIO;
+import org.apache.iceberg.hadoop.Util;
 import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.OutputFile;
@@ -136,6 +138,17 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
   }
 
   /**
+   * Generates the job temp location based on the job configuration.
+   * Currently it uses QUERY_LOCATION/jobId.
+   * @param conf The job's configuration
+   * @param jobId The JobID for the task
+   * @return The file to store the results
+   */
+  private static String generateJobLocation(Configuration conf, JobID jobId) {
+    return generateQueryLocation(conf) + "/" + jobId;
+  }
+
+  /**
    * Generates datafile location based on the task configuration.
    * Currently it uses QUERY_LOCATION/jobId/taskAttemptId.
    * @param conf The job's configuration
@@ -143,7 +156,7 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
    * @return The file to store the results
    */
   private static String generateDataFileLocation(Configuration conf, TaskAttemptID taskAttemptId) {
-    return generateQueryLocation(conf) + "/" + taskAttemptId.getJobID() + "/" + taskAttemptId.toString();
+    return generateJobLocation(conf, taskAttemptId.getJobID()) + "/" + taskAttemptId.toString();
   }
 
   /**
@@ -155,7 +168,7 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
    * @return The file to store the results
    */
   private static String generateCommitFileLocation(Configuration conf, JobID jobId, int taskId) {
-    return generateQueryLocation(conf) + "/" + jobId + "/task-" + taskId + COMMITTED_EXTENSION;
+    return generateJobLocation(conf, jobId) + "/task-" + taskId + COMMITTED_EXTENSION;
   }
 
   /**
@@ -303,7 +316,7 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
       Tasks.foreach(generateDataFileLocation(context.getJobConf(), context.getTaskAttemptID()))
           .retry(3)
           .suppressFailureWhenFinished()
-          .onFailure((file, exc) -> LOG.debug("Failed on to remove {} on abort", file, exc))
+          .onFailure((file, exc) -> LOG.debug("Failed on to remove file {} on abort task", file, exc))
           .run(file -> io.deleteFile(file));
     }
 
@@ -370,6 +383,25 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
           executor.shutdown();
         }
       }
+    }
+
+    @Override
+    public void abortJob(JobContext context, int status) throws IOException {
+      // Remove the result directory for the failed job
+      Tasks.foreach(generateJobLocation(context.getJobConf(), context.getJobID()))
+          .retry(3)
+          .suppressFailureWhenFinished()
+          .onFailure((file, exc) -> LOG.debug("Failed on to remove directory {} on abort job", file, exc))
+          .run(file -> {
+            Path toDelete = new Path(file);
+            FileSystem fs = Util.getFs(toDelete, context.getJobConf());
+            try {
+              fs.delete(toDelete, true /* recursive */);
+            } catch (IOException e) {
+              throw new RuntimeIOException(e, "Failed to delete job directory: %s", file);
+            }
+          });
+      cleanupJob(context);
     }
   }
 
