@@ -28,6 +28,7 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -145,7 +146,7 @@ public class HiveIcebergSerDeTestUtils {
     TableScan scan = table.newScan();
     List<Record> result = new ArrayList<>();
     scan.planFiles().forEach(fileScanTask -> {
-      CloseableIterable<Object> readIter = open(io, fileScanTask);
+      CloseableIterable<Object> readIter = open(io, table.schema(), fileScanTask);
       readIter.forEach(record -> result.add((Record) record));
       try {
         readIter.close();
@@ -156,13 +157,29 @@ public class HiveIcebergSerDeTestUtils {
     return result;
   }
 
-  private static CloseableIterable<Object> open(FileIO io, FileScanTask task) {
+  public static void validate(Table table, List<Record> expected, Integer sortBy) {
+    // Refresh the table, so we get the new data as well
+    table.refresh();
+    List<Record> records = HiveIcebergSerDeTestUtils.load(table.io(), table);
+
+    // Sort if needed
+    if (sortBy != null) {
+      expected.sort(Comparator.comparingLong(record -> ((Long) record.get(sortBy.intValue())).longValue()));
+      records.sort(Comparator.comparingLong(record -> ((Long) record.get(sortBy.intValue())).longValue()));
+    }
+    Assert.assertEquals(expected.size(), records.size());
+    for (int i = 0; i < expected.size(); ++i) {
+      HiveIcebergSerDeTestUtils.assertEquals(expected.get(i), records.get(i));
+    }
+  }
+
+  private static CloseableIterable<Object> open(FileIO io, Schema schema, FileScanTask task) {
     InputFile input = io.newInputFile(task.file().path().toString());
     // TODO: join to partition data from the manifest file
     switch (task.file().format()) {
       case AVRO:
         Avro.ReadBuilder avroReadBuilder = Avro.read(input)
-            .project(HiveIcebergSerDeTestUtils.FULL_SCHEMA)
+            .project(schema)
             .split(task.start(), task.length());
         avroReadBuilder.createReaderFunc(
             (expIcebergSchema, expAvroSchema) ->
@@ -171,19 +188,19 @@ public class HiveIcebergSerDeTestUtils {
         return avroReadBuilder.build();
       case PARQUET:
         Parquet.ReadBuilder parquetReadBuilder = Parquet.read(input)
-            .project(HiveIcebergSerDeTestUtils.FULL_SCHEMA)
+            .project(schema)
             .filter(task.residual())
             .caseSensitive(false)
             .split(task.start(), task.length());
         parquetReadBuilder.createReaderFunc(
             fileSchema -> GenericParquetReaders.buildReader(
-                HiveIcebergSerDeTestUtils.FULL_SCHEMA,
+                schema,
                 fileSchema,
                 constantsMap(task, IdentityPartitionConverters::convertConstant)));
         return parquetReadBuilder.build();
       case ORC:
         Map<Integer, ?> idToConstant = constantsMap(task, IdentityPartitionConverters::convertConstant);
-        Schema readSchemaWithoutConstantAndMetadataFields = TypeUtil.selectNot(HiveIcebergSerDeTestUtils.FULL_SCHEMA,
+        Schema readSchemaWithoutConstantAndMetadataFields = TypeUtil.selectNot(schema,
             Sets.union(idToConstant.keySet(), MetadataColumns.metadataFieldIds()));
         ORC.ReadBuilder orcReadBuilder = ORC.read(input)
             .project(readSchemaWithoutConstantAndMetadataFields)
@@ -192,7 +209,7 @@ public class HiveIcebergSerDeTestUtils {
             .split(task.start(), task.length());
         orcReadBuilder.createReaderFunc(
             fileSchema -> GenericOrcReader.buildReader(
-                HiveIcebergSerDeTestUtils.FULL_SCHEMA, fileSchema, idToConstant));
+                schema, fileSchema, idToConstant));
         return orcReadBuilder.build();
       default:
         throw new UnsupportedOperationException(String.format("Cannot read %s file: %s",

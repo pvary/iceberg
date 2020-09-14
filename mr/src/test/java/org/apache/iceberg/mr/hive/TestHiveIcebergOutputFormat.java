@@ -43,7 +43,6 @@ import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableScan;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.hadoop.HadoopTables;
 import org.apache.iceberg.mr.Catalogs;
 import org.apache.iceberg.mr.InputFormatConfig;
@@ -249,15 +248,9 @@ public class TestHiveIcebergOutputFormat {
       }
     }
 
-    private void validate(List<Record> expected) throws IOException {
-      // Reload the table, so we get the new data as well
-      Table newTable = Catalogs.loadTable(configuration, serDeProperties);
-      List<Record> records = HiveIcebergSerDeTestUtils.load(new HadoopFileIO(configuration), newTable);
-
-      Assert.assertEquals(expected.size(), records.size());
-      for (int i = 0; i < expected.size(); ++i) {
-        HiveIcebergSerDeTestUtils.assertEquals(expected.get(i), records.get(i));
-      }
+    private void validate(List<Record> expected) {
+      Table table = Catalogs.loadTable(configuration, serDeProperties);
+      HiveIcebergSerDeTestUtils.validate(table, expected, null);
 
       // Check the number of the files, and the content of the directory
       // We expect the following dir structure
@@ -265,29 +258,26 @@ public class TestHiveIcebergOutputFormat {
       //                         \ task-0.committed
       // We definitely do not want more files in the directory
 
-      String expectedBaseLocation = newTable.location() + "/" + jobConf.get(HiveConf.ConfVars.HIVEQUERYID.varname) +
+      String expectedBaseLocation = table.location() + "/" + jobConf.get(HiveConf.ConfVars.HIVEQUERYID.varname) +
           "/" + taskAttemptContext.getTaskAttemptID().getJobID();
 
       if (!jobAborted) {
         Set<String> fileList =
             Sets.newHashSet(new File(expectedBaseLocation).list((dir, name) -> !name.startsWith(".")));
 
-        if (records.size() > 0) {
-          TableScan scan = newTable.newScan();
+        if (expected.size() > 0) {
+          TableScan scan = table.newScan();
           String dataFilePath = scan.planFiles().iterator().next().file().path().toString();
           File parentDir = new File(dataFilePath).getParentFile();
 
           Assert.assertEquals(expectedBaseLocation, parentDir.getPath());
           Assert.assertEquals(fileList,
               Sets.newHashSet(new String[]{"task-0.committed", taskAttemptContext.getTaskAttemptID().toString()}));
-
         } else {
           Assert.assertEquals(fileList, Sets.newHashSet(new String[]{"task-0.committed"}));
-
         }
       } else {
         // If the job is aborted, we expect that the job directory is removed
-
         Assert.assertFalse(new File(expectedBaseLocation).exists());
       }
     }
