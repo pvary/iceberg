@@ -356,7 +356,7 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
                     .withPath(cfd.fileName)
                     .withFormat(cfd.fileFormat)
                     .withFileSizeInBytes(cfd.length)
-                    .withMetrics(cfd.serializableMetrics.metrics());
+                    .withMetrics(cfd.metrics);
                 dataFiles.add(builder.build());
               }
             });
@@ -428,14 +428,14 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     private final String fileName;
     private final FileFormat fileFormat;
     private final Long length;
-    private final SerializableMetrics serializableMetrics;
+    private final Metrics metrics;
 
     private ClosedFileData(String fileName, FileFormat fileFormat, Long length, Metrics metrics) {
       this.empty = false;
       this.fileName = fileName;
       this.fileFormat = fileFormat;
       this.length = length;
-      this.serializableMetrics = new SerializableMetrics(metrics);
+      this.metrics = metrics;
     }
 
     private ClosedFileData() {
@@ -443,50 +443,7 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
       this.fileName = null;
       this.fileFormat = null;
       this.length = null;
-      this.serializableMetrics = null;
-    }
-  }
-
-  /**
-   * We need this class, since Metrics in not Serializable (even though it implements the interface)
-   */
-  private static final class SerializableMetrics implements Serializable {
-    private Long rowCount;
-    private Map<Integer, Long> columnSizes;
-    private Map<Integer, Long> valueCounts;
-    private Map<Integer, Long> nullValueCounts;
-    private Map<Integer, byte[]> lowerBounds = null;
-    private Map<Integer, byte[]> upperBounds = null;
-
-    private SerializableMetrics(Metrics original) {
-      rowCount = original.recordCount();
-      columnSizes = original.columnSizes();
-      valueCounts = original.valueCounts();
-      nullValueCounts = original.nullValueCounts();
-      if (original.lowerBounds() != null) {
-        lowerBounds = new HashMap<>(original.lowerBounds().size());
-        original.lowerBounds().forEach((k, v) -> lowerBounds.put(k, v.array()));
-      }
-      if (original.upperBounds() != null) {
-        upperBounds = new HashMap<>(original.upperBounds().size());
-        original.upperBounds().forEach((k, v) -> upperBounds.put(k, v.array()));
-      }
-    }
-
-    private Metrics metrics() {
-      final Map<Integer, ByteBuffer> metricsLowerBounds =
-          lowerBounds != null ? new HashMap<>(lowerBounds.size()) : null;
-      final Map<Integer, ByteBuffer> metricsUpperBounds =
-          lowerBounds != null ? new HashMap<>(upperBounds.size()) : null;
-
-      if (lowerBounds != null) {
-        lowerBounds.forEach((k, v) -> metricsLowerBounds.put(k, ByteBuffer.wrap(v)));
-      }
-      if (upperBounds != null) {
-        upperBounds.forEach((k, v) -> metricsUpperBounds.put(k, ByteBuffer.wrap(v)));
-      }
-
-      return new Metrics(rowCount, columnSizes, valueCounts, nullValueCounts, metricsLowerBounds, metricsUpperBounds);
+      this.metrics = null;
     }
   }
 }
