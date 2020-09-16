@@ -315,7 +315,7 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
           .retry(3)
           .suppressFailureWhenFinished()
           .onFailure((file, exc) -> LOG.debug("Failed on to remove file {} on abort task", file, exc))
-          .run(file -> io.deleteFile(file));
+          .run(io::deleteFile);
     }
 
     @Override
