@@ -124,4 +124,19 @@ public class TestHiveRunnerWrite {
     records.addAll(records);
     HiveIcebergSerDeTestUtils.validate(table, records, 1);
   }
+
+  @Test
+  public void testDefaultFileFormat() {
+    shell.executeQuery("CREATE TABLE withShell2 STORED BY '" + HiveIcebergStorageHandler.class.getName() + "' " +
+        "LOCATION '" + table.location() + "'");
+
+    List<Record> records = helper.generateRandomRecords(2, 0L);
+    // The expected query is like
+    // INSERT INTO withShell VALUES ('farkas', 1), ('kutya', 2)
+    StringBuilder query = new StringBuilder().append("INSERT INTO withShell2 VALUES ");
+    records.forEach(record -> query.append("('").append(record.get(0)).append("',").append(record.get(1)).append("),"));
+    query.setLength(query.length() - 1);
+
+    shell.executeQuery(query.toString());
+  }
 }
