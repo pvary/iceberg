@@ -104,7 +104,9 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     this.overlayedConf = createOverlayedConf(jc, tableAndSerDeProperties);
     this.taskAttemptId = TaskAttemptID.forName(overlayedConf.get(TASK_ATTEMPT_ID_KEY));
     this.schema = SchemaParser.fromJson(overlayedConf.get(InputFormatConfig.TABLE_SCHEMA));
-    this.fileFormat = FileFormat.valueOf(overlayedConf.get(InputFormatConfig.WRITE_FILE_FORMAT).toUpperCase());
+    String fileFormatString =
+        overlayedConf.get(InputFormatConfig.WRITE_FILE_FORMAT,InputFormatConfig.WRITE_FILE_FORMAT_DEFAULT.name());
+    this.fileFormat = FileFormat.valueOf(fileFormatString);
 
     fileData.remove(this.taskAttemptId);
 
