@@ -69,17 +69,6 @@ public class IcebergWritable implements Writable {
     }
   }
 
-//    public void populateRow(PartialRow row) {
-//        Schema schema = row.getSchema();
-//        for (int i = 0; i < schema.getColumnCount(); i++) {
-//            ColumnSchema col = schema.getColumnByIndex(i);
-//            if (isSet(col.getName())) {
-//                Object value = getValueObject(col.getName());
-//                row.addObject(i, value);
-//            }
-//        }
-//    }
-
   @Override
   public void readFields(DataInput in) {
     throw new UnsupportedOperationException();
