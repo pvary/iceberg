@@ -138,5 +138,7 @@ public class TestHiveRunnerWrite {
     query.setLength(query.length() - 1);
 
     shell.executeQuery(query.toString());
+
+    HiveIcebergSerDeTestUtils.validate(table, records, 1);
   }
 }
