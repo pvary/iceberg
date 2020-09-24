@@ -27,46 +27,22 @@ import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Map;
-import java.util.Set;
 import java.util.UUID;
-import java.util.function.BiFunction;
-import org.apache.iceberg.FileScanTask;
-import org.apache.iceberg.MetadataColumns;
-import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.TableScan;
-import org.apache.iceberg.avro.Avro;
 import org.apache.iceberg.data.GenericRecord;
-import org.apache.iceberg.data.IdentityPartitionConverters;
+import org.apache.iceberg.data.IcebergGenerics;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.data.avro.DataReader;
-import org.apache.iceberg.data.orc.GenericOrcReader;
-import org.apache.iceberg.data.parquet.GenericParquetReaders;
 import org.apache.iceberg.io.CloseableIterable;
-import org.apache.iceberg.io.FileIO;
-import org.apache.iceberg.io.InputFile;
-import org.apache.iceberg.orc.ORC;
-import org.apache.iceberg.parquet.Parquet;
-import org.apache.iceberg.relocated.com.google.common.collect.Sets;
-import org.apache.iceberg.types.Type;
-import org.apache.iceberg.types.TypeUtil;
 import org.apache.iceberg.types.Types;
-import org.apache.iceberg.util.PartitionUtil;
 import org.apache.iceberg.util.UUIDUtil;
 import org.junit.Assert;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import static org.apache.iceberg.types.Types.NestedField.optional;
 
 public class HiveIcebergSerDeTestUtils {
-  private static final Logger LOG = LoggerFactory.getLogger(HiveIcebergSerDeTestUtils.class);
-
   // TODO: Can this be a constant all around the Iceberg tests?
   public static final Schema FULL_SCHEMA = new Schema(
       optional(1, "boolean_type", Types.BooleanType.get()),
@@ -86,7 +62,7 @@ public class HiveIcebergSerDeTestUtils {
       optional(13, "decimal_type", Types.DecimalType.of(38, 10)));
 
   private HiveIcebergSerDeTestUtils() {
-    // Empty constuctor for the utility class
+    // Empty constructor for the utility class
   }
 
   public static Record getTestRecord(boolean uuidAsByte) {
@@ -142,25 +118,13 @@ public class HiveIcebergSerDeTestUtils {
     }
   }
 
-  public static List<Record> load(FileIO io, Table table) {
-    TableScan scan = table.newScan();
-    List<Record> result = new ArrayList<>();
-    scan.planFiles().forEach(fileScanTask -> {
-      CloseableIterable<Object> readIter = open(io, table.schema(), fileScanTask);
-      readIter.forEach(record -> result.add((Record) record));
-      try {
-        readIter.close();
-      } catch (IOException ioException) {
-        LOG.error("Error closing file", ioException);
-      }
-    });
-    return result;
-  }
-
-  public static void validate(Table table, List<Record> expected, Integer sortBy) {
+  public static void validate(Table table, List<Record> expected, Integer sortBy) throws IOException {
     // Refresh the table, so we get the new data as well
     table.refresh();
-    List<Record> records = HiveIcebergSerDeTestUtils.load(table.io(), table);
+    List<Record> records = new ArrayList<>();
+    try (CloseableIterable<Record> iterable = IcebergGenerics.read(table).build()) {
+      iterable.forEach(records::add);
+    }
 
     // Sort if needed
     if (sortBy != null) {
@@ -170,62 +134,6 @@ public class HiveIcebergSerDeTestUtils {
     Assert.assertEquals(expected.size(), records.size());
     for (int i = 0; i < expected.size(); ++i) {
       HiveIcebergSerDeTestUtils.assertEquals(expected.get(i), records.get(i));
-    }
-  }
-
-  private static CloseableIterable<Object> open(FileIO io, Schema schema, FileScanTask task) {
-    InputFile input = io.newInputFile(task.file().path().toString());
-    // TODO: join to partition data from the manifest file
-    switch (task.file().format()) {
-      case AVRO:
-        Avro.ReadBuilder avroReadBuilder = Avro.read(input)
-            .project(schema)
-            .split(task.start(), task.length());
-        avroReadBuilder.createReaderFunc(
-            (expIcebergSchema, expAvroSchema) ->
-                DataReader.create(expIcebergSchema, expAvroSchema,
-                    constantsMap(task, IdentityPartitionConverters::convertConstant)));
-        return avroReadBuilder.build();
-      case PARQUET:
-        Parquet.ReadBuilder parquetReadBuilder = Parquet.read(input)
-            .project(schema)
-            .filter(task.residual())
-            .caseSensitive(false)
-            .split(task.start(), task.length());
-        parquetReadBuilder.createReaderFunc(
-            fileSchema -> GenericParquetReaders.buildReader(
-                schema,
-                fileSchema,
-                constantsMap(task, IdentityPartitionConverters::convertConstant)));
-        return parquetReadBuilder.build();
-      case ORC:
-        Map<Integer, ?> idToConstant = constantsMap(task, IdentityPartitionConverters::convertConstant);
-        Schema readSchemaWithoutConstantAndMetadataFields = TypeUtil.selectNot(schema,
-            Sets.union(idToConstant.keySet(), MetadataColumns.metadataFieldIds()));
-        ORC.ReadBuilder orcReadBuilder = ORC.read(input)
-            .project(readSchemaWithoutConstantAndMetadataFields)
-            .filter(task.residual())
-            .caseSensitive(false)
-            .split(task.start(), task.length());
-        orcReadBuilder.createReaderFunc(
-            fileSchema -> GenericOrcReader.buildReader(
-                schema, fileSchema, idToConstant));
-        return orcReadBuilder.build();
-      default:
-        throw new UnsupportedOperationException(String.format("Cannot read %s file: %s",
-            task.file().format().name(), task.file().path()));
-    }
-  }
-
-  private static Map<Integer, ?> constantsMap(FileScanTask task, BiFunction<Type, Object, Object> converter) {
-    PartitionSpec spec = task.spec();
-    Set<Integer> idColumns = spec.identitySourceIds();
-    Schema partitionSchema = TypeUtil.select(HiveIcebergSerDeTestUtils.FULL_SCHEMA, idColumns);
-    boolean projectsIdentityPartitionColumns = !partitionSchema.columns().isEmpty();
-    if (projectsIdentityPartitionColumns) {
-      return PartitionUtil.constantsMap(task, converter);
-    } else {
-      return Collections.emptyMap();
     }
   }
 }

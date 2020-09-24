@@ -57,11 +57,8 @@ import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.avro.Avro;
+import org.apache.iceberg.data.GenericAppenderFactory;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.data.avro.DataWriter;
-import org.apache.iceberg.data.orc.GenericOrcWriter;
-import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.hadoop.HadoopFileIO;
@@ -72,8 +69,6 @@ import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.mr.Catalogs;
 import org.apache.iceberg.mr.InputFormatConfig;
 import org.apache.iceberg.mr.mapreduce.IcebergWritable;
-import org.apache.iceberg.orc.ORC;
-import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.apache.iceberg.util.Tasks;
@@ -203,36 +198,9 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
 
     IcebergRecordWriter(String location) throws IOException {
       this.location = location;
-      io = new HadoopFileIO(overlayedConf);
+      this.io = new HadoopFileIO(overlayedConf);
       OutputFile dataFile = io.newOutputFile(location);
-
-      switch (fileFormat) {
-        case AVRO:
-          this.appender = Avro.write(dataFile)
-              .schema(schema)
-              .createWriterFunc(DataWriter::create)
-              .named(fileFormat.name())
-              .build();
-          break;
-
-        case PARQUET:
-          this.appender = Parquet.write(dataFile)
-              .schema(schema)
-              .createWriterFunc(GenericParquetWriter::buildWriter)
-              .named(fileFormat.name())
-              .build();
-          break;
-
-        case ORC:
-          this.appender = ORC.write(dataFile)
-              .schema(schema)
-              .createWriterFunc(GenericOrcWriter::buildWriter)
-              .build();
-          break;
-
-        default:
-          throw new UnsupportedOperationException("Cannot write format: " + fileFormat);
-      }
+      this.appender = new GenericAppenderFactory(schema).newAppender(dataFile, fileFormat);
       LOG.info("IcebergRecordWriter is created in {} with {}", location, fileFormat);
     }
 
