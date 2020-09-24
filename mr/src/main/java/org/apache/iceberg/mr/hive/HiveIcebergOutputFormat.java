@@ -387,7 +387,7 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     try (ObjectInputStream ois = new ObjectInputStream(io.newInputFile(committedFileLocation).newStream())) {
       return (ClosedFileData) ois.readObject();
     } catch (ClassNotFoundException | IOException e) {
-      throw new NotFoundException("Can not read or parse committed file: " + committedFileLocation, e);
+      throw new NotFoundException(e, "Can not read or parse committed file: %s", committedFileLocation);
     }
   }
 
