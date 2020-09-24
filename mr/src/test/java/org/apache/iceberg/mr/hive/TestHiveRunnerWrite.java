@@ -26,6 +26,7 @@ import java.io.IOException;
 import java.util.List;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.data.Record;
@@ -47,6 +48,9 @@ public class TestHiveRunnerWrite {
   private static final Schema SCHEMA = new Schema(
       required(1, "data", Types.StringType.get()),
       required(2, "id", Types.LongType.get()));
+
+  private static final PartitionSpec SPEC =
+      PartitionSpec.builderFor(SCHEMA).bucket("id", 3).build();
 
   @Rule
   public TemporaryFolder temp = new TemporaryFolder();
@@ -140,5 +144,33 @@ public class TestHiveRunnerWrite {
     shell.executeQuery(query.toString());
 
     HiveIcebergSerDeTestUtils.validate(table, records, 1);
+  }
+
+  @Test
+  public void testPartitionedWrite() throws IOException {
+    TestHelper helper2 = new TestHelper(conf,
+        new HadoopTables(conf),
+        temp.newFolder(FileFormat.PARQUET.name() + "_partitioned").toString(),
+        SCHEMA,
+        SPEC,
+        FileFormat.PARQUET,
+        temp);
+
+    Table table2 = helper2.createTable(SCHEMA, SPEC);
+
+    shell.executeQuery("CREATE TABLE withShell2 STORED BY '" + HiveIcebergStorageHandler.class.getName() + "' " +
+        "LOCATION '" + table2.location() + "' " +
+        "TBLPROPERTIES ('" + InputFormatConfig.WRITE_FILE_FORMAT + "'='" + FileFormat.PARQUET.name() + "')");
+
+    List<Record> records = helper2.generateRandomRecords(4, 0L);
+    // The expected query is like
+    // INSERT INTO withShell VALUES ('farkas', 1), ('kutya', 2)
+    StringBuilder query = new StringBuilder().append("INSERT INTO withShell2 VALUES ");
+    records.forEach(record -> query.append("('").append(record.get(0)).append("',").append(record.get(1)).append("),"));
+    query.setLength(query.length() - 1);
+
+    shell.executeQuery(query.toString());
+
+    HiveIcebergSerDeTestUtils.validate(table2, records, 1);
   }
 }

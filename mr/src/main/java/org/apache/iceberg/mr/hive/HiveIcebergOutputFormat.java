@@ -23,10 +23,12 @@ import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.Serializable;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -53,7 +55,9 @@ import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.Metrics;
+import org.apache.iceberg.PartitionKey;
 import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.PartitionSpecParser;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Table;
@@ -82,13 +86,14 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
   private static final String TASK_ATTEMPT_ID_KEY = "mapred.task.id";
   private static final String COMMITTED_EXTENSION = ".committed";
 
-  // <TaskAttemptId, ClosedFileData> map to store the data needed to create DataFiles
+  // <TaskAttemptId, WriteData> map to store the data needed to create DataFiles
   // Stored in concurrent map, since some executor engines can share containers
-  private static final Map<TaskAttemptID, ClosedFileData> fileData = new ConcurrentHashMap<>();
+  private static final Map<TaskAttemptID, WriteData> fileData = new ConcurrentHashMap<>();
 
   private Configuration overlayedConf = null;
   private TaskAttemptID taskAttemptId = null;
   private Schema schema = null;
+  private PartitionSpec spec = null;
   private FileFormat fileFormat = null;
 
   @Override
@@ -99,6 +104,7 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     this.overlayedConf = createOverlayedConf(jc, tableAndSerDeProperties);
     this.taskAttemptId = TaskAttemptID.forName(overlayedConf.get(TASK_ATTEMPT_ID_KEY));
     this.schema = SchemaParser.fromJson(overlayedConf.get(InputFormatConfig.TABLE_SCHEMA));
+    this.spec = PartitionSpecParser.fromJson(schema, overlayedConf.get(InputFormatConfig.PARTITION_SPEC));
     String fileFormatString =
         overlayedConf.get(InputFormatConfig.WRITE_FILE_FORMAT, InputFormatConfig.WRITE_FILE_FORMAT_DEFAULT.name());
     this.fileFormat = FileFormat.valueOf(fileFormatString);
@@ -193,14 +199,18 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
       implements FileSinkOperator.RecordWriter, org.apache.hadoop.mapred.RecordWriter<NullWritable, IcebergWritable> {
 
     private final String location;
-    private final FileAppender<Record> appender;
+    private final Map<PartitionKey, AppenderWrapper> appenders;
     private final FileIO io;
+    private final GenericAppenderFactory appenderFactory;
+    private final PartitionKey currentKey;
 
-    IcebergRecordWriter(String location) throws IOException {
+    IcebergRecordWriter(String location) {
       this.location = location;
       this.io = new HadoopFileIO(overlayedConf);
-      OutputFile dataFile = io.newOutputFile(location);
-      this.appender = new GenericAppenderFactory(schema).newAppender(dataFile, fileFormat);
+      this.appenderFactory = new GenericAppenderFactory(schema);
+
+      this.appenders = new HashMap<>();
+      this.currentKey = new PartitionKey(spec, schema);
       LOG.info("IcebergRecordWriter is created in {} with {}", location, fileFormat);
     }
 
@@ -208,8 +218,17 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     public void write(Writable row) {
       Preconditions.checkArgument(row instanceof IcebergWritable);
 
-      // TODO partition handling
-      appender.add(((IcebergWritable) row).record());
+      Record record = ((IcebergWritable) row).record();
+
+      currentKey.partition(record);
+
+      AppenderWrapper currentAppender = appenders.get(currentKey);
+      if (currentAppender == null) {
+        currentAppender = getAppender();
+        appenders.put(currentKey.copy(), currentAppender);
+      }
+
+      currentAppender.appender.add(record);
     }
 
     @Override
@@ -219,9 +238,14 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
 
     @Override
     public void close(boolean abort) throws IOException {
-      appender.close();
+      Set<ClosedFileData> fileDataSet = new HashSet<>(appenders.size());
+      for (PartitionKey key : appenders.keySet()) {
+        AppenderWrapper wrapper = appenders.get(key);
+        wrapper.close();
+        fileDataSet.add(new ClosedFileData(key, wrapper.location, wrapper.length(), wrapper.metrics()));
+      }
       if (!abort) {
-        fileData.put(taskAttemptId, new ClosedFileData(location, fileFormat, appender.length(), appender.metrics()));
+        fileData.put(taskAttemptId, new WriteData(fileFormat, fileDataSet));
       }
     }
 
@@ -233,6 +257,16 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     @Override
     public void close(Reporter reporter) throws IOException {
       close(false);
+    }
+
+    private AppenderWrapper getAppender() {
+      String dataFileLocation = location + UUID.randomUUID();
+      OutputFile dataFile = io.newOutputFile(dataFileLocation);
+
+      appenderFactory.newAppender(dataFile, fileFormat);
+      FileAppender<Record> appender = appenderFactory.newAppender(dataFile, fileFormat);
+
+      return new AppenderWrapper(appender, dataFileLocation);
     }
   }
 
@@ -262,15 +296,15 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     public void commitTask(TaskAttemptContext context) throws IOException {
       String commitFileLocation = generateCommitFileLocation(context.getJobConf(), context.getTaskAttemptID());
 
-      ClosedFileData closedFileData = fileData.remove(context.getTaskAttemptID());
+      WriteData writeData = fileData.remove(context.getTaskAttemptID());
 
       // Generate empty closed file data
-      if (closedFileData == null) {
-        closedFileData = new ClosedFileData();
+      if (writeData == null) {
+        writeData = new WriteData();
       }
 
       // Create the committed file for the task
-      createCommittedFileFor(new HadoopFileIO(context.getJobConf()), closedFileData, commitFileLocation);
+      createCommittedFileFor(new HadoopFileIO(context.getJobConf()), writeData, commitFileLocation);
     }
 
     @Override
@@ -316,16 +350,19 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
             .retry(3)
             .run(taskId -> {
               String taskFileName = generateCommitFileLocation(conf, jobContext.getJobID(), taskId);
-              ClosedFileData cfd = readCommittedFile(table.io(), taskFileName);
+              WriteData writeData = readCommittedFile(table.io(), taskFileName);
 
               // If the data is not empty add to the table
-              if (!cfd.empty) {
-                DataFiles.Builder builder = DataFiles.builder(PartitionSpec.unpartitioned())
-                    .withPath(cfd.fileName)
-                    .withFormat(cfd.fileFormat)
-                    .withFileSizeInBytes(cfd.length)
-                    .withMetrics(cfd.metrics);
-                dataFiles.add(builder.build());
+              if (!writeData.empty) {
+                writeData.fileDataSet.forEach(file -> {
+                  DataFiles.Builder builder = DataFiles.builder(table.spec())
+                      .withPath(file.fileName)
+                      .withFormat(writeData.fileFormat)
+                      .withFileSizeInBytes(file.length)
+                      .withPartition(file.partitionKey)
+                      .withMetrics(file.metrics);
+                  dataFiles.add(builder.build());
+                });
               }
             });
 
@@ -373,45 +410,75 @@ public class HiveIcebergOutputFormat implements OutputFormat<NullWritable, Icebe
     }
   }
 
-  private static void createCommittedFileFor(FileIO io, ClosedFileData closedFileData, String location)
+  private static void createCommittedFileFor(FileIO io, WriteData writeData, String location)
       throws IOException {
 
     OutputFile commitFile = io.newOutputFile(location);
     ObjectOutputStream oos = new ObjectOutputStream(commitFile.createOrOverwrite());
-    oos.writeObject(closedFileData);
+    oos.writeObject(writeData);
     oos.close();
     LOG.debug("Iceberg committed file is created {}", commitFile);
   }
 
-  private static ClosedFileData readCommittedFile(FileIO io, String committedFileLocation) {
+  private static WriteData readCommittedFile(FileIO io, String committedFileLocation) {
     try (ObjectInputStream ois = new ObjectInputStream(io.newInputFile(committedFileLocation).newStream())) {
-      return (ClosedFileData) ois.readObject();
+      return (WriteData) ois.readObject();
     } catch (ClassNotFoundException | IOException e) {
       throw new NotFoundException("Can not read or parse committed file: " + committedFileLocation, e);
     }
   }
 
-  private static final class ClosedFileData implements Serializable {
+  private static final class AppenderWrapper {
+    private final FileAppender<Record> appender;
+    private final String location;
+
+    AppenderWrapper(FileAppender<Record> appender, String location) {
+      this.appender = appender;
+      this.location = location;
+    }
+
+    public long length() {
+      return appender.length();
+    }
+
+    public Metrics metrics() {
+      return appender.metrics();
+    }
+
+    public void close() throws IOException {
+      appender.close();
+    }
+  }
+
+  private static final class WriteData implements Serializable {
     private final boolean empty;
-    private final String fileName;
     private final FileFormat fileFormat;
+    private final Set<ClosedFileData> fileDataSet;
+
+    WriteData(FileFormat fileFormat, Set<ClosedFileData> fileDataSet) {
+      this.empty = false;
+      this.fileFormat = fileFormat;
+      this.fileDataSet = fileDataSet;
+    }
+
+    WriteData() {
+      empty = true;
+      fileFormat = null;
+      fileDataSet = null;
+    }
+  }
+
+  private static final class ClosedFileData implements Serializable {
+    private final PartitionKey partitionKey;
+    private final String fileName;
     private final Long length;
     private final Metrics metrics;
 
-    private ClosedFileData(String fileName, FileFormat fileFormat, Long length, Metrics metrics) {
-      this.empty = false;
+    ClosedFileData(PartitionKey partitionKey, String fileName, Long length, Metrics metrics) {
+      this.partitionKey = partitionKey;
       this.fileName = fileName;
-      this.fileFormat = fileFormat;
       this.length = length;
       this.metrics = metrics;
-    }
-
-    private ClosedFileData() {
-      this.empty = true;
-      this.fileName = null;
-      this.fileFormat = null;
-      this.length = null;
-      this.metrics = null;
     }
   }
 }

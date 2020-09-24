@@ -19,6 +19,7 @@
 
 package org.apache.iceberg.mr.hive;
 
+import java.util.HashMap;
 import java.util.Map;
 import java.util.Properties;
 import org.apache.hadoop.conf.Configuration;
@@ -35,10 +36,12 @@ import org.apache.hadoop.hive.serde2.Deserializer;
 import org.apache.hadoop.mapred.InputFormat;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapred.OutputFormat;
+import org.apache.iceberg.PartitionSpecParser;
 import org.apache.iceberg.SchemaParser;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.mr.Catalogs;
 import org.apache.iceberg.mr.InputFormatConfig;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 
 public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, HiveStorageHandler {
 
@@ -74,12 +77,12 @@ public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, H
 
   @Override
   public void configureInputJobProperties(TableDesc tableDesc, Map<String, String> map) {
-    populateTableProperties(tableDesc, map);
+    overlayTableProperties(tableDesc, map);
   }
 
   @Override
   public void configureOutputJobProperties(TableDesc tableDesc, Map<String, String> map) {
-    populateTableProperties(tableDesc, map);
+    overlayTableProperties(tableDesc, map);
     map.put(WRITE_KEY, "true");
   }
 
@@ -125,12 +128,19 @@ public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, H
     return predicate;
   }
 
-  private void populateTableProperties(TableDesc tableDesc, Map<String, String> map) {
+  private void overlayTableProperties(TableDesc tableDesc, Map<String, String> map) {
     Properties props = tableDesc.getProperties();
     Table table = Catalogs.loadTable(conf, props);
+
+    Map<String, String> original = new HashMap<>(map);
+    map.clear();
+
+    map.putAll(Maps.fromProperties(props));
+    map.putAll(original);
 
     map.put(InputFormatConfig.TABLE_IDENTIFIER, props.getProperty(NAME));
     map.put(InputFormatConfig.TABLE_LOCATION, table.location());
     map.put(InputFormatConfig.TABLE_SCHEMA, SchemaParser.toJson(table.schema()));
+    map.put(InputFormatConfig.PARTITION_SPEC, PartitionSpecParser.toJson(table.spec()));
   }
 }
