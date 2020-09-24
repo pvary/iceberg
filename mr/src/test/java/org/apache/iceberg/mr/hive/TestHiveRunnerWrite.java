@@ -81,7 +81,7 @@ public class TestHiveRunnerWrite {
   }
 
   @Test
-  public void testInsert() {
+  public void testInsert() throws IOException {
     List<Record> records = helper.generateRandomRecords(2, 0L);
     // The expected query is like
     // INSERT INTO withShell VALUES ('farkas', 1), ('kutya', 2)
@@ -126,7 +126,7 @@ public class TestHiveRunnerWrite {
   }
 
   @Test
-  public void testDefaultFileFormat() {
+  public void testDefaultFileFormat() throws IOException {
     shell.executeQuery("CREATE TABLE withShell2 STORED BY '" + HiveIcebergStorageHandler.class.getName() + "' " +
         "LOCATION '" + table.location() + "'");
 

@@ -248,7 +248,7 @@ public class TestHiveIcebergOutputFormat {
       }
     }
 
-    private void validate(List<Record> expected) {
+    private void validate(List<Record> expected) throws IOException {
       Table table = Catalogs.loadTable(configuration, serDeProperties);
       HiveIcebergSerDeTestUtils.validate(table, expected, null);
 
