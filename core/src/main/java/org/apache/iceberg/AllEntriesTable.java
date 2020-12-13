@@ -40,39 +40,24 @@ import org.apache.iceberg.util.ThreadPools;
  * use {@link DataFilesTable}.
  */
 public class AllEntriesTable extends BaseMetadataTable {
-  private final TableOperations ops;
-  private final Table table;
-  private final String name;
 
   AllEntriesTable(TableOperations ops, Table table) {
     this(ops, table, table.name() + ".all_entries");
   }
 
   AllEntriesTable(TableOperations ops, Table table, String name) {
-    this.ops = ops;
-    this.table = table;
-    this.name = name;
-  }
-
-  @Override
-  Table table() {
-    return table;
-  }
-
-  @Override
-  public String name() {
-    return name;
+    super(ops, table, name, MetadataTableType.ALL_ENTRIES);
   }
 
   @Override
   public TableScan newScan() {
-    return new Scan(ops, table, schema());
+    return new Scan(ops(), table(), schema());
   }
 
   @Override
   public Schema schema() {
-    Schema schema = ManifestEntry.getSchema(table.spec().partitionType());
-    if (table.spec().fields().size() < 1) {
+    Schema schema = ManifestEntry.getSchema(table().spec().partitionType());
+    if (table().spec().fields().size() < 1) {
       // avoid returning an empty struct, which is not always supported. instead, drop the partition field (id 102)
       return TypeUtil.selectNot(schema, Sets.newHashSet(102));
     } else {

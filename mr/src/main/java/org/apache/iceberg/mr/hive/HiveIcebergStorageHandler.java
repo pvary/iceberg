@@ -35,6 +35,7 @@ import org.apache.hadoop.mapred.InputFormat;
 import org.apache.hadoop.mapred.JobConf;
 import org.apache.hadoop.mapred.OutputFormat;
 import org.apache.iceberg.BaseTable;
+import org.apache.iceberg.HasStaticStub;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.PartitionSpecParser;
 import org.apache.iceberg.Schema;
@@ -86,8 +87,8 @@ public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, H
     map.put(InputFormatConfig.TABLE_IDENTIFIER, props.getProperty(Catalogs.NAME));
     map.put(InputFormatConfig.TABLE_LOCATION, table.location());
     map.put(InputFormatConfig.TABLE_SCHEMA, schemaJson);
-    if (table instanceof BaseTable) {
-      map.put(InputFormatConfig.METADATA_LOCATION, ((BaseTable) table).operations().current().metadataFileLocation());
+    if (table instanceof HasStaticStub) {
+      map.put(InputFormatConfig.STATIC_STUB, SerializationUtil.serializeToBase64(((HasStaticStub) table).stub()));
     }
 
     map.put(InputFormatConfig.FILE_IO, SerializationUtil.serializeToBase64(table.io()));
@@ -192,6 +193,15 @@ public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, H
   }
 
   /**
+   * Returns the Table PartitionSpec serialized to the configuration.
+   * @param config The configuration used to get the data from
+   * @return The Table PartitionSpec object
+   */
+  public static HasStaticStub.Stub stub(Configuration config) {
+    return SerializationUtil.deserializeFromBase64(config.get(InputFormatConfig.STATIC_STUB));
+  }
+
+  /**
    * Stores the serializable table data in the configuration.
    * Currently the following is handled:
    * <ul>
@@ -211,9 +221,8 @@ public class HiveIcebergStorageHandler implements HiveStoragePredicateHandler, H
     config.set(InputFormatConfig.TABLE_LOCATION, table.location());
     config.set(InputFormatConfig.TABLE_SCHEMA, SchemaParser.toJson(table.schema()));
     config.set(InputFormatConfig.PARTITION_SPEC, PartitionSpecParser.toJson(table.spec()));
-    if (table instanceof BaseTable) {
-      config.set(InputFormatConfig.METADATA_LOCATION,
-          ((BaseTable) table).operations().current().metadataFileLocation());
+    if (table instanceof HasStaticStub) {
+      config.set(InputFormatConfig.STATIC_STUB, SerializationUtil.serializeToBase64(((HasStaticStub) table).stub()));
     }
 
     config.set(InputFormatConfig.FILE_IO, SerializationUtil.serializeToBase64(table.io()));

@@ -38,14 +38,13 @@ import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.CombinedScanTask;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.HasStaticStub;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SchemaParser;
-import org.apache.iceberg.StaticTableOperations;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.TableScan;
 import org.apache.iceberg.avro.Avro;
@@ -97,10 +96,9 @@ public class IcebergInputFormat<T> extends InputFormat<Void, T> {
   public List<InputSplit> getSplits(JobContext context) {
     Configuration conf = context.getConfiguration();
     Table table;
-    if (conf.get(InputFormatConfig.METADATA_LOCATION) != null) {
-      TableOperations ops =
-          new StaticTableOperations(conf.get(InputFormatConfig.METADATA_LOCATION), HiveIcebergStorageHandler.io(conf));
-      table = new BaseTable(ops, conf.get(InputFormatConfig.TABLE_IDENTIFIER));
+    if (conf.get(InputFormatConfig.STATIC_STUB) != null) {
+      HasStaticStub.Stub stub = HiveIcebergStorageHandler.stub(conf);
+      table = new HasStaticStub.Builder(stub).io(HiveIcebergStorageHandler.io(conf)).build();
     } else {
       table = Catalogs.loadTable(conf);
     }

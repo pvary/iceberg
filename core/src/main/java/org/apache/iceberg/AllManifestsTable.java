@@ -55,33 +55,17 @@ public class AllManifestsTable extends BaseMetadataTable {
       )))
   );
 
-  private final TableOperations ops;
-  private final Table table;
-  private final String name;
-
   AllManifestsTable(TableOperations ops, Table table) {
     this(ops, table, table.name() + ".all_manifests");
   }
 
   AllManifestsTable(TableOperations ops, Table table, String name) {
-    this.ops = ops;
-    this.table = table;
-    this.name = name;
-  }
-
-  @Override
-  Table table() {
-    return table;
-  }
-
-  @Override
-  public String name() {
-    return name;
+    super(ops, table, name, MetadataTableType.ALL_MANIFESTS);
   }
 
   @Override
   public TableScan newScan() {
-    return new AllManifestsTableScan(ops, table, MANIFEST_FILE_SCHEMA);
+    return new AllManifestsTableScan(ops(), table(), MANIFEST_FILE_SCHEMA);
   }
 
   @Override

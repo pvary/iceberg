@@ -41,33 +41,18 @@ public class HistoryTable extends BaseMetadataTable {
       Types.NestedField.required(4, "is_current_ancestor", Types.BooleanType.get())
   );
 
-  private final TableOperations ops;
-  private final Table table;
-  private final String name;
 
   HistoryTable(TableOperations ops, Table table) {
     this(ops, table, table.name() + ".history");
   }
 
   HistoryTable(TableOperations ops, Table table, String name) {
-    this.ops = ops;
-    this.table = table;
-    this.name = name;
-  }
-
-  @Override
-  Table table() {
-    return table;
-  }
-
-  @Override
-  public String name() {
-    return name;
+    super(ops, table, name, MetadataTableType.HISTORY);
   }
 
   @Override
   public TableScan newScan() {
-    return new HistoryScan();
+    return new HistoryScan(ops(), table());
   }
 
   @Override
@@ -77,13 +62,13 @@ public class HistoryTable extends BaseMetadataTable {
 
   private DataTask task(TableScan scan) {
     return StaticDataTask.of(
-        ops.io().newInputFile(ops.current().metadataFileLocation()),
-        ops.current().snapshotLog(),
-        convertHistoryEntryFunc(table));
+        ops().io().newInputFile(ops().current().metadataFileLocation()),
+        ops().current().snapshotLog(),
+        convertHistoryEntryFunc(table()));
   }
 
   private class HistoryScan extends StaticTableScan {
-    HistoryScan() {
+    HistoryScan(TableOperations ops, Table table) {
       super(ops, table, HISTORY_SCHEMA, HistoryTable.this::task);
     }
 

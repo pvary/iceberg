@@ -21,6 +21,7 @@ package org.apache.iceberg.mr;
 
 import java.util.List;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.iceberg.HasStaticStub;
 import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.SchemaParser;
@@ -47,7 +48,7 @@ public class InputFormatConfig {
   public static final String TABLE_LOCATION = "iceberg.mr.table.location";
   public static final String TABLE_SCHEMA = "iceberg.mr.table.schema";
   public static final String PARTITION_SPEC = "iceberg.mr.table.partition.spec";
-  public static final String METADATA_LOCATION = "iceberg.mr.table.metadata.location";
+  public static final String STATIC_STUB = "iceberg.mr.table.static.stub";
   public static final String LOCALITY = "iceberg.mr.locality";
   public static final String CATALOG = "iceberg.mr.catalog";
   public static final String HADOOP_CATALOG_WAREHOUSE_LOCATION = "iceberg.mr.catalog.hadoop.warehouse.location";
@@ -91,9 +92,8 @@ public class InputFormatConfig {
       // Store the io and the current snapshot of the table in the configuration which are needed for the split
       // generation
       Table table = Catalogs.loadTable(conf);
-      conf.set(InputFormatConfig.METADATA_LOCATION,
-          ((HasTableOperations) table).operations().current().metadataFileLocation());
 
+      conf.set(InputFormatConfig.STATIC_STUB, SerializationUtil.serializeToBase64(((HasStaticStub) table).stub()));
       conf.set(InputFormatConfig.FILE_IO, SerializationUtil.serializeToBase64(table.io()));
       return conf;
     }

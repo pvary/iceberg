@@ -30,7 +30,7 @@ import org.apache.iceberg.io.LocationProvider;
  * <p>
  * This can be extended by providing a {@link TableOperations} to the constructor.
  */
-public class BaseTable implements Table, HasTableOperations {
+public class BaseTable implements Table, HasTableOperations, HasStaticStub {
   private final TableOperations ops;
   private final String name;
 
@@ -212,5 +212,10 @@ public class BaseTable implements Table, HasTableOperations {
   @Override
   public String toString() {
     return name();
+  }
+
+  @Override
+  public Stub stub() {
+    return new Stub(ops.current().metadataFileLocation());
   }
 }

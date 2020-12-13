@@ -38,33 +38,17 @@ public class SnapshotsTable extends BaseMetadataTable {
           Types.MapType.ofRequired(7, 8, Types.StringType.get(), Types.StringType.get()))
   );
 
-  private final TableOperations ops;
-  private final Table table;
-  private final String name;
-
   SnapshotsTable(TableOperations ops, Table table) {
     this(ops, table, table.name() + ".snapshots");
   }
 
   SnapshotsTable(TableOperations ops, Table table, String name) {
-    this.ops = ops;
-    this.table = table;
-    this.name = name;
-  }
-
-  @Override
-  Table table() {
-    return table;
-  }
-
-  @Override
-  public String name() {
-    return name;
+    super(ops, table, name, MetadataTableType.SNAPSHOTS);
   }
 
   @Override
   public TableScan newScan() {
-    return new SnapshotsTableScan();
+    return new SnapshotsTableScan(ops(), table());
   }
 
   @Override
@@ -74,14 +58,14 @@ public class SnapshotsTable extends BaseMetadataTable {
 
   private DataTask task(BaseTableScan scan) {
     return StaticDataTask.of(
-        ops.io().newInputFile(ops.current().metadataFileLocation()),
-        ops.current().snapshots(),
+        ops().io().newInputFile(ops().current().metadataFileLocation()),
+        ops().current().snapshots(),
         SnapshotsTable::snapshotToRow);
   }
 
   private class SnapshotsTableScan extends StaticTableScan {
-    SnapshotsTableScan() {
-      super(ops, table, SNAPSHOT_SCHEMA, SnapshotsTable.this::task);
+    SnapshotsTableScan(TableOperations ops, Table table) {
+      super(ops table, SNAPSHOT_SCHEMA, SnapshotsTable.this::task);
     }
 
     @Override

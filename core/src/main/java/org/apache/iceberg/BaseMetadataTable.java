@@ -26,11 +26,33 @@ import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.LocationProvider;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 
-abstract class BaseMetadataTable implements Table {
+abstract class BaseMetadataTable implements Table, HasStaticStub {
   private final PartitionSpec spec = PartitionSpec.unpartitioned();
   private final SortOrder sortOrder = SortOrder.unsorted();
+  private final TableOperations ops;
+  private final Table table;
+  private final String name;
+  private final MetadataTableType type;
 
-  abstract Table table();
+  BaseMetadataTable(TableOperations ops, Table table, String name, MetadataTableType type) {
+    this.ops = ops;
+    this.table = table;
+    this.name = name;
+    this.type = type;
+  }
+
+  protected TableOperations ops() {
+    return ops;
+  }
+
+  protected Table table() {
+    return table;
+  }
+
+  @Override
+  public String name() {
+    return name;
+  }
 
   @Override
   public FileIO io() {
@@ -180,5 +202,10 @@ abstract class BaseMetadataTable implements Table {
   @Override
   public String toString() {
     return name();
+  }
+
+  @Override
+  public HasStaticStub.Stub stub() {
+    return new HasStaticStub.Stub(ops.current().metadataFileLocation(), name, type);
   }
 }

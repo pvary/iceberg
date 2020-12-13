@@ -29,57 +29,42 @@ import org.apache.iceberg.util.StructLikeWrapper;
  */
 public class PartitionsTable extends BaseMetadataTable {
 
-  private final TableOperations ops;
-  private final Table table;
   private final Schema schema;
-  private final String name;
 
   PartitionsTable(TableOperations ops, Table table) {
     this(ops, table, table.name() + ".partitions");
   }
 
   PartitionsTable(TableOperations ops, Table table, String name) {
-    this.ops = ops;
-    this.table = table;
+    super(ops, table, name, MetadataTableType.PARTITIONS);
     this.schema = new Schema(
         Types.NestedField.required(1, "partition", table.spec().partitionType()),
         Types.NestedField.required(2, "record_count", Types.LongType.get()),
         Types.NestedField.required(3, "file_count", Types.IntegerType.get())
     );
-    this.name = name;
-  }
-
-  @Override
-  Table table() {
-    return table;
-  }
-
-  @Override
-  public String name() {
-    return name;
   }
 
   @Override
   public TableScan newScan() {
-    return new PartitionsScan();
+    return new PartitionsScan(ops(), table());
   }
 
   @Override
   public Schema schema() {
-    if (table.spec().fields().size() < 1) {
+    if (table().spec().fields().size() < 1) {
       return schema.select("record_count", "file_count");
     }
     return schema;
   }
 
   private DataTask task(TableScan scan) {
-    Iterable<Partition> partitions = partitions(table, scan.snapshot().snapshotId());
-    if (table.spec().fields().size() < 1) {
+    Iterable<Partition> partitions = partitions(table(), scan.snapshot().snapshotId());
+    if (table().spec().fields().size() < 1) {
       // the table is unpartitioned, partitions contains only the root partition
-      return StaticDataTask.of(io().newInputFile(ops.current().metadataFileLocation()), partitions,
+      return StaticDataTask.of(io().newInputFile(ops().current().metadataFileLocation()), partitions,
           root -> StaticDataTask.Row.of(root.recordCount, root.fileCount));
     } else {
-      return StaticDataTask.of(io().newInputFile(ops.current().metadataFileLocation()), partitions,
+      return StaticDataTask.of(io().newInputFile(ops().current().metadataFileLocation()), partitions,
           PartitionsTable::convertPartition);
     }
   }
@@ -104,7 +89,7 @@ public class PartitionsTable extends BaseMetadataTable {
   }
 
   private class PartitionsScan extends StaticTableScan {
-    PartitionsScan() {
+    PartitionsScan(TableOperations ops, Table table) {
       super(ops, table, PartitionsTable.this.schema(), PartitionsTable.this::task);
     }
   }
