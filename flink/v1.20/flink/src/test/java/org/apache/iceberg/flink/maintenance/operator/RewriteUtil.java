@@ -36,6 +36,11 @@ class RewriteUtil {
   private RewriteUtil() {}
 
   static List<DataFileRewritePlanner.PlannedGroup> planDataFileRewrite(TableLoader tableLoader)
+          throws Exception {
+    return planDataFileRewrite(tableLoader, 10_000_000L);
+  }
+
+  static List<DataFileRewritePlanner.PlannedGroup> planDataFileRewrite(TableLoader tableLoader, long maxRewriteBytes)
       throws Exception {
     try (OneInputStreamOperatorTestHarness<Trigger, DataFileRewritePlanner.PlannedGroup>
         testHarness =
@@ -46,7 +51,7 @@ class RewriteUtil {
                     0,
                     tableLoader,
                     11,
-                    10_000_000L,
+                    maxRewriteBytes,
                     ImmutableMap.of(MIN_INPUT_FILES, "2")))) {
       testHarness.open();
 
