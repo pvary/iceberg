@@ -62,24 +62,26 @@ public class FlinkParquetReaders {
 
   public static ParquetValueReader<RowData> buildReader(
       Schema expectedSchema, MessageType fileSchema) {
-    return buildReader(expectedSchema, fileSchema, ImmutableMap.of());
+    return buildReader(expectedSchema, fileSchema, ImmutableMap.of(), null);
   }
 
   @SuppressWarnings("unchecked")
   public static ParquetValueReader<RowData> buildReader(
-      Schema expectedSchema, MessageType fileSchema, Map<Integer, ?> idToConstant) {
+      Schema expectedSchema, MessageType fileSchema, Map<Integer, ?> idToConstant, String filePath) {
     return (ParquetValueReader<RowData>)
         TypeWithSchemaVisitor.visit(
-            expectedSchema.asStruct(), fileSchema, new ReadBuilder(fileSchema, idToConstant));
+            expectedSchema.asStruct(), fileSchema, new ReadBuilder(fileSchema, idToConstant, StringData.fromString(filePath)));
   }
 
   private static class ReadBuilder extends TypeWithSchemaVisitor<ParquetValueReader<?>> {
     private final MessageType type;
     private final Map<Integer, ?> idToConstant;
+    private final StringData filePath;
 
-    ReadBuilder(MessageType type, Map<Integer, ?> idToConstant) {
+    ReadBuilder(MessageType type, Map<Integer, ?> idToConstant, StringData filePath) {
       this.type = type;
       this.idToConstant = idToConstant;
+      this.filePath = filePath;
     }
 
     @Override
@@ -132,6 +134,9 @@ public class FlinkParquetReaders {
           types.add(null);
         } else if (id == MetadataColumns.IS_DELETED.fieldId()) {
           reorderedFields.add(ParquetValueReaders.constant(false));
+          types.add(null);
+        } else if (id == MetadataColumns.FILE_PATH.fieldId()) {
+          reorderedFields.add(ParquetValueReaders.constant(filePath));
           types.add(null);
         } else {
           ParquetValueReader<?> reader = readersById.get(id);

@@ -19,8 +19,10 @@
 package org.apache.iceberg.flink.maintenance.operator;
 
 import static org.apache.iceberg.TableProperties.DEFAULT_NAME_MAPPING;
+import static org.apache.iceberg.TableProperties.DELETE_TARGET_FILE_SIZE_BYTES_DEFAULT;
 
 import java.util.Collections;
+import java.util.List;
 import java.util.Set;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.annotation.VisibleForTesting;
@@ -32,8 +34,13 @@ import org.apache.flink.util.Collector;
 import org.apache.iceberg.BaseCombinedScanTask;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.MetadataColumns;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.actions.RewriteFileGroup;
+import org.apache.iceberg.data.GenericAppenderFactory;
+import org.apache.iceberg.data.GenericRecord;
+import org.apache.iceberg.data.Record;
 import org.apache.iceberg.flink.FlinkSchemaUtil;
 import org.apache.iceberg.flink.maintenance.operator.DataFileRewritePlanner.PlannedGroup;
 import org.apache.iceberg.flink.sink.RowDataTaskWriterFactory;
@@ -41,9 +48,14 @@ import org.apache.iceberg.flink.sink.TaskWriterFactory;
 import org.apache.iceberg.flink.source.DataIterator;
 import org.apache.iceberg.flink.source.FileScanTaskReader;
 import org.apache.iceberg.flink.source.RowDataFileScanTaskReader;
+import org.apache.iceberg.io.LastPositionInfo;
+import org.apache.iceberg.io.OutputFileFactory;
 import org.apache.iceberg.io.TaskWriter;
+import org.apache.iceberg.io.UnpartitionedWriter;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.PropertyUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -57,10 +69,18 @@ import org.slf4j.LoggerFactory;
 public class DataFileRewriteExecutor
     extends ProcessFunction<PlannedGroup, DataFileRewriteExecutor.ExecutedGroup> {
   private static final Logger LOG = LoggerFactory.getLogger(DataFileRewriteExecutor.class);
+  private static final Schema INDEX_SCHEMA =
+          new Schema(
+                  Lists.newArrayList(
+                          Types.NestedField.required(1, "old_filename", Types.StringType.get()),
+                          Types.NestedField.optional(2, "old_pos", Types.LongType.get()),
+                          Types.NestedField.required(3, "new_filename", Types.StringType.get()),
+                          Types.NestedField.optional(4, "new_pos", Types.LongType.get())));
 
   private final String tableName;
   private final String taskName;
   private final int taskIndex;
+  private final GenericRecord record = GenericRecord.create(INDEX_SCHEMA);
 
   private transient int subTaskId;
   private transient int attemptId;
@@ -107,10 +127,20 @@ public class DataFileRewriteExecutor
           value.group().rewrittenFiles().size());
     }
 
-    try (TaskWriter<RowData> writer = writerFor(value)) {
+    try (TaskWriter<RowData> writer = writerFor(value);
+         TaskWriter<Record> indexWriter = writer instanceof LastPositionInfo ? indexWriter(value) : null
+    ) {
       try (DataIterator<RowData> iterator = readerFor(value)) {
         while (iterator.hasNext()) {
-          writer.write(iterator.next());
+          RowData rowData = iterator.next();
+          writer.write(rowData);
+          if (indexWriter != null) {
+            record.setField("old_filename", rowData.getString(rowData.getArity() -1).toString());
+            record.setField("old_pos", rowData.getLong(rowData.getArity()-2));
+            record.setField("new_filename", ((LastPositionInfo) writer).lastLocation());
+            record.setField("new_pos", ((LastPositionInfo) writer).lastPosition());
+            indexWriter.write(record);
+          }
         }
 
         Set<DataFile> dataFiles = Sets.newHashSet(writer.dataFiles());
@@ -168,6 +198,29 @@ public class DataFileRewriteExecutor
     }
   }
 
+  private TaskWriter<Record> indexWriter(PlannedGroup value) {
+    String formatString =
+            PropertyUtil.propertyAsString(
+                    value.table().properties(),
+                    TableProperties.DEFAULT_FILE_FORMAT,
+                    TableProperties.DEFAULT_FILE_FORMAT_DEFAULT);
+    FileFormat format = FileFormat.fromString(formatString);
+    OutputFileFactory outputFileFactory =
+            OutputFileFactory.builderFor(value.table(), subTaskId, attemptId)
+                    .format(format)
+                    .ioSupplier(() -> value.table().io())
+                    .build();
+    GenericAppenderFactory appenderFactory = new GenericAppenderFactory(INDEX_SCHEMA);
+
+    return new UnpartitionedWriter<>(
+            value.table().spec(),
+            format,
+            appenderFactory,
+            outputFileFactory,
+            value.table().io(),
+            DELETE_TARGET_FILE_SIZE_BYTES_DEFAULT);
+  }
+
   private TaskWriter<RowData> writerFor(PlannedGroup value) {
     String formatString =
         PropertyUtil.propertyAsString(
@@ -188,10 +241,14 @@ public class DataFileRewriteExecutor
   }
 
   private DataIterator<RowData> readerFor(PlannedGroup value) {
+    List<Types.NestedField> columns = Lists.newArrayList(value.table().schema().columns());
+    columns.add(MetadataColumns.ROW_POSITION);
+    columns.add(MetadataColumns.FILE_PATH);
+
     RowDataFileScanTaskReader reader =
         new RowDataFileScanTaskReader(
             value.table().schema(),
-            value.table().schema(),
+            new Schema(columns),
             PropertyUtil.propertyAsString(value.table().properties(), DEFAULT_NAME_MAPPING, null),
             false,
             Collections.emptyList());

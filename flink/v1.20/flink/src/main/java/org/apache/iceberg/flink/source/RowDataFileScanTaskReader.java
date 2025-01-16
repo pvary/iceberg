@@ -173,7 +173,7 @@ public class RowDataFileScanTaskReader implements FileScanTaskReader<RowData> {
             .split(task.start(), task.length())
             .project(schema)
             .createReaderFunc(
-                fileSchema -> FlinkParquetReaders.buildReader(schema, fileSchema, idToConstant))
+                fileSchema -> FlinkParquetReaders.buildReader(schema, fileSchema, idToConstant, task.file().location()))
             .filter(task.residual())
             .caseSensitive(caseSensitive)
             .reuseContainers();

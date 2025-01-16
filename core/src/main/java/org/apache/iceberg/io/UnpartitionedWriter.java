@@ -22,9 +22,11 @@ import java.io.IOException;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.PartitionSpec;
 
-public class UnpartitionedWriter<T> extends BaseTaskWriter<T> {
+public class UnpartitionedWriter<T> extends BaseTaskWriter<T> implements LastPositionInfo {
 
   private final RollingFileWriter currentWriter;
+  private String lastLocation;
+  private long lastPosition;
 
   public UnpartitionedWriter(
       PartitionSpec spec,
@@ -39,11 +41,23 @@ public class UnpartitionedWriter<T> extends BaseTaskWriter<T> {
 
   @Override
   public void write(T record) throws IOException {
+    this.lastPosition = currentWriter.currentRows();
+    this.lastLocation = currentWriter.currentPath().toString();
     currentWriter.write(record);
   }
 
   @Override
   public void close() throws IOException {
     currentWriter.close();
+  }
+
+  @Override
+  public String lastLocation() {
+    return lastLocation;
+  }
+
+  @Override
+  public long lastPosition() {
+    return lastPosition;
   }
 }

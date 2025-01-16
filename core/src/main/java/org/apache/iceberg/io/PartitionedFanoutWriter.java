@@ -25,8 +25,10 @@ import org.apache.iceberg.PartitionKey;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 
-public abstract class PartitionedFanoutWriter<T> extends BaseTaskWriter<T> {
+public abstract class PartitionedFanoutWriter<T> extends BaseTaskWriter<T> implements LastPositionInfo {
   private final Map<PartitionKey, RollingFileWriter> writers = Maps.newHashMap();
+  private String lastLocation;
+  private long lastPosition;
 
   protected PartitionedFanoutWriter(
       PartitionSpec spec,
@@ -60,6 +62,8 @@ public abstract class PartitionedFanoutWriter<T> extends BaseTaskWriter<T> {
       writers.put(copiedKey, writer);
     }
 
+    this.lastPosition = writer.currentRows();
+    this.lastLocation = writer.currentPath().toString();
     writer.write(row);
   }
 
@@ -71,5 +75,15 @@ public abstract class PartitionedFanoutWriter<T> extends BaseTaskWriter<T> {
       }
       writers.clear();
     }
+  }
+
+  @Override
+  public String lastLocation() {
+    return lastLocation;
+  }
+
+  @Override
+  public long lastPosition() {
+    return lastPosition;
   }
 }
