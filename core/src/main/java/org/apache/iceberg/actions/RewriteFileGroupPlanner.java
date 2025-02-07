@@ -41,8 +41,7 @@ import org.slf4j.LoggerFactory;
  * {@link RewriteDataFiles#REWRITE_JOB_ORDER} handling.
  */
 public class RewriteFileGroupPlanner
-    implements FileRewritePlanner<
-        RewriteFilePlanInfo, FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup> {
+    implements FileRewritePlanner<FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup> {
   // The SizeBasedFileRewritePlanner will be needed in the long run, but omit for the shake of the
   // discussion
   //        extends SizeBasedFileRewritePlanner<FileGroupInfo, FileScanTask, DataFile,
@@ -139,9 +138,7 @@ public class RewriteFileGroupPlanner
   }
 
   @Override
-  public FileRewritePlan<
-          RewriteFilePlanInfo, FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup>
-      plan() {
+  public FileRewritePlan<FileGroupInfo, FileScanTask, DataFile, RewriteFileGroup> plan() {
     // [..]
   }
 }

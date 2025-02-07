@@ -38,14 +38,12 @@ import org.apache.iceberg.ContentScanTask;
  *   <li>{@link #plan()} generates the plan for the given configuration
  * </ul>
  *
- * @param <PI> the Java type of the plan info
  * @param <FGI> the Java type of the file group info
  * @param <T> the Java type of the tasks to read content files
  * @param <F> the Java type of the content files
  * @param <G> the Java type of the planned groups
  */
 public interface FileRewritePlanner<
-    PI extends FileRewritePlanInfo,
     FGI,
     T extends ContentScanTask<F>,
     F extends ContentFile<F>,
@@ -74,5 +72,5 @@ public interface FileRewritePlanner<
    *
    * @return the generated plan which could be executed during the compaction
    */
-  FileRewritePlan<PI, FGI, T, F, G> plan();
+  FileRewritePlan<FGI, T, F, G> plan();
 }

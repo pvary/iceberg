@@ -42,11 +42,7 @@ import org.slf4j.LoggerFactory;
  */
 public class RewritePositionDeletesGroupPlanner
     implements FileRewritePlanner<
-        FileRewritePlanInfo,
-        FileGroupInfo,
-        PositionDeletesScanTask,
-        DeleteFile,
-        RewritePositionDeletesGroup> {
+        FileGroupInfo, PositionDeletesScanTask, DeleteFile, RewritePositionDeletesGroup> {
   // The SizeBasedFileRewritePlanner will be needed in the long run, but omit for the shake of the
   // discussion
   //        extends SizeBasedFileRewritePlanner<FileGroupInfo, PositionDeletesScanTask, DeleteFile,
@@ -94,7 +90,9 @@ public class RewritePositionDeletesGroupPlanner
   }
 
   @Override
-  public RewritePositionDeletePlan plan() {
+  public FileRewritePlan<
+          FileGroupInfo, PositionDeletesScanTask, DeleteFile, RewritePositionDeletesGroup>
+      plan() {
     // [..]
   }
 

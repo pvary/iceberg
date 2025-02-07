@@ -35,19 +35,22 @@ import org.apache.iceberg.util.DataFileSet;
  * which have been written by the action.
  */
 public class RewriteFileGroup extends FileRewriteGroup<FileGroupInfo, FileScanTask, DataFile> {
+  private final int outputSpecId;
   private DataFileSet addedFiles = DataFileSet.create();
 
   @Deprecated
   public RewriteFileGroup(FileGroupInfo info, List<FileScanTask> fileScanTasks) {
-    this(info, fileScanTasks, 0L, 0);
+    this(info, fileScanTasks, 0, 0L, 0);
   }
 
   public RewriteFileGroup(
       FileGroupInfo info,
       List<FileScanTask> fileScanTasks,
+      int outputSpecId,
       long splitSize,
       int expectedOutputFiles) {
     super(info, fileScanTasks, splitSize, expectedOutputFiles);
+    this.outputSpecId = outputSpecId;
   }
 
   public void setOutputFiles(Set<DataFile> files) {
@@ -84,6 +87,10 @@ public class RewriteFileGroup extends FileRewriteGroup<FileGroupInfo, FileScanTa
             addedFiles == null ? "Rewrite Incomplete" : Integer.toString(addedFiles.size()))
         .add("numRewrittenBytes", sizeInBytes())
         .toString();
+  }
+
+  public int outputSpecId() {
+    return outputSpecId;
   }
 
   public long sizeInBytes() {

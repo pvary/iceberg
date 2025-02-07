@@ -42,14 +42,12 @@ import org.apache.iceberg.ContentScanTask;
  * @param <T> the Java type of the tasks to read content files
  * @param <F> the Java type of the content files
  * @param <G> the Java type of the planned groups
- * @param <P> the Java type of the plan to execute
  */
 public interface FileRewriteExecutor<
     I,
     T extends ContentScanTask<F>,
     F extends ContentFile<F>,
-    G extends FileRewriteGroup<I, T, F>,
-    P extends FileRewritePlanInfo> {
+    G extends FileRewriteGroup<I, T, F>> {
 
   /** Returns a description for this rewriter. */
   default String description() {
@@ -77,5 +75,5 @@ public interface FileRewriteExecutor<
    * @param group of scan tasks for files to be rewritten together
    * @return a set of newly written files
    */
-  Set<F> rewrite(P planInfo, G group);
+  Set<F> rewrite(G group);
 }
