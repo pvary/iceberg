@@ -60,6 +60,7 @@ public final class DataFileServiceRegistry {
       new String[] {
         "org.apache.iceberg.parquet.Parquet",
         "org.apache.iceberg.orc.ORC",
+        "org.apache.iceberg.vortex.Vortex",
         "org.apache.iceberg.arrow.vectorized.ArrowReader",
         "org.apache.iceberg.flink.source.RowDataFileScanTaskReader",
         "org.apache.iceberg.flink.sink.FlinkAppenderFactory",

@@ -29,9 +29,9 @@ import org.apache.iceberg.mapping.NameMapping;
  * Builder API for reading Iceberg data files.
  *
  * @param <R> type of the reader
- * @param <F> type of the records which are filtered by {@link DeleteFilter}
+ * @param <DeleteRowT> type of the records which are filtered by {@link DeleteFilter}
  */
-public interface ReadBuilder<R extends ReadBuilder<R, F>, F> {
+public interface ReadBuilder<R extends ReadBuilder<R, DeleteRowT>, DeleteRowT> {
   /**
    * Restricts the read to the given range: [start, start + length).
    *
@@ -110,7 +110,7 @@ public interface ReadBuilder<R extends ReadBuilder<R, F>, F> {
    * supported by the reader then the delete filter is ignored, and unfiltered results are returned.
    * It is the caller's responsibility to apply the filter again.
    */
-  default R withDeleteFilter(DeleteFilter<F> newDeleteFilter) {
+  default R withDeleteFilter(DeleteFilter<DeleteRowT> newDeleteFilter) {
     // Skip filtering if not available
     return (R) this;
   }

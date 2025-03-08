@@ -83,6 +83,7 @@ spark-hive35 = "3.5.4"
 sqlite-jdbc = "3.49.1.0"
 testcontainers = "1.20.5"
 tez08 = { strictly = "0.8.4"}  # see rich version usage explanation above
+vortex = "0.25.2-36-g8ff6b8e.dirty" # todo(aduffy): replace with stable published version
 
 [libraries]
 activation = { module = "javax.activation:activation", version.ref = "activation" }
@@ -163,6 +164,8 @@ scala-collection-compat = { module = "org.scala-lang.modules:scala-collection-co
 slf4j-api = { module = "org.slf4j:slf4j-api", version.ref = "slf4j" }
 slf4j-simple = { module = "org.slf4j:slf4j-simple", version.ref = "slf4j" }
 snowflake-jdbc = { module = "net.snowflake:snowflake-jdbc", version.ref = "snowflake-jdbc" }
+vortex-jni = { module = "dev.vortex:vortex-jni", version.ref = "vortex" }
+vortex-spark = { module = "dev.vortex:vortex-spark", version.ref = "vortex" }
 
 # test libraries
 apiguardian = { module = "org.apiguardian:apiguardian-api", version.ref = "apiguardian" }

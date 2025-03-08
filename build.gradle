@@ -17,7 +17,9 @@
  * under the License.
  */
 
+
 import groovy.transform.Memoized
+
 import java.util.regex.Matcher
 import java.util.regex.Pattern
 
@@ -794,6 +796,26 @@ project(':iceberg-parquet') {
 
     testImplementation project(path: ':iceberg-api', configuration: 'testArtifacts')
     testImplementation project(path: ':iceberg-core', configuration: 'testArtifacts')
+    testImplementation project(path: ':iceberg-data')
+  }
+}
+
+project(':iceberg-vortex') {
+  test {
+    useJUnitPlatform()
+  }
+  dependencies {
+    implementation project(path: ':iceberg-bundled-guava', configuration: 'shadow')
+    api project(':iceberg-api')
+    implementation project(':iceberg-core')
+    implementation project(':iceberg-common')
+
+    annotationProcessor libs.immutables.value
+    compileOnly libs.immutables.value
+
+    implementation(libs.vortex.jni) {
+      exclude group: 'org.codehaus.jackson'
+    }
   }
 }
 
