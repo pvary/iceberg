@@ -20,10 +20,14 @@ package org.apache.iceberg.spark.data.vectorized;
 
 import dev.vortex.api.Array;
 import dev.vortex.api.DType;
+import dev.vortex.arrow.ArrowAllocation;
+import dev.vortex.relocated.org.apache.arrow.vector.VectorSchemaRoot;
+import dev.vortex.spark.read.VortexArrowColumnVector;
 import dev.vortex.spark.read.VortexColumnarBatch;
 import java.util.Map;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.vortex.VortexBatchReader;
+import org.apache.spark.sql.vectorized.ColumnVector;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 
 public class VectorizedSparkVortexReaders {
@@ -33,11 +37,26 @@ public class VectorizedSparkVortexReaders {
   public static VortexBatchReader<ColumnarBatch> buildReader(
       Schema icebergSchema, DType vortexSchema, Map<Integer, ?> idToConstant) {
     // TODO(aduffy): schema compat, idToConstant handling.
-    return new VortexBatchReader<ColumnarBatch>() {
-      @Override
-      public ColumnarBatch read(Array batch) {
-        return VortexColumnarBatch.fromVortex(batch);
+    return new SchemaCachingBatchReader();
+  }
+
+  static final class SchemaCachingBatchReader implements VortexBatchReader<ColumnarBatch> {
+    // Reusable vector schema root.
+    private VectorSchemaRoot root;
+
+    SchemaCachingBatchReader() {}
+
+    @Override
+    public ColumnarBatch read(Array batch) {
+      this.root = batch.exportToArrow(ArrowAllocation.rootAllocator(), this.root);
+      int rowCount = this.root.getRowCount();
+      ColumnVector[] vectors = new ColumnVector[this.root.getFieldVectors().size()];
+
+      for (int i = 0; i < this.root.getFieldVectors().size(); ++i) {
+        vectors[i] = new VortexArrowColumnVector(this.root.getFieldVectors().get(i));
       }
-    };
+
+      return new VortexColumnarBatch(batch, vectors, rowCount);
+    }
   }
 }

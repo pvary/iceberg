@@ -204,7 +204,9 @@ public class VortexSmokeTest {
       Dataset<Row> df =
           spark.sql(
               "select count(*) from db.trips where started_at BETWEEN '2024-12-1 00:00:00' AND '2024-12-31 23:59:59' AND member_casual = 'member'");
-      df.explain(true);
+      // Show codegen
+      df.queryExecution().debug().codegen();
+      // Time execution
       long start = System.nanoTime();
       System.err.println("Begin query");
       spark.sparkContext().setLogLevel("DEBUG");
