@@ -51,6 +51,7 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
+import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.MetricsConfig;
@@ -178,8 +179,8 @@ public class ORC {
 
     @Override
     public <B extends org.apache.iceberg.io.AppenderBuilder<B, E>> B appenderBuilder(
-        OutputFile outputFile, WriteMode mode) {
-      AppenderBuilderInternal<?, E> internal = new AppenderBuilderInternal<>(outputFile, mode);
+        OutputFile outputFile, FileContent content) {
+      AppenderBuilderInternal<?, E> internal = new AppenderBuilderInternal<>(outputFile, content);
       return (B) internal.writerFunction(writerFunction).pathTransformFunc(pathTransformFunc);
     }
 
@@ -197,7 +198,7 @@ public class ORC {
   private static class AppenderBuilderInternal<B extends AppenderBuilderInternal<B, E>, E>
       implements org.apache.iceberg.io.AppenderBuilder<B, E> {
     private final OutputFile file;
-    private final ObjectModel.WriteMode mode;
+    private final FileContent content;
     private final Configuration conf;
     private Schema schema = null;
     private BiFunction<Schema, TypeDescription, OrcRowWriter<?>> createWriterFunc;
@@ -210,9 +211,9 @@ public class ORC {
     private E engineSchema;
     private Function<CharSequence, ?> pathTransformFunc;
 
-    private AppenderBuilderInternal(OutputFile file, ObjectModel.WriteMode mode) {
+    private AppenderBuilderInternal(OutputFile file, FileContent content) {
       this.file = file;
-      this.mode = mode;
+      this.content = content;
       if (file instanceof HadoopOutputFile) {
         this.conf = new Configuration(((HadoopOutputFile) file).getConf());
       } else {
@@ -297,7 +298,7 @@ public class ORC {
     }
 
     @Override
-    public B engineSchema(E newEngineSchema) {
+    public B dataSchema(E newEngineSchema) {
       this.engineSchema = newEngineSchema;
       return (B) this;
     }
@@ -332,20 +333,20 @@ public class ORC {
 
     private void initWriterFunctionAndContext() {
       Preconditions.checkState(writerFunction != null, "Writer function has to be set.");
-      switch (mode) {
-        case DATA_WRITER:
+      switch (content) {
+        case DATA:
           this.createWriterFunc =
               (icebergSchema, typeDescription) ->
                   writerFunction.write(icebergSchema, typeDescription, engineSchema);
           this.createContextFunc = Context::dataContext;
           break;
-        case EQUALITY_DELETE_WRITER:
+        case EQUALITY_DELETES:
           this.createWriterFunc =
               (icebergSchema, typeDescription) ->
                   writerFunction.write(icebergSchema, typeDescription, engineSchema);
           this.createContextFunc = Context::deleteContext;
           break;
-        case POSITION_DELETE_WRITER:
+        case POSITION_DELETES:
           this.createContextFunc = Context::deleteContext;
           if (schema.columns().size() == DeleteSchemaUtil.pathPosSchema().columns().size()) {
             // this is a position delete without rows
@@ -366,7 +367,7 @@ public class ORC {
           }
           break;
         default:
-          throw new IllegalArgumentException("Not supported mode: " + mode);
+          throw new IllegalArgumentException("Not supported content: " + content);
       }
     }
 
@@ -374,7 +375,7 @@ public class ORC {
     public <D> FileAppender<D> build() {
       Preconditions.checkNotNull(schema, "Schema is required");
 
-      if (mode != null) {
+      if (content != null) {
         initWriterFunctionAndContext();
       }
 

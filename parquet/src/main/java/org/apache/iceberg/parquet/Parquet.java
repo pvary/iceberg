@@ -61,6 +61,7 @@ import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.Files;
 import org.apache.iceberg.InternalData;
@@ -72,7 +73,6 @@ import org.apache.iceberg.SortOrder;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.SystemConfigs;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.avro.Avro;
 import org.apache.iceberg.avro.AvroSchemaUtil;
 import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.deletes.EqualityDeleteWriter;
@@ -220,8 +220,8 @@ public class Parquet {
 
     @Override
     public <B extends org.apache.iceberg.io.AppenderBuilder<B, E>> B appenderBuilder(
-        OutputFile outputFile, WriteMode mode) {
-      AppenderBuilderInternal<?, E> internal = new AppenderBuilderInternal<>(outputFile, mode);
+        OutputFile outputFile, FileContent content) {
+      AppenderBuilderInternal<?, E> internal = new AppenderBuilderInternal<>(outputFile, content);
       return (B) internal.writerFunction(writerFunction).pathTransformFunc(pathTransformFunc);
     }
 
@@ -241,7 +241,7 @@ public class Parquet {
   static class AppenderBuilderInternal<B extends AppenderBuilderInternal<B, E>, E>
       implements InternalData.WriteBuilder, AppenderBuilder<B, E> {
     private final OutputFile file;
-    private final Avro.ObjectModel.WriteMode mode;
+    private final FileContent content;
     private final Configuration conf;
     private final Map<String, String> metadata = Maps.newLinkedHashMap();
     private final Map<String, String> config = Maps.newLinkedHashMap();
@@ -259,9 +259,9 @@ public class Parquet {
     private ByteBuffer fileAADPrefix = null;
     private Function<CharSequence, ?> pathTransformFunc = null;
 
-    private AppenderBuilderInternal(OutputFile file, Avro.ObjectModel.WriteMode mode) {
+    private AppenderBuilderInternal(OutputFile file, FileContent content) {
       this.file = file;
-      this.mode = mode;
+      this.content = content;
       if (file instanceof HadoopOutputFile) {
         this.conf = new Configuration(((HadoopOutputFile) file).getConf());
       } else {
@@ -302,7 +302,7 @@ public class Parquet {
     }
 
     @Override
-    public B engineSchema(E newEngineSchema) {
+    public B dataSchema(E newEngineSchema) {
       this.engineSchema = newEngineSchema;
       return (B) this;
     }
@@ -503,20 +503,20 @@ public class Parquet {
 
     private <D> void initWriterFunctionAndContext() {
       Preconditions.checkState(writerFunction != null, "Writer function has to be set.");
-      switch (mode) {
-        case DATA_WRITER:
+      switch (content) {
+        case DATA:
           this.createWriterFunc =
               (icebergSchema, messageType) ->
                   writerFunction.write(engineSchema, icebergSchema, messageType);
           this.createContextFunc = Context::dataContext;
           break;
-        case EQUALITY_DELETE_WRITER:
+        case EQUALITY_DELETES:
           this.createWriterFunc =
               (icebergSchema, messageType) ->
                   writerFunction.write(engineSchema, icebergSchema, messageType);
           this.createContextFunc = Context::deleteContext;
           break;
-        case POSITION_DELETE_WRITER:
+        case POSITION_DELETES:
           this.createContextFunc = Context::deleteContext;
           if (schema.columns().size() == DeleteSchemaUtil.pathPosSchema().columns().size()) {
             // this is a position delete without rows
@@ -539,7 +539,7 @@ public class Parquet {
           }
           break;
         default:
-          throw new IllegalArgumentException("Not supported mode: " + mode);
+          throw new IllegalArgumentException("Not supported content: " + content);
       }
     }
 
@@ -548,7 +548,7 @@ public class Parquet {
       Preconditions.checkNotNull(schema, "Schema is required");
       Preconditions.checkNotNull(name, "Table name is required and cannot be null");
 
-      if (mode != null) {
+      if (content != null) {
         initWriterFunctionAndContext();
       }
 
@@ -1347,7 +1347,7 @@ public class Parquet {
       NativeEncryptionInputFile nativeFile = (NativeEncryptionInputFile) file;
       return new ReadBuilder(nativeFile.encryptedInputFile())
           .withFileEncryptionKey(nativeFile.keyMetadata().encryptionKey())
-          .withAADPrefix(nativeFile.keyMetadata().aadPrefix());
+          .withAadPrefix(nativeFile.keyMetadata().aadPrefix());
     } else {
       return new ReadBuilder(file);
     }
@@ -1580,9 +1580,18 @@ public class Parquet {
     }
 
     @Override
-    public B withAADPrefix(ByteBuffer aadPrefix) {
+    public B withAadPrefix(ByteBuffer aadPrefix) {
       this.fileAADPrefix = aadPrefix;
       return (B) this;
+    }
+
+    /**
+     * @deprecated Since 1.10.0, will be removed in 1.11.0. Use {@link #withAadPrefix(ByteBuffer)}
+     *     instead.
+     */
+    @Deprecated
+    public B withAADPrefix(ByteBuffer aadPrefix) {
+      return withAadPrefix(aadPrefix);
     }
 
     @Override

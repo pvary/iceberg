@@ -45,6 +45,7 @@ import org.apache.avro.io.DatumWriter;
 import org.apache.avro.io.Encoder;
 import org.apache.avro.specific.SpecificData;
 import org.apache.iceberg.FieldMetrics;
+import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.InternalData;
 import org.apache.iceberg.MetricsConfig;
@@ -161,8 +162,8 @@ public class Avro {
 
     @Override
     public <B extends AppenderBuilder<B, E>> B appenderBuilder(
-        OutputFile outputFile, WriteMode mode) {
-      AppenderBuilderInternal<?, E> internal = new AppenderBuilderInternal<>(outputFile, mode);
+        OutputFile outputFile, FileContent content) {
+      AppenderBuilderInternal<?, E> internal = new AppenderBuilderInternal<>(outputFile, content);
       return (B)
           internal.writerFunction(writerFunction).deleteRowWriterFunction(deleteRowWriterFunction);
     }
@@ -177,7 +178,7 @@ public class Avro {
   private static class AppenderBuilderInternal<B extends AppenderBuilderInternal<B, E>, E>
       implements InternalData.WriteBuilder, AppenderBuilder<B, E> {
     private final OutputFile file;
-    private final ObjectModel.WriteMode mode;
+    private final FileContent content;
     private final Map<String, String> config = Maps.newHashMap();
     private final Map<String, String> metadata = Maps.newLinkedHashMap();
     private org.apache.iceberg.Schema schema = null;
@@ -190,9 +191,9 @@ public class Avro {
     private Function<Map<String, String>, Context> createContextFunc = Context::dataContext;
     private E engineSchema;
 
-    private AppenderBuilderInternal(OutputFile file, ObjectModel.WriteMode mode) {
+    private AppenderBuilderInternal(OutputFile file, FileContent content) {
       this.file = file;
-      this.mode = mode;
+      this.content = content;
     }
 
     /**
@@ -299,24 +300,24 @@ public class Avro {
     }
 
     @Override
-    public B engineSchema(E newEngineSchema) {
+    public B dataSchema(E newEngineSchema) {
       this.engineSchema = newEngineSchema;
       return (B) this;
     }
 
     private void initWriterFunctionAndContext() {
-      switch (mode) {
-        case DATA_WRITER:
+      switch (content) {
+        case DATA:
           Preconditions.checkState(writerFunction != null, "Writer function has to be set.");
           this.createWriterFunc = avroSchema -> writerFunction.apply(avroSchema, engineSchema);
           this.createContextFunc = Context::dataContext;
           break;
-        case EQUALITY_DELETE_WRITER:
+        case EQUALITY_DELETES:
           Preconditions.checkState(writerFunction != null, "Writer function has to be set.");
           this.createWriterFunc = avroSchema -> writerFunction.apply(avroSchema, engineSchema);
           this.createContextFunc = Context::deleteContext;
           break;
-        case POSITION_DELETE_WRITER:
+        case POSITION_DELETES:
           this.createContextFunc = Context::deleteContext;
           if (schema.columns().size() == DeleteSchemaUtil.pathPosSchema().columns().size()) {
             // this is a position delete without rows
@@ -337,7 +338,7 @@ public class Avro {
           }
           break;
         default:
-          throw new IllegalArgumentException("Not supported mode: " + mode);
+          throw new IllegalArgumentException("Not supported content: " + content);
       }
     }
 
@@ -346,7 +347,7 @@ public class Avro {
       Preconditions.checkNotNull(schema, "Schema is required");
       Preconditions.checkNotNull(name, "Table name is required and cannot be null");
 
-      if (mode != null) {
+      if (content != null) {
         initWriterFunctionAndContext();
       }
 

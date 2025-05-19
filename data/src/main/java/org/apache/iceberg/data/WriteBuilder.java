@@ -62,9 +62,9 @@ import org.apache.iceberg.util.ArrayUtil;
  */
 @SuppressWarnings("unchecked")
 class WriteBuilder<B extends WriteBuilder<B, A, E>, A extends AppenderBuilder<A, E>, E>
-    implements DataWriterBuilder<B, E>,
-        EqualityDeleteWriterBuilder<B, E>,
-        PositionDeleteWriterBuilder<B, E> {
+    implements DataWriteBuilder<B, E>,
+        EqualityDeleteWriteBuilder<B, E>,
+        PositionDeleteWriteBuilder<B, E> {
   private final AppenderBuilder<A, E> appenderBuilder;
   private final String location;
   private final FileFormat format;
@@ -89,7 +89,7 @@ class WriteBuilder<B extends WriteBuilder<B, A, E>, A extends AppenderBuilder<A,
 
   @Override
   public B engineSchema(E engineSchema) {
-    appenderBuilder.engineSchema(engineSchema);
+    appenderBuilder.dataSchema(engineSchema);
     return (B) this;
   }
 

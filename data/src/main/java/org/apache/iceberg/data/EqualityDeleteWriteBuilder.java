@@ -19,26 +19,36 @@
 package org.apache.iceberg.data;
 
 import java.io.IOException;
+import java.util.List;
+import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.Schema;
-import org.apache.iceberg.io.DataWriter;
+import org.apache.iceberg.deletes.EqualityDeleteWriter;
 
 /**
- * Builder for generating a {@link DataWriter}.
+ * Builder for generating an {@link EqualityDeleteWriter}.
  *
  * @param <B> type of the builder
  * @param <E> engine specific schema of the input records used for appender initialization
  */
-public interface DataWriterBuilder<B extends DataWriterBuilder<B, E>, E>
-    extends FileWriterBuilderBase<B, E> {
+public interface EqualityDeleteWriteBuilder<B extends EqualityDeleteWriteBuilder<B, E>, E>
+    extends ContentFileWriteBuilderBase<B, E> {
+  /** Sets the row schema for the delete writers. */
+  B withRowSchema(Schema newSchema);
+
+  /** Sets the equality field ids for the equality delete writer. */
+  B withEqualityFieldIds(List<Integer> fieldIds);
+
+  /** Sets the equality field ids for the equality delete writer. */
+  B withEqualityFieldIds(int... fieldIds);
+
   /**
-   * Creates a writer which generates a {@link org.apache.iceberg.DataFile} based on the
-   * configurations set. The data writer will expect inputs defined by the {@link
-   * #engineSchema(Object)} which should be convertible to the Iceberg schema defined by {@link
-   * #schema(Schema)}.
+   * Creates a writer which generates an equality {@link DeleteFile} based on the configurations
+   * set. The writer will expect inputs defined by the {@link #engineSchema(Object)} which should be
+   * convertible to the Iceberg schema defined by {@link #withRowSchema(Schema)}.
    *
    * @param <D> the type of data that the writer will handle
-   * @return a {@link DataWriter} instance configured with the specified settings
+   * @return a {@link EqualityDeleteWriter} instance configured with the specified settings
    * @throws IOException if an I/O error occurs during the creation of the writer
    */
-  <D> DataWriter<D> dataWriter() throws IOException;
+  <D> EqualityDeleteWriter<D> equalityDeleteWriter() throws IOException;
 }

@@ -18,37 +18,27 @@
  */
 package org.apache.iceberg.data;
 
-import org.apache.iceberg.PartitionSpec;
-import org.apache.iceberg.SortOrder;
-import org.apache.iceberg.StructLike;
-import org.apache.iceberg.deletes.EqualityDeleteWriter;
-import org.apache.iceberg.deletes.PositionDeleteWriter;
-import org.apache.iceberg.encryption.EncryptionKeyMetadata;
+import java.io.IOException;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.io.DataWriter;
 
 /**
- * Builder for generating one of the following:
- *
- * <ul>
- *   <li>{@link DataWriter}
- *   <li>{@link EqualityDeleteWriter}
- *   <li>{@link PositionDeleteWriter}
- * </ul>
+ * Builder for generating a {@link DataWriter}.
  *
  * @param <B> type of the builder
  * @param <E> engine specific schema of the input records used for appender initialization
  */
-interface FileWriterBuilderBase<B extends FileWriterBuilderBase<B, E>, E>
-    extends WriterBuilderBase<B, E> {
-  /** Sets the partition specification for the Iceberg metadata. */
-  B withSpec(PartitionSpec newSpec);
-
-  /** Sets the partition value for the Iceberg metadata. */
-  B withPartition(StructLike newPartition);
-
-  /** Sets the encryption key metadata for Iceberg metadata. */
-  B withKeyMetadata(EncryptionKeyMetadata metadata);
-
-  /** Sets the sort order for the Iceberg metadata. */
-  B withSortOrder(SortOrder newSortOrder);
+public interface DataWriteBuilder<B extends DataWriteBuilder<B, E>, E>
+    extends ContentFileWriteBuilderBase<B, E> {
+  /**
+   * Creates a writer which generates a {@link org.apache.iceberg.DataFile} based on the
+   * configurations set. The data writer will expect inputs defined by the {@link
+   * #engineSchema(Object)} which should be convertible to the Iceberg schema defined by {@link
+   * #schema(Schema)}.
+   *
+   * @param <D> the type of data that the writer will handle
+   * @return a {@link DataWriter} instance configured with the specified settings
+   * @throws IOException if an I/O error occurs during the creation of the writer
+   */
+  <D> DataWriter<D> dataWriter() throws IOException;
 }

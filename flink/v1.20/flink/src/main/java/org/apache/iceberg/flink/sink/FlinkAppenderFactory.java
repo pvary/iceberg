@@ -101,7 +101,7 @@ public class FlinkAppenderFactory implements FileAppenderFactory<RowData>, Seria
               format,
               FlinkObjectModels.FLINK_OBJECT_MODEL,
               EncryptedFiles.plainAsEncryptedOutput(outputFile))
-          .engineSchema(flinkSchema)
+          .dataSchema(flinkSchema)
           .set(props)
           .schema(schema)
           .metricsConfig(metricsConfig)
