@@ -60,6 +60,19 @@ configure(jmhProjects) {
   def jmhReportDir = project.property("jmhJsonOutputPath").toString().replace(".json", "")
   mkdir(file(jmhReportDir))
 
+  // Add dependencies block for JMH projects
+  dependencies {
+    jmh("${libs.orc.core.get().module}:${libs.versions.orc.get()}:nohive") {
+      exclude group: 'org.apache.hadoop'
+      exclude group: 'commons-lang'
+      // These artifacts are shaded and included in the orc-core fat jar
+      exclude group: 'com.google.protobuf', module: 'protobuf-java'
+      exclude group: 'org.apache.hive', module: 'hive-storage-api'
+    }
+    jmh("${libs.arrow.vector.get().module}:${libs.versions.arrow.get()}")
+    jmh project(':iceberg-arrow')
+  }
+
   jmh {
     jmhVersion = '1.37'
     failOnError = true
@@ -70,6 +83,7 @@ configure(jmhProjects) {
     resultFormat = 'JSON'
     includes = [jmhIncludeRegex]
     zip64 = true
+    jvmArgs = ['--add-opens=java.base/java.nio=ALL-UNNAMED']
   }
 
   jmhReport {
