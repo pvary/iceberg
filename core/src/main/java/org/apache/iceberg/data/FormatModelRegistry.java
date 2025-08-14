@@ -67,7 +67,8 @@ import org.slf4j.LoggerFactory;
 public final class FormatModelRegistry {
   private static final Logger LOG = LoggerFactory.getLogger(FormatModelRegistry.class);
   // The list of classes which are used for registering the reader and writer builders
-  private static final List<String> CLASSES_TO_REGISTER = ImmutableList.of();
+  private static final List<String> CLASSES_TO_REGISTER =
+      ImmutableList.of();
 
   private static final Map<Pair<FileFormat, String>, FormatModel<?>> FORMAT_MODELS =
       Maps.newConcurrentMap();
@@ -96,7 +97,7 @@ public final class FormatModelRegistry {
         !FORMAT_MODELS.containsKey(key),
         "Cannot register %s: %s is registered for format=%s model=%s",
         formatModel.getClass(),
-        FORMAT_MODELS.get(key).getClass(),
+        FORMAT_MODELS.containsKey(key) ? FORMAT_MODELS.get(key).getClass() : null,
         key.first(),
         key.second());
 
