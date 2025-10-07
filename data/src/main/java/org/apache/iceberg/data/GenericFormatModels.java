@@ -51,7 +51,9 @@ public class GenericFormatModels {
                 new ParquetFormatModel<>(
                     Record.class,
                     Schema.class,
-                    GenericParquetReaders::buildReader,
+                    (readerFunction, messageType) ->
+                        GenericParquetReaders.buildReader(
+                            readerFunction.schema(), messageType, readerFunction.constantValues()),
                     (schema, messageType, inputType) ->
                         GenericParquetWriter.create(schema, messageType))));
     logAngIgnoreNoClassDefFoundError(

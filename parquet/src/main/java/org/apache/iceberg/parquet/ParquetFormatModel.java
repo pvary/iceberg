@@ -19,6 +19,7 @@
 package org.apache.iceberg.parquet;
 
 import java.util.Map;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.Schema;
@@ -32,15 +33,18 @@ import org.apache.parquet.schema.MessageType;
 public class ParquetFormatModel<D, S, F> implements FormatModel<D, S> {
   private final Class<D> type;
   private final Class<S> schemaType;
-  private final ReaderFunction<D> readerFunction;
-  private final BatchReaderFunction<D, F> batchReaderFunction;
+  private final BiFunction<DynamicReaderFunction<D>, MessageType, ParquetValueReader<D>>
+      readerFunction;
+  private final BiFunction<DynamicBatchReaderFunction<D>, MessageType, VectorizedReader<D>>
+      batchReaderFunction;
   private final WriterFunction<S> writerFunction;
 
   private ParquetFormatModel(
       Class<D> type,
       Class<S> schemaType,
-      ReaderFunction<D> readerFunction,
-      BatchReaderFunction<D, F> batchReaderFunction,
+      BiFunction<DynamicReaderFunction<D>, MessageType, ParquetValueReader<D>> readerFunction,
+      BiFunction<DynamicBatchReaderFunction<D>, MessageType, VectorizedReader<D>>
+          batchReaderFunction,
       WriterFunction<S> writerFunction) {
     this.type = type;
     this.schemaType = schemaType;
@@ -50,19 +54,22 @@ public class ParquetFormatModel<D, S, F> implements FormatModel<D, S> {
   }
 
   public ParquetFormatModel(Class<D> type) {
-    this(type, null, null, null);
+    this(type, null, null, null, null);
   }
 
   public ParquetFormatModel(
       Class<D> type,
       Class<S> schemaType,
-      ReaderFunction<D> readerFunction,
+      BiFunction<DynamicReaderFunction<D>, MessageType, ParquetValueReader<D>> readerFunction,
       WriterFunction<S> writerFunction) {
     this(type, schemaType, readerFunction, null, writerFunction);
   }
 
   public ParquetFormatModel(
-      Class<D> type, Class<S> schemaType, BatchReaderFunction<D, F> batchReaderFunction) {
+      Class<D> type,
+      Class<S> schemaType,
+      BiFunction<DynamicBatchReaderFunction<D>, MessageType, VectorizedReader<D>>
+          batchReaderFunction) {
     this(type, schemaType, null, batchReaderFunction, null);
   }
 
@@ -91,26 +98,11 @@ public class ParquetFormatModel<D, S, F> implements FormatModel<D, S> {
   @Override
   public ReadBuilder readBuilder(InputFile inputFile) {
     if (batchReaderFunction != null) {
-      return Parquet.read(inputFile).createBatchedReaderFunc(impl(batchReaderFunction));
+      return Parquet.read(inputFile)
+          .createBatchedReaderFunc(new DynamicBatchReaderFunction<>(batchReaderFunction));
     } else {
-      return Parquet.read(inputFile).createReaderFunc(impl(readerFunction));
+      return Parquet.read(inputFile).createReaderFunc(new DynamicReaderFunction<>(readerFunction));
     }
-  }
-
-  @FunctionalInterface
-  public interface ReaderFunction<D> {
-    ParquetValueReader<D> read(
-        Schema schema, MessageType messageType, Map<Integer, ?> constantValues);
-  }
-
-  @FunctionalInterface
-  public interface BatchReaderFunction<D, F> {
-    VectorizedReader<D> read(
-        Schema schema,
-        MessageType messageType,
-        Map<Integer, ?> constantValues,
-        F deleteFilter,
-        Map<String, String> config);
   }
 
   @FunctionalInterface
@@ -122,68 +114,107 @@ public class ParquetFormatModel<D, S, F> implements FormatModel<D, S> {
     void deleteFilter(F deleteFilter);
   }
 
-  public static Parquet.ReadBuilder.ReaderFunction impl(ReaderFunction<?> readerFunction) {
-    return new Parquet.ReadBuilder.ReaderFunction() {
-      private Schema schema;
-      private Map<Integer, ?> constantValues;
+  public static class DynamicReaderFunction<D> implements Parquet.ReadBuilder.ReaderFunction {
+    private final BiFunction<DynamicReaderFunction<D>, MessageType, ParquetValueReader<D>>
+        readerFunction;
+    private Schema schema;
+    private Map<Integer, ?> constantValues;
 
-      @Override
-      public Function<MessageType, ParquetValueReader<?>> apply() {
-        return messageType -> readerFunction.read(schema, messageType, constantValues);
-      }
+    public DynamicReaderFunction(
+        BiFunction<DynamicReaderFunction<D>, MessageType, ParquetValueReader<D>> readerFunction) {
+      this.readerFunction = readerFunction;
+    }
 
-      @Override
-      public Parquet.ReadBuilder.ReaderFunction withSchema(Schema schema) {
-        this.schema = schema;
-        return this;
-      }
+    @Override
+    public Function<MessageType, ParquetValueReader<?>> apply() {
+      return messageType -> readerFunction.apply(this, messageType);
+    }
 
-      @Override
-      public Parquet.ReadBuilder.ReaderFunction withConstantValues(Map<Integer, ?> constantValues) {
-        this.constantValues = constantValues;
-        return this;
-      }
-    };
+    @Override
+    public DynamicReaderFunction<D> withSchema(Schema expectedSchema) {
+      this.schema = expectedSchema;
+      return this;
+    }
+
+    @Override
+    public DynamicReaderFunction<D> withConstantValues(Map<Integer, ?> newConstantValues) {
+      this.constantValues = newConstantValues;
+      return this;
+    }
+
+    @Override
+    public Schema schema() {
+      return schema;
+    }
+
+    @Override
+    public Map<Integer, ?> constantValues() {
+      return constantValues;
+    }
   }
 
-  public static <A, B> Parquet.ReadBuilder.BatchReaderFunction impl(
-      BatchReaderFunction<A, B> readerFunction) {
-    return new Parquet.ReadBuilder.BatchReaderFunction() {
-      private Schema schema;
-      private Map<Integer, ?> constantValues;
-      private B deleteFilter;
-      private Map<String, String> config;
+  public static class DynamicBatchReaderFunction<D>
+      implements Parquet.ReadBuilder.BatchReaderFunction {
+    private final BiFunction<DynamicBatchReaderFunction<D>, MessageType, VectorizedReader<D>>
+        readerFunction;
+    private Schema schema;
+    private Map<Integer, ?> constantValues;
+    private Object deleteFilter;
+    private Map<String, String> config;
 
-      @Override
-      public Function<MessageType, VectorizedReader<?>> apply() {
-        return messageType ->
-            readerFunction.read(schema, messageType, constantValues, deleteFilter, config);
-      }
+    public DynamicBatchReaderFunction(
+        BiFunction<DynamicBatchReaderFunction<D>, MessageType, VectorizedReader<D>>
+            readerFunction) {
+      this.readerFunction = readerFunction;
+    }
 
-      @Override
-      public Parquet.ReadBuilder.BatchReaderFunction withSchema(Schema schema) {
-        this.schema = schema;
-        return this;
-      }
+    @Override
+    public Function<MessageType, VectorizedReader<?>> apply() {
+      return messageType -> readerFunction.apply(this, messageType);
+    }
 
-      @Override
-      public Parquet.ReadBuilder.BatchReaderFunction withConstantValues(
-          Map<Integer, ?> constantValues) {
-        this.constantValues = constantValues;
-        return this;
-      }
+    @Override
+    public DynamicBatchReaderFunction<D> withSchema(Schema expectedSchema) {
+      this.schema = expectedSchema;
+      return this;
+    }
 
-      @Override
-      public Parquet.ReadBuilder.BatchReaderFunction withDeleteFilter(Object deleteFilter) {
-        this.deleteFilter = (B) deleteFilter;
-        return this;
-      }
+    @Override
+    public DynamicBatchReaderFunction<D> withConstantValues(Map<Integer, ?> newConstantValues) {
+      this.constantValues = newConstantValues;
+      return this;
+    }
 
-      @Override
-      public Parquet.ReadBuilder.BatchReaderFunction withConfig(Map<String, String> config) {
-        this.config = config;
-        return this;
-      }
-    };
+    @Override
+    public DynamicBatchReaderFunction<D> withDeleteFilter(Object newDeleteFilter) {
+      this.deleteFilter = newDeleteFilter;
+      return this;
+    }
+
+    @Override
+    public DynamicBatchReaderFunction<D> withConfig(Map<String, String> newConfig) {
+      this.config = newConfig;
+      return this;
+    }
+
+    @Override
+    public Schema schema() {
+      return schema;
+    }
+
+    @Override
+    public Map<Integer, ?> constantValues() {
+      return constantValues;
+    }
+
+    @Override
+    public Object deleteFilter() {
+      return deleteFilter;
+    }
+
+    @Override
+    public Map<String, String> config() {
+      return config;
+    }
   }
 }

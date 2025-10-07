@@ -49,14 +49,23 @@ public class SparkFormatModels {
         new ParquetFormatModel<InternalRow, StructType, DeleteFilter<InternalRow>>(
             InternalRow.class,
             StructType.class,
-            SparkParquetReaders::buildReader,
+            (readerFunction, messageType) ->
+                SparkParquetReaders.buildReader(
+                    readerFunction.schema(), messageType, readerFunction.constantValues()),
             (icebergSchema, messageType, inputType) ->
                 SparkParquetWriters.buildWriter(
                     SparkSchemaUtil.convert(icebergSchema), messageType)));
 
     FormatModelRegistry.register(
         new ParquetFormatModel<ColumnarBatch, StructType, DeleteFilter<InternalRow>>(
-            ColumnarBatch.class, StructType.class, VectorizedSparkParquetReaders::buildReader));
+            ColumnarBatch.class,
+            StructType.class,
+            (readerFunction, messageType) ->
+                VectorizedSparkParquetReaders.buildReader(
+                    readerFunction.schema(),
+                    messageType,
+                    readerFunction.constantValues(),
+                    (DeleteFilter<InternalRow>) readerFunction.deleteFilter())));
 
     FormatModelRegistry.register(
         new ORCFormatModel<>(

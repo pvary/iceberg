@@ -131,9 +131,9 @@ public class ArrowReader extends CloseableGroup {
         new ParquetFormatModel<>(
             ColumnarBatch.class,
             Object.class,
-            (schema, messageType, constantValues, deleteFilter, properties) ->
+            (readerFunction, messageType) ->
                 VectorizedCombinedScanIterator.buildReader(
-                    schema,
+                    readerFunction.schema(),
                     messageType, /* setArrowValidityVector */
                     NullCheckingForGet.NULL_CHECKING_ENABLED)));
   }

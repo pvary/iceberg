@@ -1281,6 +1281,14 @@ public class Parquet {
       default ReaderFunction withConstantValues(Map<Integer, ?> constantValues) {
         return this;
       }
+
+      default Schema schema() {
+        return null;
+      }
+
+      default Map<Integer, ?> constantValues() {
+        return ImmutableMap.of();
+      }
     }
 
     private static class UnaryReaderFunction implements ReaderFunction {
@@ -1317,6 +1325,11 @@ public class Parquet {
         this.schema = expectedSchema;
         return this;
       }
+
+      @Override
+      public Schema schema() {
+        return schema;
+      }
     }
 
     public interface BatchReaderFunction {
@@ -1336,6 +1349,22 @@ public class Parquet {
 
       default BatchReaderFunction withConfig(Map<String, String> config) {
         return this;
+      }
+
+      default Schema schema() {
+        return null;
+      }
+
+      default Map<Integer, ?> constantValues() {
+        return ImmutableMap.of();
+      }
+
+      default Object deleteFilter() {
+        return null;
+      }
+
+      default Map<String, String> config() {
+        return ImmutableMap.of();
       }
     }
 

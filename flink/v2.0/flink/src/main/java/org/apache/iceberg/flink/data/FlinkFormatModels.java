@@ -31,7 +31,9 @@ public class FlinkFormatModels {
         new ParquetFormatModel<>(
             RowData.class,
             RowType.class,
-            FlinkParquetReaders::buildReader,
+            (readerFunction, messageType) ->
+                FlinkParquetReaders.buildReader(
+                    readerFunction.schema(), messageType, readerFunction.constantValues()),
             (unused, messageType, rowType) ->
                 FlinkParquetWriters.buildWriter(rowType, messageType)));
 
