@@ -52,8 +52,8 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
  *
  * <p>The implementation delegates to a format-specific {@link WriteBuilder} while enriching it with
  * content-specific functionality. When building a writer, the implementation configures the
- * underlying builder and calls its {@link WriteBuilder#build()} method to create the appropriate
- * specialized writer for the requested content type.
+ * underlying builder and calls its {@link WriteBuilder#buildAppender()} method to create the
+ * appropriate specialized writer for the requested content type.
  *
  * @param <B> the concrete builder type for method chaining
  * @param <S> the type of the schema for the input data
@@ -61,7 +61,7 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
  */
 abstract class ContentFileWriteBuilderImpl<B extends ContentFileWriteBuilder<B>, D, S>
     implements ContentFileWriteBuilder<B> {
-  private final WriteBuilder writeBuilder;
+  private final WriteBuilder<D, S> writeBuilder;
   private final String location;
   private final FileFormat format;
   private PartitionSpec spec = null;
@@ -70,22 +70,23 @@ abstract class ContentFileWriteBuilderImpl<B extends ContentFileWriteBuilder<B>,
   private SortOrder sortOrder = null;
 
   static <D, S> DataWriteBuilder<D, S> forDataFile(
-      WriteBuilder writeBuilder, String location, FileFormat format) {
+      WriteBuilder<D, S> writeBuilder, String location, FileFormat format) {
     return new DataFileWriteBuilder<>(writeBuilder, location, format);
   }
 
   static <D, S> EqualityDeleteWriteBuilder<D, S> forEqualityDelete(
-      WriteBuilder writeBuilder, String location, FileFormat format) {
+      WriteBuilder<D, S> writeBuilder, String location, FileFormat format) {
     return new EqualityDeleteFileWriteBuilder<>(writeBuilder, location, format);
   }
 
   static PositionDeleteWriteBuilder forPositionDelete(
-      WriteBuilder writeBuilder, String location, FileFormat format) {
-    return new PositionDeleteFileWriteBuilder(writeBuilder, location, format);
+      WriteBuilder<PositionDelete<?>, ?> writeBuilder, String location, FileFormat format) {
+    return new PositionDeleteFileWriteBuilder(
+        (WriteBuilder<PositionDelete<?>, Object>) writeBuilder, location, format);
   }
 
   private ContentFileWriteBuilderImpl(
-      WriteBuilder writeBuilder, String location, FileFormat format) {
+      WriteBuilder<D, S> writeBuilder, String location, FileFormat format) {
     this.writeBuilder = writeBuilder;
     this.location = location;
     this.format = format;
@@ -154,7 +155,8 @@ abstract class ContentFileWriteBuilderImpl<B extends ContentFileWriteBuilder<B>,
   private static class DataFileWriteBuilder<D, S>
       extends ContentFileWriteBuilderImpl<DataWriteBuilder<D, S>, D, S>
       implements DataWriteBuilder<D, S> {
-    private DataFileWriteBuilder(WriteBuilder writeBuilder, String location, FileFormat format) {
+    private DataFileWriteBuilder(
+        WriteBuilder<D, S> writeBuilder, String location, FileFormat format) {
       super(writeBuilder, location, format);
     }
 
@@ -183,7 +185,7 @@ abstract class ContentFileWriteBuilderImpl<B extends ContentFileWriteBuilder<B>,
           "Partition must not be null when creating data writer for partitioned spec");
 
       return new DataWriter<>(
-          super.writeBuilder.build(),
+          super.writeBuilder.buildAppender(),
           super.format,
           super.location,
           super.spec,
@@ -200,7 +202,7 @@ abstract class ContentFileWriteBuilderImpl<B extends ContentFileWriteBuilder<B>,
     private int[] equalityFieldIds = null;
 
     private EqualityDeleteFileWriteBuilder(
-        WriteBuilder writeBuilder, String location, FileFormat format) {
+        WriteBuilder<D, S> writeBuilder, String location, FileFormat format) {
       super(writeBuilder, location, format);
     }
 
@@ -254,7 +256,7 @@ abstract class ContentFileWriteBuilderImpl<B extends ContentFileWriteBuilder<B>,
                   IntStream.of(equalityFieldIds)
                       .mapToObj(Objects::toString)
                       .collect(Collectors.joining(", ")))
-              .build(),
+              .buildAppender(),
           super.format,
           super.location,
           super.spec,
@@ -270,7 +272,7 @@ abstract class ContentFileWriteBuilderImpl<B extends ContentFileWriteBuilder<B>,
       implements PositionDeleteWriteBuilder {
 
     private PositionDeleteFileWriteBuilder(
-        WriteBuilder writeBuilder, String location, FileFormat format) {
+        WriteBuilder<PositionDelete<?>, Object> writeBuilder, String location, FileFormat format) {
       super(writeBuilder, location, format);
     }
 
@@ -289,7 +291,7 @@ abstract class ContentFileWriteBuilderImpl<B extends ContentFileWriteBuilder<B>,
 
       return new PositionDeleteWriter<>(
           new PositionDeleteFileAppender(
-              super.writeBuilder.meta("delete-type", "position").build()),
+              super.writeBuilder.meta("delete-type", "position").buildAppender()),
           super.format,
           super.location,
           super.spec,

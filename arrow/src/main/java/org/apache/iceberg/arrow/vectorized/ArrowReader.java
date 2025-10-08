@@ -355,7 +355,7 @@ public class ArrowReader extends CloseableGroup {
                 .recordsPerBatch(batchSize)
                 .caseSensitive(filterCaseSensitive)
                 .filter(task.residual())
-                .build();
+                .buildIterable();
       } else {
         throw new UnsupportedOperationException(
             "Format: " + task.file().format() + " not supported for batched reads");

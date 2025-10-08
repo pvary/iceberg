@@ -186,7 +186,12 @@ public class GenericAppenderFactory implements FileAppenderFactory<Record> {
     try {
       WriteBuilder builder =
           FormatModelRegistry.writeBuilder(fileFormat, Record.class, encryptedOutputFile);
-      return builder.schema(schema).setAll(config).metricsConfig(metricsConfig).overwrite().build();
+      return builder
+          .schema(schema)
+          .setAll(config)
+          .metricsConfig(metricsConfig)
+          .overwrite()
+          .buildAppender();
     } catch (IOException e) {
       throw new UncheckedIOException(e);
     }

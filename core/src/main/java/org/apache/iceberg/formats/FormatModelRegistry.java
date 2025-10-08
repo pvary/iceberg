@@ -147,9 +147,10 @@ public final class FormatModelRegistry {
    * @param type the output type
    * @param inputFile source file to read data from
    * @param <D> the type of data records the reader will produce
+   * @param <S> the type of the output schema for the reader
    * @return a configured reader builder for the specified format and object model
    */
-  public static <D, S> ReadBuilder readBuilder(
+  public static <D, S> ReadBuilder<D, S> readBuilder(
       FileFormat format, Class<D> type, InputFile inputFile) {
     FormatModel<D, S> factory = factoryFor(format, type);
     return factory.readBuilder(inputFile);
@@ -166,11 +167,12 @@ public final class FormatModelRegistry {
    * @param type the input type
    * @param outputFile destination for the written data
    * @param <D> the type of data records the writer will accept
+   * @param <S> the type of the input schema for the writer
    * @return a configured writer builder for creating the appender
    */
-  public static <D> WriteBuilder writeBuilder(
+  public static <D, S> WriteBuilder<D, S> writeBuilder(
       FileFormat format, Class<D> type, EncryptedOutputFile outputFile) {
-    FormatModel<D, ?> factory = factoryFor(format, type);
+    FormatModel<D, S> factory = factoryFor(format, type);
     return factory.writeBuilder(outputFile.encryptingOutputFile()).content(FileContent.DATA);
   }
 
@@ -192,7 +194,7 @@ public final class FormatModelRegistry {
   public static <D, S> DataWriteBuilder<D, S> dataWriteBuilder(
       FileFormat format, Class<D> type, EncryptedOutputFile outputFile) {
     FormatModel<D, S> factory = factoryFor(format, type);
-    WriteBuilder writeBuilder =
+    WriteBuilder<D, S> writeBuilder =
         factory.writeBuilder(outputFile.encryptingOutputFile()).content(FileContent.DATA);
     return ContentFileWriteBuilderImpl.forDataFile(
         writeBuilder, outputFile.encryptingOutputFile().location(), format);
@@ -216,7 +218,7 @@ public final class FormatModelRegistry {
   public static <D, S> EqualityDeleteWriteBuilder<D, S> equalityDeleteWriteBuilder(
       FileFormat format, Class<D> type, EncryptedOutputFile outputFile) {
     FormatModel<D, S> factory = factoryFor(format, type);
-    WriteBuilder writeBuilder =
+    WriteBuilder<D, S> writeBuilder =
         factory
             .writeBuilder(outputFile.encryptingOutputFile())
             .content(FileContent.EQUALITY_DELETES);
@@ -239,7 +241,7 @@ public final class FormatModelRegistry {
   public static PositionDeleteWriteBuilder positionDeleteWriteBuilder(
       FileFormat format, EncryptedOutputFile outputFile) {
     FormatModel<PositionDelete<?>, ?> factory = factoryForPositionDelete(format);
-    WriteBuilder writeBuilder =
+    WriteBuilder<PositionDelete<?>, ?> writeBuilder =
         factory
             .writeBuilder(outputFile.encryptingOutputFile())
             .content(FileContent.POSITION_DELETES);

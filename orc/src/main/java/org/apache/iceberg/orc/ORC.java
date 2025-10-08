@@ -117,7 +117,8 @@ public class ORC {
     return new WriteBuilder(file.encryptingOutputFile());
   }
 
-  public static class WriteBuilder implements org.apache.iceberg.formats.WriteBuilder {
+  public static class WriteBuilder
+      implements org.apache.iceberg.formats.WriteBuilder<Object, Object> {
     private final OutputFile file;
     private final Configuration conf;
     private Schema schema = null;
@@ -250,6 +251,10 @@ public class ORC {
     }
 
     @Override
+    public FileAppender<Object> buildAppender() {
+      return build();
+    }
+
     public <D> FileAppender<D> build() {
       if (content != null) {
         switch (content) {
@@ -782,7 +787,8 @@ public class ORC {
     return new ReadBuilder(file);
   }
 
-  public static class ReadBuilder implements org.apache.iceberg.formats.ReadBuilder {
+  public static class ReadBuilder
+      implements org.apache.iceberg.formats.ReadBuilder<Object, Object> {
     private final InputFile file;
     private final Configuration conf;
     private Schema schema = null;
@@ -928,6 +934,10 @@ public class ORC {
     }
 
     @Override
+    public CloseableIterable<Object> buildIterable() {
+      return build();
+    }
+
     public <D> CloseableIterable<D> build() {
       Preconditions.checkNotNull(schema, "Schema is required");
       Preconditions.checkNotNull(reuseContainers, "Reuse containers is required for ORC read");

@@ -101,7 +101,7 @@ class GenericReader implements Serializable {
         .split(task.start(), task.length())
         .caseSensitive(filterCaseSensitive)
         .filter(task.residual())
-        .build();
+        .buildIterable();
   }
 
   private class CombinedTaskIterable extends CloseableGroup implements CloseableIterable<Record> {

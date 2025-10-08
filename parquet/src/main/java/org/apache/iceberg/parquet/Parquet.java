@@ -159,7 +159,8 @@ public class Parquet {
   }
 
   public static class WriteBuilder
-      implements InternalData.WriteBuilder, org.apache.iceberg.formats.WriteBuilder {
+      implements InternalData.WriteBuilder,
+          org.apache.iceberg.formats.WriteBuilder<Object, Object> {
     private final OutputFile file;
     private final Configuration conf;
     private final Map<String, String> metadata = Maps.newLinkedHashMap();
@@ -397,6 +398,11 @@ public class Parquet {
                 }
                 withColumnStatsEnabled.accept(parquetColumnPath, Boolean.valueOf(isEnabled));
               });
+    }
+
+    @Override
+    public FileAppender<Object> buildAppender() throws IOException {
+      return build();
     }
 
     @SuppressWarnings("methodLength")
@@ -1238,7 +1244,7 @@ public class Parquet {
 
   public static class ReadBuilder
       implements InternalData.ReadBuilder,
-          org.apache.iceberg.formats.ReadBuilder,
+          org.apache.iceberg.formats.ReadBuilder<Object, Object>,
           ParquetFormatModel.SupportsDeleteFilter<Object> {
     private final InputFile file;
     private final Map<String, String> properties = Maps.newHashMap();
@@ -1526,6 +1532,11 @@ public class Parquet {
     public ReadBuilder withAADPrefix(ByteBuffer aadPrefix) {
       this.fileAADPrefix = aadPrefix;
       return this;
+    }
+
+    @Override
+    public CloseableIterable<Object> buildIterable() {
+      return build();
     }
 
     @Override

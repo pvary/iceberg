@@ -109,7 +109,8 @@ public class Avro {
   }
 
   public static class WriteBuilder
-      implements InternalData.WriteBuilder, org.apache.iceberg.formats.WriteBuilder {
+      implements InternalData.WriteBuilder,
+          org.apache.iceberg.formats.WriteBuilder<Object, Object> {
     private final OutputFile file;
     private final Map<String, String> config = Maps.newHashMap();
     private final Map<String, String> metadata = Maps.newLinkedHashMap();
@@ -240,6 +241,11 @@ public class Avro {
         Function<Map<String, String>, Context> newCreateContextFunc) {
       this.createContextFunc = newCreateContextFunc;
       return this;
+    }
+
+    @Override
+    public FileAppender<Object> buildAppender() throws IOException {
+      return build();
     }
 
     @Override
@@ -710,7 +716,7 @@ public class Avro {
   }
 
   public static class ReadBuilder
-      implements InternalData.ReadBuilder, org.apache.iceberg.formats.ReadBuilder {
+      implements InternalData.ReadBuilder, org.apache.iceberg.formats.ReadBuilder<Object, Object> {
     private final InputFile file;
     private final Map<String, String> renames = Maps.newLinkedHashMap();
     private final Map<Integer, Class<? extends StructLike>> typeMap = Maps.newHashMap();
@@ -876,6 +882,11 @@ public class Avro {
     public ReadBuilder classLoader(ClassLoader classLoader) {
       this.loader = classLoader;
       return this;
+    }
+
+    @Override
+    public AvroIterable<Object> buildIterable() {
+      return build();
     }
 
     @Override

@@ -28,23 +28,26 @@ import org.apache.iceberg.io.FileAppender;
 
 /**
  * Builder interface for creating file writers across supported data file formats. The {@link
- * FormatModel} implementations provide the appropriate {@link WriteBuilder} instances.
+ * FormatModel} implementations provide the appropriate {@link WriteBuilder<D, S>} instances.
  *
- * <p>The {@link WriteBuilder} follows the builder pattern to configure and create {@link
+ * <p>The {@link WriteBuilder<D, S>} follows the builder pattern to configure and create {@link
  * FileAppender} instances that write data to the target output files.
  *
  * <p>This interface is directly exposed to users for parameterizing when only an appender is
  * required.
+ *
+ * @param <D> the output data type produced by the reader
+ * @param <S> the type of the schema for the output data type
  */
-public interface WriteBuilder {
+public interface WriteBuilder<D, S> {
   /** Set the file schema. */
-  WriteBuilder schema(Schema schema);
+  WriteBuilder<D, S> schema(Schema schema);
 
   /**
    * Sets the input schema accepted by the writer. If not provided derived from the {@link
    * #schema(Schema)}.
    */
-  WriteBuilder inputSchema(Object schema);
+  WriteBuilder<D, S> inputSchema(S schema);
 
   /**
    * Set a writer configuration property which affects the writer behavior.
@@ -53,7 +56,7 @@ public interface WriteBuilder {
    * @param value config value
    * @return this for method chaining
    */
-  WriteBuilder set(String property, String value);
+  WriteBuilder<D, S> set(String property, String value);
 
   /**
    * Sets multiple writer configuration properties that affect the writer behavior.
@@ -61,7 +64,7 @@ public interface WriteBuilder {
    * @param properties writer config properties to set
    * @return this for method chaining
    */
-  default WriteBuilder setAll(Map<String, String> properties) {
+  default WriteBuilder<D, S> setAll(Map<String, String> properties) {
     properties.forEach(this::set);
     return this;
   }
@@ -73,7 +76,7 @@ public interface WriteBuilder {
    * @param value config value
    * @return this for method chaining
    */
-  WriteBuilder meta(String property, String value);
+  WriteBuilder<D, S> meta(String property, String value);
 
   /**
    * Sets multiple file metadata properties in the created file.
@@ -81,7 +84,7 @@ public interface WriteBuilder {
    * @param properties file metadata properties to set
    * @return this for method chaining
    */
-  default WriteBuilder meta(Map<String, String> properties) {
+  default WriteBuilder<D, S> meta(Map<String, String> properties) {
     properties.forEach(this::meta);
     return this;
   }
@@ -90,26 +93,26 @@ public interface WriteBuilder {
    * Based on the target file content the generated {@link FileAppender} needs different
    * configuration.
    */
-  WriteBuilder content(FileContent content);
+  WriteBuilder<D, S> content(FileContent content);
 
   /** Sets the metrics configuration used for collecting column metrics for the created file. */
-  WriteBuilder metricsConfig(MetricsConfig metricsConfig);
+  WriteBuilder<D, S> metricsConfig(MetricsConfig metricsConfig);
 
   /** Overwrite the file if it already exists. By default, overwrite is disabled. */
-  WriteBuilder overwrite();
+  WriteBuilder<D, S> overwrite();
 
   /**
    * Sets the encryption key used for writing the file. If the writer does not support encryption,
    * then an exception should be thrown.
    */
-  WriteBuilder withFileEncryptionKey(ByteBuffer encryptionKey);
+  WriteBuilder<D, S> withFileEncryptionKey(ByteBuffer encryptionKey);
 
   /**
    * Sets the additional authentication data (AAD) prefix used for writing the file. If the reader
    * does not support encryption, then an exception should be thrown.
    */
-  WriteBuilder withAADPrefix(ByteBuffer aadPrefix);
+  WriteBuilder<D, S> withAADPrefix(ByteBuffer aadPrefix);
 
   /** Finalizes the configuration and builds the {@link FileAppender}. */
-  <D> FileAppender<D> build() throws IOException;
+  FileAppender<D> buildAppender() throws IOException;
 }
