@@ -125,7 +125,7 @@ public final class FormatModelRegistry {
    * @return a configured reader builder for the specified format and object model
    */
   public static <D, S> ReadBuilder<D, S> readBuilder(
-      FileFormat format, Class<D> type, InputFile inputFile) {
+      FileFormat format, Class<? extends D> type, InputFile inputFile) {
     FormatModel<D, S> factory = factoryFor(format, type);
     return factory.readBuilder(inputFile);
   }
@@ -205,7 +205,7 @@ public final class FormatModelRegistry {
   }
 
   @SuppressWarnings("unchecked")
-  private static <D, S> FormatModel<D, S> factoryFor(FileFormat format, Class<D> type) {
+  private static <D, S> FormatModel<D, S> factoryFor(FileFormat format, Class<? extends D> type) {
     FormatModel<D, S> model = (FormatModel<D, S>) MODELS.get(Pair.of(format, type));
     Preconditions.checkArgument(
         model != null, "Format model is not registered for format %s and type %s", format, type);

@@ -33,6 +33,7 @@ import org.apache.iceberg.spark.ParquetReaderType;
 import org.apache.iceberg.spark.SparkUtil;
 import org.apache.parquet.schema.MessageType;
 import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.vectorized.ColumnVector;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -98,6 +99,21 @@ public class VectorizedSparkParquetReaders {
       DeleteFilter<InternalRow> deleteFilter) {
     return buildReader(
         expectedSchema, fileSchema, idToConstant, deleteFilter, ArrowAllocation.rootAllocator());
+  }
+
+  public static class CometColumnarBatch extends ColumnarBatch {
+    public CometColumnarBatch(ColumnVector[] columns) {
+      super(columns);
+    }
+  }
+
+  public static VectorizedReader<ColumnarBatch> buildCometReader(
+      Schema schema,
+      MessageType fileSchema,
+      Map<Integer, ?> idToConstant,
+      DeleteFilter<InternalRow> deleteFilter,
+      Map<String, String> config) {
+    return buildReader(schema, fileSchema, idToConstant, deleteFilter);
   }
 
   public static CometColumnarBatchReader buildCometReader(

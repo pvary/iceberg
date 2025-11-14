@@ -45,19 +45,19 @@ import org.apache.parquet.schema.MessageType;
 public class ParquetFormatModel<D, S, F> implements FormatModel<D, S> {
   public static final String WRITER_VERSION_KEY = "parquet.writer.version";
 
-  private final Class<D> type;
+  private final Class<? extends D> registerType;
   private final Class<S> schemaType;
   private final ReaderFunction<D> readerFunction;
   private final BatchReaderFunction<D, F> batchReaderFunction;
   private final WriterFunction<S> writerFunction;
 
   private ParquetFormatModel(
-      Class<D> type,
+      Class<? extends D> registerType,
       Class<S> schemaType,
       ReaderFunction<D> readerFunction,
       BatchReaderFunction<D, F> batchReaderFunction,
       WriterFunction<S> writerFunction) {
-    this.type = type;
+    this.registerType = registerType;
     this.schemaType = schemaType;
     this.readerFunction = readerFunction;
     this.batchReaderFunction = batchReaderFunction;
@@ -65,7 +65,7 @@ public class ParquetFormatModel<D, S, F> implements FormatModel<D, S> {
   }
 
   public ParquetFormatModel(Class<D> type) {
-    this(type, null, null, null);
+    this(type, null, null, null, null);
   }
 
   public ParquetFormatModel(
@@ -77,8 +77,10 @@ public class ParquetFormatModel<D, S, F> implements FormatModel<D, S> {
   }
 
   public ParquetFormatModel(
-      Class<D> type, Class<S> schemaType, BatchReaderFunction<D, F> batchReaderFunction) {
-    this(type, schemaType, null, batchReaderFunction, null);
+      Class<? extends D> returnType,
+      Class<S> schemaType,
+      BatchReaderFunction<D, F> batchReaderFunction) {
+    this(returnType, schemaType, null, (BatchReaderFunction<D, F>) batchReaderFunction, null);
   }
 
   @Override
@@ -88,7 +90,7 @@ public class ParquetFormatModel<D, S, F> implements FormatModel<D, S> {
 
   @Override
   public Class<D> type() {
-    return type;
+    return (Class<D>) registerType;
   }
 
   @Override

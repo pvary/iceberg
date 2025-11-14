@@ -32,6 +32,7 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.parquet.ParquetFormatModel;
 import org.apache.iceberg.spark.OrcBatchReadConf;
 import org.apache.iceberg.spark.ParquetBatchReadConf;
+import org.apache.iceberg.spark.ParquetReaderType;
 import org.apache.iceberg.spark.data.vectorized.VectorizedSparkParquetReaders;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 
@@ -64,22 +65,28 @@ abstract class BaseBatchReader<T extends ScanTask> extends BaseReader<ColumnarBa
       Map<Integer, ?> idToConstant,
       SparkDeleteFilter deleteFilter) {
     Schema requiredSchema = deleteFilter != null ? deleteFilter.requiredSchema() : expectedSchema();
-    ReadBuilder readBuilder =
-        FormatModelRegistry.readBuilder(format, ColumnarBatch.class, inputFile);
+    ReadBuilder<ColumnarBatch, ?> readBuilder;
     if (parquetConf != null) {
-      readBuilder =
-          readBuilder
-              .recordsPerBatch(parquetConf.batchSize())
-              .set(
-                  VectorizedSparkParquetReaders.PARQUET_READER_TYPE,
-                  parquetConf.readerType().name());
+      if (!ParquetReaderType.COMET.name().equals(parquetConf.readerType().name())) {
+        readBuilder =
+            FormatModelRegistry.readBuilder(
+                format, VectorizedSparkParquetReaders.CometColumnarBatch.class, inputFile);
+      } else {
+        readBuilder = FormatModelRegistry.readBuilder(format, ColumnarBatch.class, inputFile);
+      }
+
+      readBuilder = readBuilder.recordsPerBatch(parquetConf.batchSize());
 
       if (readBuilder instanceof ParquetFormatModel.SupportsDeleteFilter<?>) {
         ((ParquetFormatModel.SupportsDeleteFilter<SparkDeleteFilter>) readBuilder)
             .deleteFilter(deleteFilter);
       }
     } else if (orcConf != null) {
-      readBuilder = readBuilder.recordsPerBatch(orcConf.batchSize());
+      readBuilder =
+          FormatModelRegistry.readBuilder(format, ColumnarBatch.class, inputFile)
+              .recordsPerBatch(orcConf.batchSize());
+    } else {
+      readBuilder = FormatModelRegistry.readBuilder(format, ColumnarBatch.class, inputFile);
     }
 
     return readBuilder
