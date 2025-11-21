@@ -1593,6 +1593,179 @@ public class TestRemoveSnapshots extends TableTestBase {
     return (RemoveSnapshots) removeSnapshots.withIncrementalCleanup(incrementalCleanup);
   }
 
+  @Test
+  public void testCleanupLevelAll() {
+    table.newAppend().appendFile(FILE_A).commit();
+    Snapshot firstSnapshot = table.currentSnapshot();
+    table.newDelete().deleteFile(FILE_A).commit();
+    Snapshot secondSnapshot = table.currentSnapshot();
+    table.newAppend().appendFile(FILE_B).commit();
+    long tAfterCommits = waitUntilAfter(table.currentSnapshot().timestampMillis());
+
+    Set<String> deletedFiles = Sets.newHashSet();
+
+    table
+        .expireSnapshots()
+        .cleanupLevel(ExpireSnapshots.CleanupLevel.ALL)
+        .expireOlderThan(tAfterCommits)
+        .deleteWith(deletedFiles::add)
+        .commit();
+
+    Assertions.assertThat(deletedFiles)
+        .as("CleanupLevel.ALL should delete both metadata and data files")
+        .containsExactlyInAnyOrder(
+            firstSnapshot.manifestListLocation(),
+            firstSnapshot.allManifests(table.io()).get(0).path(),
+            secondSnapshot.manifestListLocation(),
+            secondSnapshot.allManifests(table.io()).get(0).path(),
+            FILE_A.path().toString());
+  }
+
+  @Test
+  public void testCleanupLevelMetadataOnly() {
+    table.newAppend().appendFile(FILE_A).commit();
+    Snapshot firstSnapshot = table.currentSnapshot();
+    table.newDelete().deleteFile(FILE_A).commit();
+    Snapshot secondSnapshot = table.currentSnapshot();
+    table.newAppend().appendFile(FILE_B).commit();
+    long tAfterCommits = waitUntilAfter(table.currentSnapshot().timestampMillis());
+
+    Set<String> deletedFiles = Sets.newHashSet();
+
+    table
+        .expireSnapshots()
+        .cleanupLevel(ExpireSnapshots.CleanupLevel.METADATA_ONLY)
+        .expireOlderThan(tAfterCommits)
+        .deleteWith(deletedFiles::add)
+        .commit();
+
+    Assertions.assertThat(deletedFiles)
+        .as("CleanupLevel.METADATA_ONLY should delete only metadata files")
+        .containsExactlyInAnyOrder(
+            firstSnapshot.manifestListLocation(),
+            firstSnapshot.allManifests(table.io()).get(0).path(),
+            secondSnapshot.manifestListLocation(),
+            secondSnapshot.allManifests(table.io()).get(0).path());
+  }
+
+  @Test
+  public void testCleanupLevelNone() {
+    table.newAppend().appendFile(FILE_A).commit();
+    Snapshot firstSnapshot = table.currentSnapshot();
+    table.newDelete().deleteFile(FILE_A).commit();
+    Snapshot secondSnapshot = table.currentSnapshot();
+    table.newAppend().appendFile(FILE_B).commit();
+    long tAfterCommits = waitUntilAfter(table.currentSnapshot().timestampMillis());
+
+    Set<String> deletedFiles = Sets.newHashSet();
+
+    table
+        .expireSnapshots()
+        .cleanupLevel(ExpireSnapshots.CleanupLevel.NONE)
+        .expireOlderThan(tAfterCommits)
+        .deleteWith(deletedFiles::add)
+        .commit();
+
+    Assertions.assertThat(table.snapshot(firstSnapshot.snapshotId()))
+        .as("First snapshot metadata should be removed even with CleanupLevel.NONE")
+        .isNull();
+    Assertions.assertThat(table.snapshot(secondSnapshot.snapshotId()))
+        .as("Second snapshot metadata should be removed even with CleanupLevel.NONE")
+        .isNull();
+
+    Assertions.assertThat(deletedFiles).as("CleanupLevel.NONE should not delete any files").isEmpty();
+  }
+
+  @Test
+  public void testCleanExpiredFilesAPI() {
+    table.newAppend().appendFile(FILE_A).commit();
+    Snapshot firstSnapshot = table.currentSnapshot();
+    waitUntilAfter(firstSnapshot.timestampMillis());
+
+    table.newAppend().appendFile(FILE_B).commit();
+    long tAfterCommits = waitUntilAfter(table.currentSnapshot().timestampMillis());
+
+    Set<String> deletedFiles = Sets.newHashSet();
+
+    // Use deprecated cleanExpiredFiles(false) - should map to CleanupLevel.NONE
+    table
+        .expireSnapshots()
+        .cleanExpiredFiles(false)
+        .expireOlderThan(tAfterCommits)
+        .deleteWith(deletedFiles::add)
+        .commit();
+
+    Assertions.assertThat(deletedFiles)
+        .as("Deprecated cleanExpiredFiles(false) should behave like CleanupLevel.NONE")
+        .isEmpty();
+  }
+
+  @Test
+  public void testCannotSetCleanExpiredFilesAndCleanupLevelTogether() {
+    // Setting cleanExpiredFiles after cleanupLevel should fail
+    Assertions.assertThatThrownBy(
+            () ->
+                table
+                    .expireSnapshots()
+                    .cleanupLevel(ExpireSnapshots.CleanupLevel.METADATA_ONLY)
+                    .cleanExpiredFiles(false))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(
+            "Cannot set cleanExpiredFiles when cleanupLevel has already been set");
+
+    // Setting cleanupLevel after cleanExpiredFiles should also fail
+    Assertions.assertThatThrownBy(
+            () ->
+                table
+                    .expireSnapshots()
+                    .cleanExpiredFiles(false)
+                    .cleanupLevel(ExpireSnapshots.CleanupLevel.METADATA_ONLY))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(
+            "Cannot set cleanupLevel to METADATA_ONLY when cleanExpiredFiles was explicitly set to false");
+  }
+
+  @Test
+  public void testCanOverrideCleanExpiredFilesWithCleanupLevel() {
+    table.newAppend().appendFile(FILE_A).commit();
+    Snapshot firstSnapshot = table.currentSnapshot();
+    table.newDelete().deleteFile(FILE_A).commit();
+    Snapshot secondSnapshot = table.currentSnapshot();
+    table.newAppend().appendFile(FILE_B).commit();
+    long tAfterCommits = waitUntilAfter(table.currentSnapshot().timestampMillis());
+
+    Set<String> deletedFiles = Sets.newHashSet();
+
+    // Setting cleanExpiredFiles(true) first, then overriding with cleanupLevel should work
+    // because cleanExpiredFiles(true) doesn't create a conflicting intention
+    table
+        .expireSnapshots()
+        .cleanExpiredFiles(true) // This sets cleanupLevel to ALL
+        .cleanupLevel(
+            ExpireSnapshots.CleanupLevel.METADATA_ONLY) // This should override to METADATA_ONLY
+        .expireOlderThan(tAfterCommits)
+        .deleteWith(deletedFiles::add)
+        .commit();
+
+    Assertions.assertThat(deletedFiles)
+        .as("Should only delete metadata files when overridden to METADATA_ONLY")
+        .containsExactlyInAnyOrder(
+            firstSnapshot.manifestListLocation(),
+            firstSnapshot.allManifests(table.io()).get(0).path(),
+            secondSnapshot.manifestListLocation(),
+            secondSnapshot.allManifests(table.io()).get(0).path());
+
+    // FILE_A should NOT be deleted because cleanupLevel was overridden to METADATA_ONLY
+    Assertions.assertThat(deletedFiles).doesNotContain(FILE_A.path().toString());
+  }
+
+  @Test
+  public void testCleanupLevelNullValidation() {
+    Assertions.assertThatThrownBy(() -> table.expireSnapshots().cleanupLevel(null))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining("Invalid cleanup level: null");
+  }
+
   private StatisticsFile writeStatsFile(
       long snapshotId, long snapshotSequenceNumber, String statsLocation, FileIO fileIO)
       throws IOException {
