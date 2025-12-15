@@ -44,6 +44,7 @@ import org.apache.iceberg.data.Record;
 import org.apache.iceberg.data.parquet.GenericParquetReaders;
 import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.DataWriter;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
@@ -79,6 +80,7 @@ public class TestParquetFileMerger {
   @BeforeEach
   public void setupFileIO() {
     this.fileIO = new TestTables.LocalFileIO();
+    temp.resolve("parquet").toFile().mkdirs();
   }
 
   @Test
@@ -99,7 +101,6 @@ public class TestParquetFileMerger {
   public void testCanMergeReturnsFalseForNonParquetFile() throws IOException {
     // Create a non-Parquet file (just a text file)
     File textFile = createTempFile(temp);
-    textFile.getParentFile().mkdirs(); // Ensure directory exists
     java.nio.file.Files.write(textFile.toPath(), "This is not a Parquet file".getBytes());
 
     InputFile inputFile = Files.localInput(textFile);
@@ -112,12 +113,10 @@ public class TestParquetFileMerger {
 
   @Test
   public void testCanMergeReturnsFalseForDifferentSchemas() throws IOException {
-    // Create first Parquet file with schema1
-    Schema icebergSchema1 = SCHEMA;
-
+    // Create first Parquet file with SCHEMA
     File parquetFile1 = createTempFile(temp);
     OutputFile outputFile1 = Files.localOutput(parquetFile1);
-    createParquetFileWithData(outputFile1, icebergSchema1, Collections.emptyList());
+    createParquetFileWithData(outputFile1, SCHEMA, Collections.emptyList());
 
     // Create second Parquet file with different schema
     Schema icebergSchema2 =
@@ -142,10 +141,10 @@ public class TestParquetFileMerger {
   public void testCanMergeReturnsTrueForIdenticalSchemas() throws IOException {
     // Create two Parquet files with the same schema and some data
     File parquetFile1 = createTempFile(temp);
-    writeRecordsToFile(parquetFile1, Arrays.asList(createRecord(1, "a")));
+    writeRecordsToFile(parquetFile1, Collections.singletonList(createRecord(1, "a")));
 
     File parquetFile2 = createTempFile(temp);
-    writeRecordsToFile(parquetFile2, Arrays.asList(createRecord(2, "b")));
+    writeRecordsToFile(parquetFile2, Collections.singletonList(createRecord(2, "b")));
 
     // Should return non-null MessageType for identical schemas
     InputFile inputFile1 = Files.localInput(parquetFile1);
@@ -156,11 +155,12 @@ public class TestParquetFileMerger {
     assertThat(result).isNotNull();
   }
 
+  /**
+   * Test that merging files with virtual row lineage synthesizes physical _row_id and
+   * _last_updated_sequence_number columns
+   */
   @Test
   public void testMergeFilesSynthesizesRowLineageColumns() throws IOException {
-    // Test that merging files with virtual row lineage synthesizes physical _row_id and
-    // _last_updated_sequence_number columns
-
     // Create two files with test data
     File file1 = createTempFile(temp);
     writeRecordsToFile(
@@ -179,8 +179,7 @@ public class TestParquetFileMerger {
     OutputFile mergedOutput = Files.localOutput(mergedFile);
 
     // Perform merge
-    mergeFilesHelper(
-        dataFiles, mergedOutput, DEFAULT_ROW_GROUP_SIZE, PartitionSpec.unpartitioned(), null);
+    mergeFilesHelper(dataFiles, mergedOutput, PartitionSpec.unpartitioned(), null);
 
     // Verify the merged file has both row lineage columns
     InputFile mergedInput = Files.localInput(mergedFile);
@@ -188,6 +187,7 @@ public class TestParquetFileMerger {
     try (ParquetFileReader reader = ParquetFileReader.open(ParquetIO.file(mergedInput))) {
       mergedSchema = reader.getFooter().getFileMetaData().getSchema();
     }
+
     assertThat(mergedSchema.containsField(MetadataColumns.ROW_ID.name()))
         .as("Merged file should have _row_id column")
         .isTrue();
@@ -221,10 +221,9 @@ public class TestParquetFileMerger {
     assertThat(records.get(4).data).isEqualTo("e");
   }
 
+  /** Test row lineage synthesis works correctly across multiple row groups */
   @Test
   public void testMergeFilesWithMultipleRowGroups() throws IOException {
-    // Test row lineage synthesis works correctly across multiple row groups
-
     // Create file with multiple row groups by setting small row group size
     File file1 = createTempFile(temp);
     OutputFile output1 = Files.localOutput(file1);
@@ -234,16 +233,17 @@ public class TestParquetFileMerger {
     for (int i = 0; i < 100; i++) {
       records.add(createRecord(i, "data" + i));
     }
+
     createParquetFileWithData(output1, SCHEMA, records, 1024); // Small row group size
 
     // Merge with row lineage
-    List<DataFile> dataFiles = Arrays.asList(createDataFile(file1.getAbsolutePath(), 1000L, 7L));
+    List<DataFile> dataFiles =
+        Collections.singletonList(createDataFile(file1.getAbsolutePath(), 1000L, 7L));
 
     File mergedFile = createTempFile(temp);
     OutputFile mergedOutput = Files.localOutput(mergedFile);
 
-    mergeFilesHelper(
-        dataFiles, mergedOutput, DEFAULT_ROW_GROUP_SIZE, PartitionSpec.unpartitioned(), null);
+    mergeFilesHelper(dataFiles, mergedOutput, PartitionSpec.unpartitioned(), null);
 
     // Verify row IDs are sequential across row groups
     List<RowLineageRecord> mergedRecords = readRowLineageData(Files.localInput(mergedFile));
@@ -255,16 +255,15 @@ public class TestParquetFileMerger {
     }
   }
 
+  /** Test that each file's dataSequenceNumber is correctly applied to its rows */
   @Test
   public void testMergeFilesWithDifferentDataSequenceNumbers() throws IOException {
-    // Test that each file's dataSequenceNumber is correctly applied to its rows
-
     // Create three files
     File file1 = createTempFile(temp);
     writeRecordsToFile(file1, Arrays.asList(createRecord(1, "a"), createRecord(2, "b")));
 
     File file2 = createTempFile(temp);
-    writeRecordsToFile(file2, Arrays.asList(createRecord(3, "c")));
+    writeRecordsToFile(file2, Collections.singletonList(createRecord(3, "c")));
 
     File file3 = createTempFile(temp);
     writeRecordsToFile(
@@ -279,12 +278,7 @@ public class TestParquetFileMerger {
 
     File mergedFile = createTempFile(temp);
 
-    mergeFilesHelper(
-        dataFiles,
-        Files.localOutput(mergedFile),
-        DEFAULT_ROW_GROUP_SIZE,
-        PartitionSpec.unpartitioned(),
-        null);
+    mergeFilesHelper(dataFiles, Files.localOutput(mergedFile), PartitionSpec.unpartitioned(), null);
 
     // Verify sequence numbers transition correctly between files
     List<RowLineageRecord> records = readRowLineageData(Files.localInput(mergedFile));
@@ -303,15 +297,14 @@ public class TestParquetFileMerger {
     assertThat(records.get(5).seqNum).isEqualTo(30L);
   }
 
+  /** Test that merging without firstRowIds/dataSequenceNumbers works (no row lineage columns) */
   @Test
   public void testMergeFilesWithoutRowLineage() throws IOException {
-    // Test that merging without firstRowIds/dataSequenceNumbers works (no row lineage columns)
-
     File file1 = createTempFile(temp);
     writeRecordsToFile(file1, Arrays.asList(createRecord(1, "a"), createRecord(2, "b")));
 
     File file2 = createTempFile(temp);
-    writeRecordsToFile(file2, Arrays.asList(createRecord(3, "c")));
+    writeRecordsToFile(file2, Collections.singletonList(createRecord(3, "c")));
 
     // Merge without row lineage (null firstRowIds and dataSequenceNumbers)
     List<DataFile> dataFiles =
@@ -321,12 +314,7 @@ public class TestParquetFileMerger {
 
     File mergedFile = createTempFile(temp);
 
-    mergeFilesHelper(
-        dataFiles,
-        Files.localOutput(mergedFile),
-        DEFAULT_ROW_GROUP_SIZE,
-        PartitionSpec.unpartitioned(),
-        null);
+    mergeFilesHelper(dataFiles, Files.localOutput(mergedFile), PartitionSpec.unpartitioned(), null);
 
     // Verify merged file does NOT have row lineage columns
     MessageType mergedSchema;
@@ -334,6 +322,7 @@ public class TestParquetFileMerger {
         ParquetFileReader.open(ParquetIO.file(Files.localInput(mergedFile)))) {
       mergedSchema = reader.getFooter().getFileMetaData().getSchema();
     }
+
     assertThat(mergedSchema.containsField(MetadataColumns.ROW_ID.name()))
         .as("Merged file should not have _row_id column when no lineage provided")
         .isFalse();
@@ -343,17 +332,16 @@ public class TestParquetFileMerger {
         .isFalse();
 
     // Verify data is still correct
-    List<Record> records = readData(Files.localInput(mergedFile), SCHEMA);
+    List<Record> records = readData(Files.localInput(mergedFile));
     assertThat(records).hasSize(3);
     assertThat(records.get(0).getField("id")).isEqualTo(1);
     assertThat(records.get(1).getField("id")).isEqualTo(2);
     assertThat(records.get(2).getField("id")).isEqualTo(3);
   }
 
+  /** Test that files already having physical row lineage columns are preserved via binary copy */
   @Test
   public void testMergeFilesWithPhysicalRowLineageColumns() throws IOException {
-    // Test that files already having physical row lineage columns are preserved via binary copy
-
     // Create schema with row lineage columns
     Schema schemaWithLineage =
         new Schema(
@@ -381,22 +369,17 @@ public class TestParquetFileMerger {
     createParquetFileWithData(
         Files.localOutput(file2),
         schemaWithLineage,
-        Arrays.asList(createRecordWithLineage(schemaWithLineage, 3, "c", 102L, 5L)));
+        Collections.singletonList(createRecordWithLineage(schemaWithLineage, 3, "c", 102L, 6L)));
 
     // Merge with firstRowIds/dataSequenceNumbers (should use binary copy path)
     List<DataFile> dataFiles =
         Arrays.asList(
             createDataFile(file1.getAbsolutePath(), 100L, 5L),
-            createDataFile(file2.getAbsolutePath(), 102L, 5L));
+            createDataFile(file2.getAbsolutePath(), 102L, 6L));
 
     File mergedFile = createTempFile(temp);
 
-    mergeFilesHelper(
-        dataFiles,
-        Files.localOutput(mergedFile),
-        DEFAULT_ROW_GROUP_SIZE,
-        PartitionSpec.unpartitioned(),
-        null);
+    mergeFilesHelper(dataFiles, Files.localOutput(mergedFile), PartitionSpec.unpartitioned(), null);
 
     // Verify physical columns are preserved
     List<RowLineageRecord> records = readRowLineageData(Files.localInput(mergedFile));
@@ -408,12 +391,12 @@ public class TestParquetFileMerger {
     assertThat(records.get(1).rowId).isEqualTo(101L);
     assertThat(records.get(1).seqNum).isEqualTo(5L);
     assertThat(records.get(2).rowId).isEqualTo(102L);
-    assertThat(records.get(2).seqNum).isEqualTo(5L);
+    assertThat(records.get(2).seqNum).isEqualTo(6L);
   }
 
+  /** Test that validation catches files with null values in physical row lineage columns */
   @Test
   public void testCanMergeReturnsFalseForPhysicalRowLineageWithNulls() throws IOException {
-    // Test that validation catches files with null values in physical row lineage columns
     Schema schemaWithLineage =
         new Schema(
             Types.NestedField.required(1, "id", Types.IntegerType.get()),
@@ -437,7 +420,7 @@ public class TestParquetFileMerger {
             createRecordWithLineage(schemaWithLineage, 1, "a", null, 5L), // null _row_id
             createRecordWithLineage(schemaWithLineage, 2, "b", 101L, 5L)));
 
-    List<InputFile> inputFiles = Arrays.asList(Files.localInput(file1));
+    List<InputFile> inputFiles = Collections.singletonList(Files.localInput(file1));
 
     // canMergeAndGetSchema should return null due to null values
     MessageType result = ParquetFileMerger.canMergeAndGetSchema(inputFiles);
@@ -446,10 +429,9 @@ public class TestParquetFileMerger {
         .isNull();
   }
 
+  /** Test that verifies exact row ID and sequence number values in merged output */
   @Test
   public void testMergeFilesVerifiesExactRowIdValues() throws IOException {
-    // Test that verifies exact row ID and sequence number values in merged output
-
     // Create file 1 with 3 records, firstRowId=100, dataSequenceNumber=5
     File file1 = createTempFile(temp);
     writeRecordsToFile(
@@ -478,12 +460,7 @@ public class TestParquetFileMerger {
     // Merge files with row lineage preservation
     File outputFile = createTempFile(temp);
 
-    mergeFilesHelper(
-        dataFiles,
-        Files.localOutput(outputFile),
-        DEFAULT_ROW_GROUP_SIZE,
-        PartitionSpec.unpartitioned(),
-        null);
+    mergeFilesHelper(dataFiles, Files.localOutput(outputFile), PartitionSpec.unpartitioned(), null);
 
     // Read back the merged data and verify exact row ID values
     List<RowLineageRecord> records = readRowLineageData(Files.localInput(outputFile));
@@ -516,10 +493,9 @@ public class TestParquetFileMerger {
     assertThat(records.get(8).seqNum).isEqualTo(10L);
   }
 
+  /** Test schema validation edge case: same field name but different types */
   @Test
   public void testCanMergeReturnsFalseForSameFieldNameDifferentType() throws IOException {
-    // Test schema validation edge case: same field name but different types
-
     // Create first file with 'data' as StringType
     Schema schema1 =
         new Schema(
@@ -547,17 +523,18 @@ public class TestParquetFileMerger {
         .isNull();
   }
 
+  /**
+   * Test that files with different compression codecs can still be merged (compression is at the
+   * row group level, not schema level)
+   */
   @Test
   public void testCanMergeReturnsTrueForDifferentCompressionCodecs() throws IOException {
-    // Test that files with different compression codecs can still be merged
-    // (compression is at the row group level, not schema level)
-
     // Create file 1 with SNAPPY compression
     File file1 = createTempFile(temp);
     createParquetFileWithData(
         Files.localOutput(file1),
         SCHEMA,
-        Arrays.asList(createRecord(1, "a")),
+        Collections.singletonList(createRecord(1, "a")),
         TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES_DEFAULT,
         "snappy");
 
@@ -566,7 +543,7 @@ public class TestParquetFileMerger {
     createParquetFileWithData(
         Files.localOutput(file2),
         SCHEMA,
-        Arrays.asList(createRecord(2, "b")),
+        Collections.singletonList(createRecord(2, "b")),
         TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES_DEFAULT,
         "gzip");
 
@@ -579,12 +556,14 @@ public class TestParquetFileMerger {
         .isNotNull();
   }
 
+  /**
+   * Test row lineage synthesis works correctly with partitioned tables
+   *
+   * <p>Note: In Iceberg partitioned tables, partition columns are NOT stored in Parquet files, they
+   * are encoded in the file path and DataFile metadata
+   */
   @Test
   public void testMergeFilesWithPartitionedTable() throws IOException {
-    // Test row lineage synthesis works correctly with partitioned tables
-    // Note: In Iceberg partitioned tables, partition columns are NOT stored in Parquet files,
-    // they are encoded in the file path and DataFile metadata
-
     // Create schema with partition column
     Schema fullSchema =
         new Schema(
@@ -604,7 +583,7 @@ public class TestParquetFileMerger {
     writeRecordsToFile(file1, Arrays.asList(createRecord(1, "row1"), createRecord(2, "row2")));
 
     File file2 = createTempFile(temp);
-    writeRecordsToFile(file2, Arrays.asList(createRecord(3, "row3")));
+    writeRecordsToFile(file2, Collections.singletonList(createRecord(3, "row3")));
 
     // Merge with row lineage
     List<DataFile> dataFiles =
@@ -614,8 +593,7 @@ public class TestParquetFileMerger {
 
     File mergedFile = createTempFile(temp);
 
-    mergeFilesHelper(
-        dataFiles, Files.localOutput(mergedFile), DEFAULT_ROW_GROUP_SIZE, spec, partitionA);
+    mergeFilesHelper(dataFiles, Files.localOutput(mergedFile), spec, partitionA);
 
     // Verify row lineage is correctly synthesized
     List<RowLineageRecord> records = readRowLineageData(Files.localInput(mergedFile));
@@ -639,15 +617,12 @@ public class TestParquetFileMerger {
 
   @Test
   public void testCanMergeReturnsFalseForCorruptedParquetFile() throws IOException {
-    // Test error handling for corrupted Parquet files
-
     // Create a valid Parquet file
     File validFile = createTempFile(temp);
-    writeRecordsToFile(validFile, Arrays.asList(createRecord(1, "a")));
+    writeRecordsToFile(validFile, Collections.singletonList(createRecord(1, "a")));
 
     // Create a corrupted file by writing partial/invalid Parquet data
     File corruptedFile = createTempFile(temp);
-    corruptedFile.getParentFile().mkdirs();
     java.nio.file.Files.write(
         corruptedFile.toPath(), "PAR1InvalidData".getBytes()); // Invalid Parquet content
 
@@ -661,11 +636,9 @@ public class TestParquetFileMerger {
 
   @Test
   public void testCanMergeReturnsFalseForNonExistentFile() throws IOException {
-    // Test error handling for non-existent file paths
-
     // Create a valid file
     File validFile = createTempFile(temp);
-    writeRecordsToFile(validFile, Arrays.asList(createRecord(1, "a")));
+    writeRecordsToFile(validFile, Collections.singletonList(createRecord(1, "a")));
 
     // Reference a non-existent file
     File nonExistentFile = new File(temp.toFile(), "non_existent_file.parquet");
@@ -757,7 +730,7 @@ public class TestParquetFileMerger {
       long rowGroupSize,
       String compression)
       throws IOException {
-    var writerBuilder =
+    Parquet.DataWriteBuilder writerBuilder =
         writeData(outputFile)
             .schema(schema)
             .withSpec(PartitionSpec.unpartitioned())
@@ -768,23 +741,20 @@ public class TestParquetFileMerger {
       writerBuilder.set(TableProperties.PARQUET_COMPRESSION, compression);
     }
 
-    var writer = writerBuilder.overwrite().build();
-    try {
+    try (DataWriter<Record> writer = writerBuilder.overwrite().build()) {
       for (Record record : records) {
         writer.write(record);
       }
-    } finally {
-      writer.close();
     }
   }
 
   /** Helper to read data from Parquet file */
-  private List<Record> readData(InputFile inputFile, Schema schema) throws IOException {
+  private List<Record> readData(InputFile inputFile) throws IOException {
     List<Record> records = Lists.newArrayList();
     try (CloseableIterable<Record> reader =
         Parquet.read(inputFile)
-            .project(schema)
-            .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(schema, fileSchema))
+            .project(SCHEMA)
+            .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(SCHEMA, fileSchema))
             .build()) {
       for (Record record : reader) {
         records.add(record);
@@ -908,12 +878,8 @@ public class TestParquetFileMerger {
    * Helper method to call mergeFiles with schema validation. This gets the schema first using
    * canMergeAndGetSchema to avoid redundant file reads.
    */
-  private DataFile mergeFilesHelper(
-      List<DataFile> dataFiles,
-      OutputFile outputFile,
-      long rowGroupSize,
-      PartitionSpec spec,
-      StructLike partition)
+  private void mergeFilesHelper(
+      List<DataFile> dataFiles, OutputFile outputFile, PartitionSpec spec, StructLike partition)
       throws IOException {
     // Get schema using canMergeAndGetSchema
     MessageType schema =
@@ -925,7 +891,7 @@ public class TestParquetFileMerger {
     }
 
     // Call mergeFiles with the schema
-    return ParquetFileMerger.mergeFiles(
-        dataFiles, fileIO, outputFile, schema, rowGroupSize, spec, partition);
+    ParquetFileMerger.mergeFiles(
+        dataFiles, fileIO, outputFile, schema, DEFAULT_ROW_GROUP_SIZE, spec, partition);
   }
 }
