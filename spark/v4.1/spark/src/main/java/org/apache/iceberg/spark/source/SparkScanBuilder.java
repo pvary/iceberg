@@ -20,11 +20,13 @@ package org.apache.iceberg.spark.source;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Set;
 import org.apache.iceberg.BaseTable;
 import org.apache.iceberg.BatchScan;
 import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.IncrementalAppendScan;
 import org.apache.iceberg.IncrementalChangelogScan;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.MetricsConfig;
 import org.apache.iceberg.MetricsModes;
 import org.apache.iceberg.Schema;
@@ -36,15 +38,18 @@ import org.apache.iceberg.expressions.AggregateEvaluator;
 import org.apache.iceberg.expressions.Binder;
 import org.apache.iceberg.expressions.BoundAggregate;
 import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.spark.Spark3Util;
 import org.apache.iceberg.spark.SparkAggregates;
 import org.apache.iceberg.spark.SparkReadConf;
 import org.apache.iceberg.spark.SparkReadOptions;
 import org.apache.iceberg.spark.SparkSchemaUtil;
 import org.apache.iceberg.types.Type;
+import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.SnapshotUtil;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.InternalRow;
@@ -539,6 +544,101 @@ public class SparkScanBuilder extends BaseSparkScanBuilder
         projection,
         filters(),
         metricsReporter()::scanReport);
+  }
+
+  public Scan buildColumnUpdateScan() {
+    Preconditions.checkArgument(
+        filter() == Expressions.alwaysTrue(), "Filtering is not allowed with column update");
+
+    Snapshot snapshot = SnapshotUtil.latestSnapshot(table(), readConf().branch());
+    Preconditions.checkState(snapshot != null, "Can't do column update on empty table");
+
+    Schema expectedSchema = projectionWithMetadataColumns();
+
+    // TODO gaborkaszab: If I projects the schema fields here to a subset of the table schema
+    // then later on I get an exception from Spark planning where the missing columns are seem to be
+    // referenced but not found in the schema.
+
+    /* Set<String> updatedColumns = updatedColumns();
+    if (!updatedColumns.isEmpty()) {
+      expectedSchema = filterSchemaForColumnUpdate(expectedSchema, updatedColumns);
+    }*/
+
+    BatchScan scan =
+        newBatchScan()
+            .useSnapshot(snapshot.snapshotId())
+            .ignoreResiduals()
+            .caseSensitive(caseSensitive())
+            .filter(filter())
+            .project(expectedSchema)
+            .metricsReporter(metricsReporter());
+
+    scan = configureSplitPlanning(scan);
+
+    return new SparkCopyOnWriteScan(
+        spark(),
+        table(),
+        scan,
+        snapshot,
+        readConf(),
+        expectedSchema,
+        filters(),
+        metricsReporter()::scanReport);
+  }
+
+  // TODO gaborkaszab: obviously I have no idea how to pass the information about updated columns to
+  // the Writer :D
+  // This is an AI-generated hack to add this info into thread-local during plan, and read it here.
+  // It could break in million ways.
+
+  private Set<String> updatedColumns() {
+    try {
+      Class<?> contextClass =
+          Class.forName("org.apache.spark.sql.catalyst.analysis.ColumnUpdateContext$");
+      Object contextModule = contextClass.getField("MODULE$").get(null);
+      java.lang.reflect.Method getMethod = contextClass.getMethod("getUpdatedColumns");
+      @SuppressWarnings("unchecked")
+      scala.collection.immutable.Set<String> scalaSet =
+          (scala.collection.immutable.Set<String>) getMethod.invoke(contextModule);
+
+      Set<String> updatedColumns = Sets.newHashSet();
+      scala.collection.Iterator<String> iter = scalaSet.iterator();
+      while (iter.hasNext()) {
+        updatedColumns.add(iter.next());
+      }
+
+      return updatedColumns;
+    } catch (Exception e) {
+      return Set.of();
+    }
+  }
+
+  // TODO gaborkaszab: filter the metadata cols too. What we need is the cols being updated and
+  // FILE_PATH.
+  private Schema filterSchemaForColumnUpdate(Schema inputSchema, Set<String> updatedColumns) {
+    // First try to get updated columns from thread-local context
+
+    List<Types.NestedField> filteredFields = new java.util.ArrayList<>();
+    for (Types.NestedField field : inputSchema.asStruct().fields()) {
+      String fieldName = field.name();
+      // Always keep metadata columns
+      if (MetadataColumns.isMetadataColumn(fieldName)) {
+        filteredFields.add(field);
+      } else if (updatedColumns.contains(fieldName)) {
+        // If we know the updated columns, keep them
+        filteredFields.add(field);
+      }
+    }
+
+    // If we ended up with only metadata columns and no data columns,
+    // this means no updated columns were found - fall back to original schema
+    boolean hasDataColumns =
+        filteredFields.stream().anyMatch(f -> !MetadataColumns.isMetadataColumn(f.name()));
+    if (!hasDataColumns) {
+      return inputSchema;
+    }
+
+    return new Schema(filteredFields);
   }
 
   private BatchScan newBatchScan() {

@@ -39,7 +39,8 @@ import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
  */
 public enum RowLevelOperationMode {
   COPY_ON_WRITE("copy-on-write"),
-  MERGE_ON_READ("merge-on-read");
+  MERGE_ON_READ("merge-on-read"),
+  COLUMN_UPDATE("column-update");
 
   private final String modeName;
 
@@ -53,6 +54,8 @@ public enum RowLevelOperationMode {
       return COPY_ON_WRITE;
     } else if (MERGE_ON_READ.modeName().equalsIgnoreCase(modeName)) {
       return MERGE_ON_READ;
+    } else if (COLUMN_UPDATE.modeName().equalsIgnoreCase(modeName)) {
+      return COLUMN_UPDATE;
     } else {
       throw new IllegalArgumentException("Unknown row-level operation mode: " + modeName);
     }

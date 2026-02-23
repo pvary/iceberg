@@ -85,6 +85,10 @@ class SparkCopyOnWriteScan extends SparkPartitioningAwareScan<FileScanTask>
     return snapshot != null ? snapshot.snapshotId() : null;
   }
 
+  Set<String> filteredLocations() {
+    return filteredLocations;
+  }
+
   @Override
   protected Class<FileScanTask> taskJavaClass() {
     return FileScanTask.class;
