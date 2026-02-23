@@ -95,6 +95,7 @@ class RowDataReader extends BaseRowReader<FileScanTask> implements PartitionRead
     return deleteFilter.filter(open(task, requiredSchema, idToConstant)).iterator();
   }
 
+  // TODO gaborkaszab: this is the last time we have a FileScanTask. Create a stitching reader
   protected CloseableIterable<InternalRow> open(
       FileScanTask task, Schema readSchema, Map<Integer, ?> idToConstant) {
     if (task.isDataTask()) {

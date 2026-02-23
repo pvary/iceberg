@@ -51,6 +51,11 @@ import org.apache.iceberg.AppendFiles;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DistributionMode;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.ManifestContent;
+import org.apache.iceberg.ManifestFile;
+import org.apache.iceberg.ManifestFiles;
+import org.apache.iceberg.ManifestReader;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.RowLevelOperationMode;
 import org.apache.iceberg.Snapshot;
@@ -60,6 +65,8 @@ import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.deletes.DeleteGranularity;
 import org.apache.iceberg.exceptions.ValidationException;
+import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableSet;
@@ -324,6 +331,282 @@ public abstract class TestUpdate extends SparkRowLevelOperationsTestBase {
         "Should have expected rows",
         ImmutableList.of(row(1, "invalid")),
         sql("SELECT * FROM %s", selectTarget()));
+  }
+
+  // Test with different row group sizes: 1KB, 10KB, 100KB, 1MB
+  private static final long[] ROW_GROUP_SIZES = {1024L, 1024L * 10, 1024L * 100, 1024L * 1024};
+
+  @TestTemplate
+  public void splitReadingWithColumnUpdates() throws Exception {
+    assumeThat(fileFormat).isEqualTo(org.apache.iceberg.FileFormat.PARQUET);
+    assumeThat(vectorized).isFalse();
+
+    for (long rowGroupSizeBytes : ROW_GROUP_SIZES) {
+      splitReadingWithColumnUpdatesForRowGroupSize(rowGroupSizeBytes);
+    }
+  }
+
+  private void splitReadingWithColumnUpdatesForRowGroupSize(long rowGroupSizeBytes)
+      throws Exception {
+    this.formatVersion = 4;
+
+    createAndInitTable(
+        "id INT, dep STRING, col1 STRING, col2 STRING, col3 STRING, col4 STRING, col5 STRING, col6 STRING, col7 STRING, col8 STRING, col9 STRING, col10 STRING");
+    sql(
+        "ALTER TABLE %s SET TBLPROPERTIES('write.update.mode'='column-update', 'write.parquet.row-group-size-bytes'=%d)",
+        tableName, rowGroupSizeBytes);
+
+    int numRowsToAdd = 1000;
+    StringBuilder inputData = new StringBuilder();
+    for (int i = 1; i <= numRowsToAdd; i++) {
+      inputData.append(
+          String.format(
+              "{ \"id\": %d, \"dep\": \"str%d\", \"col1\": \"column1_value_str_%d\", \"col2\": \"column2_value_str_%d\", \"col3\": \"column3_value_str_%d\", \"col4\": \"column4_value_str_%d\", \"col5\": \"column5_value_str_%d\", \"col6\": \"column6_value_str_%d\", \"col7\": \"column7_value_str_%d\", \"col8\": \"column8_value_str_%d\", \"col9\": \"column9_value_str_%d\", \"col10\": \"column10_value_str_%d\" }",
+              i, i, i, i, i, i, i, i, i, i, i, i));
+      if (i < numRowsToAdd) {
+        inputData.append("\n");
+      }
+    }
+
+    append(tableName, inputData.toString());
+    createBranchIfNeeded();
+
+    Table table = validationCatalog.loadTable(tableIdent);
+    assertThat(table.snapshots()).hasSize(1);
+    assertThat(table.currentSnapshot().addedDataFiles(table.io())).hasSize(1);
+    assertThat(table.currentSnapshot().addedRows()).isEqualTo(numRowsToAdd);
+
+    String valueToUpdateTo = "some_updated_value";
+    sql("UPDATE %s AS t SET t.dep = concat('%s_', t.id)", commitTarget(), valueToUpdateTo);
+
+    table.refresh();
+    assertThat(table.snapshots()).as("Should have 2 snapshots").hasSize(2);
+
+    List<ManifestFile> manifests = table.currentSnapshot().allManifests(table.io());
+    assertThat(manifests).hasSize(1);
+
+    ManifestFile manifest = manifests.get(0);
+
+    try (ManifestReader<DataFile> reader = ManifestFiles.read(manifest, table.io())) {
+      DataFile dataFile = Iterables.getOnlyElement(reader);
+
+      assertThat(dataFile.columnUpdateDetails()).isNotNull().isNotEmpty().hasSize(1);
+      assertThat(dataFile.columnUpdateDetails().get(0).fieldIds()).containsExactly(2);
+      assertThat(dataFile.splitOffsets()).isNotNull().isNotEmpty();
+    }
+
+    List<Object[]> expectedData = Lists.newArrayList();
+    for (int i = 1; i <= numRowsToAdd; i++) {
+      expectedData.add(
+          row(
+              i,
+              valueToUpdateTo + "_" + i,
+              "column1_value_str_" + i,
+              "column2_value_str_" + i,
+              "column3_value_str_" + i,
+              "column4_value_str_" + i,
+              "column5_value_str_" + i,
+              "column6_value_str_" + i,
+              "column7_value_str_" + i,
+              "column8_value_str_" + i,
+              "column9_value_str_" + i,
+              "column10_value_str_" + i));
+    }
+
+    assertEquals(
+        "Should have expected rows with updated dep column",
+        expectedData,
+        sql("SELECT * FROM %s ORDER BY id", selectTarget()));
+
+    sql("DROP TABLE IF EXISTS %s", tableName);
+  }
+
+  @TestTemplate
+  public void testColumnUpdateOnMultipleFiles() throws Exception {
+    assumeThat(fileFormat).isEqualTo(org.apache.iceberg.FileFormat.PARQUET);
+    assumeThat(vectorized).isFalse();
+
+    this.formatVersion = 4;
+
+    createAndInitTable("id INT, dep STRING");
+    sql("ALTER TABLE %s SET TBLPROPERTIES('write.update.mode'='column-update')", tableName);
+
+    append(tableName, "{ \"id\": 1, \"dep\": \"str1\" }\n" + "{ \"id\": 2, \"dep\": \"str2\" }");
+    append(tableName, "{ \"id\": 3, \"dep\": \"str3\" }\n" + "{ \"id\": 4, \"dep\": \"str4\" }");
+    createBranchIfNeeded();
+
+    Table table = validationCatalog.loadTable(tableIdent);
+    assertThat(table.snapshots()).hasSize(2);
+
+    String valueToUpdateTo = "_updated";
+    sql(
+        "UPDATE %s AS t SET t.dep = concat(concat(t.dep, '%s'), t.id)",
+        commitTarget(), valueToUpdateTo);
+
+    table.refresh();
+    assertThat(table.snapshots()).as("Should have 3 snapshots").hasSize(3);
+
+    List<ManifestFile> manifests = table.currentSnapshot().allManifests(table.io());
+    assertThat(manifests).hasSize(2);
+
+    for (ManifestFile manifest : manifests) {
+      try (ManifestReader<DataFile> reader = ManifestFiles.read(manifest, table.io())) {
+        for (DataFile dataFile : reader) {
+          assertThat(dataFile.columnUpdateDetails()).isNotNull().isNotEmpty();
+          assertThat(dataFile.columnUpdateDetails().get(0).fieldIds()).containsExactly(2);
+        }
+      }
+    }
+
+    assertEquals(
+        "Should have expected rows with updated name column",
+        ImmutableList.of(
+            row(1, "str1_updated1"),
+            row(2, "str2_updated2"),
+            row(3, "str3_updated3"),
+            row(4, "str4_updated4")),
+        sql("SELECT * FROM %s ORDER BY id", selectTarget()));
+  }
+
+  @TestTemplate
+  public void testColumnUpdateOnMultipleFilesAcrossPartitions() throws Exception {
+    assumeThat(fileFormat).isEqualTo(org.apache.iceberg.FileFormat.PARQUET);
+    assumeThat(vectorized).isFalse();
+
+    this.formatVersion = 4;
+
+    createAndInitTable("id INT, dep STRING, category STRING, event_date DATE");
+    sql("ALTER TABLE %s SET TBLPROPERTIES('write.update.mode'='column-update')", tableName);
+    sql("ALTER TABLE %s ADD PARTITION FIELD category", tableName);
+    sql("ALTER TABLE %s ADD PARTITION FIELD day(event_date)", tableName);
+
+    sql(
+        "INSERT INTO TABLE %s VALUES (1, 'str1', 'a', DATE '2024-01-15'), (2, 'str2', 'a', DATE '2024-01-15')",
+        tableName);
+    sql(
+        "INSERT INTO TABLE %s VALUES (3, 'str3', 'b', DATE '2024-02-20'), (4, 'str4', 'b', DATE '2024-02-20')",
+        tableName);
+    createBranchIfNeeded();
+
+    Table table = validationCatalog.loadTable(tableIdent);
+    assertThat(table.snapshots()).hasSize(2);
+
+    String valueToUpdateTo = "_updated";
+    sql(
+        "UPDATE %s AS t SET t.dep = concat(concat(t.dep, '%s'), t.id)",
+        commitTarget(), valueToUpdateTo);
+
+    table.refresh();
+    assertThat(table.snapshots()).as("Should have 3 snapshots").hasSize(3);
+
+    List<ManifestFile> manifests = table.currentSnapshot().allManifests(table.io());
+    assertThat(manifests).hasSize(2);
+
+    for (ManifestFile manifest : manifests) {
+      try (ManifestReader<DataFile> reader = ManifestFiles.read(manifest, table.io())) {
+        for (DataFile dataFile : reader) {
+          assertThat(dataFile.columnUpdateDetails()).isNotNull().isNotEmpty();
+          assertThat(dataFile.columnUpdateDetails().get(0).fieldIds()).containsExactly(2);
+        }
+      }
+    }
+
+    assertEquals(
+        "Should have expected rows with updated dep column",
+        ImmutableList.of(
+            row(1, "str1_updated1", "a", java.sql.Date.valueOf("2024-01-15")),
+            row(2, "str2_updated2", "a", java.sql.Date.valueOf("2024-01-15")),
+            row(3, "str3_updated3", "b", java.sql.Date.valueOf("2024-02-20")),
+            row(4, "str4_updated4", "b", java.sql.Date.valueOf("2024-02-20"))),
+        sql("SELECT * FROM %s ORDER BY id", selectTarget()));
+  }
+
+  @TestTemplate
+  public void filePruneByColumnUpdate() throws Exception {
+    assumeThat(fileFormat).isEqualTo(org.apache.iceberg.FileFormat.PARQUET);
+    assumeThat(vectorized).isFalse();
+
+    this.formatVersion = 4;
+    createAndInitTable("id INT, dep STRING");
+    sql("ALTER TABLE %s SET TBLPROPERTIES('write.update.mode'='column-update')", tableName);
+
+    append(tableName, "{ \"id\": 1, \"dep\": \"str1\" }\n" + "{ \"id\": 2, \"dep\": \"str2\" }");
+    createBranchIfNeeded();
+
+    Table table = validationCatalog.loadTable(tableIdent);
+    assertThat(table.snapshots()).hasSize(1);
+
+    sql("UPDATE %s AS t SET t.dep = 'some_updated_value'", commitTarget());
+
+    table.refresh();
+    CloseableIterable<FileScanTask> files =
+        table.newScan().filter(Expressions.equal("dep", "str1")).planFiles();
+
+    assertThat(files.iterator().hasNext()).isFalse();
+
+    assertEquals(
+        "Rows should be filtered by column update stats",
+        ImmutableList.of(),
+        sql("SELECT * FROM %s WHERE dep='str1'", selectTarget()));
+  }
+
+  @TestTemplate
+  public void testColumnUpdateAfterMergeOnReadDelete() throws Exception {
+    assumeThat(fileFormat).isEqualTo(org.apache.iceberg.FileFormat.PARQUET);
+    assumeThat(vectorized).isFalse();
+
+    this.formatVersion = 4;
+
+    createAndInitTable("id INT, dep STRING");
+    sql(
+        "ALTER TABLE %s SET TBLPROPERTIES('write.delete.mode'='merge-on-read', 'write.update.mode'='column-update')",
+        tableName);
+
+    append(tableName, "{ \"id\": 1, \"dep\": \"str1\" }\n" + "{ \"id\": 2, \"dep\": \"str2\" }");
+    append(
+        tableName,
+        "{ \"id\": 3, \"dep\": \"str3\" }\n"
+            + "{ \"id\": 4, \"dep\": \"str4\" }\n"
+            + "{ \"id\": 5, \"dep\": \"str5\" }");
+    append(tableName, "{ \"id\": 6, \"dep\": \"str6\" }\n" + "{ \"id\": 7, \"dep\": \"str7\" }");
+    createBranchIfNeeded();
+
+    Table table = validationCatalog.loadTable(tableIdent);
+    assertThat(table.snapshots()).hasSize(3);
+
+    // Delete rows from beginning, middle and end of files
+    sql("DELETE FROM %s WHERE id = 1 OR id = 4 OR id = 7", commitTarget());
+
+    String valueToUpdateTo = "_updated";
+    sql(
+        "UPDATE %s AS t SET t.dep = concat(concat(t.dep, '%s'), t.id)",
+        commitTarget(), valueToUpdateTo);
+
+    table.refresh();
+    List<ManifestFile> manifests = table.currentSnapshot().allManifests(table.io());
+    assertThat(manifests).hasSize(4);
+
+    for (ManifestFile manifest : manifests) {
+      if (manifest.content() == ManifestContent.DELETES) {
+        continue;
+      }
+
+      try (ManifestReader<DataFile> reader = ManifestFiles.read(manifest, table.io())) {
+        for (DataFile dataFile : reader) {
+          assertThat(dataFile.columnUpdateDetails()).isNotNull().isNotEmpty();
+          assertThat(dataFile.columnUpdateDetails().get(0).fieldIds()).containsExactly(2);
+        }
+      }
+    }
+
+    assertEquals(
+        "Should have expected rows with updated dep column (deleted rows should not appear)",
+        ImmutableList.of(
+            row(2, "str2_updated2"),
+            row(3, "str3_updated3"),
+            row(5, "str5_updated5"),
+            row(6, "str6_updated6")),
+        sql("SELECT * FROM %s ORDER BY id", selectTarget()));
   }
 
   @TestTemplate
