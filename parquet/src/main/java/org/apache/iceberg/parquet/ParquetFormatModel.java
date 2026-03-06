@@ -21,6 +21,7 @@ package org.apache.iceberg.parquet;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Map;
+import java.util.function.BiFunction;
 import java.util.function.Function;
 import org.apache.iceberg.FileContent;
 import org.apache.iceberg.FileFormat;
@@ -48,23 +49,29 @@ public class ParquetFormatModel<D, S, R>
   public static final String WRITER_VERSION_KEY = "parquet.writer.version";
   private final boolean isBatchReader;
 
+  // TODO gaborkaszab: move to base if all the children implements this?
+  private final BiFunction<Schema, Integer[][], Combiner<D>> combinerFunction;
+
   public static <D> ParquetFormatModel<PositionDelete<D>, Void, Object> forPositionDeletes() {
-    return new ParquetFormatModel<>(PositionDelete.deleteClass(), Void.class, null, null, false);
+    return new ParquetFormatModel<>(
+        PositionDelete.deleteClass(), Void.class, null, null, null, false);
   }
 
   public static <D, S> ParquetFormatModel<D, S, ParquetValueReader<?>> create(
       Class<D> type,
       Class<S> schemaType,
       WriterFunction<ParquetValueWriter<?>, S, MessageType> writerFunction,
-      ReaderFunction<ParquetValueReader<?>, S, MessageType> readerFunction) {
-    return new ParquetFormatModel<>(type, schemaType, writerFunction, readerFunction, false);
+      ReaderFunction<ParquetValueReader<?>, S, MessageType> readerFunction,
+      BiFunction<Schema, Integer[][], Combiner<D>> combinerFunction) {
+    return new ParquetFormatModel<>(
+        type, schemaType, writerFunction, readerFunction, combinerFunction, false);
   }
 
   public static <D, S> ParquetFormatModel<D, S, VectorizedReader<?>> create(
       Class<? extends D> type,
       Class<S> schemaType,
       ReaderFunction<VectorizedReader<?>, S, MessageType> batchReaderFunction) {
-    return new ParquetFormatModel<>(type, schemaType, null, batchReaderFunction, true);
+    return new ParquetFormatModel<>(type, schemaType, null, batchReaderFunction, null, true);
   }
 
   private ParquetFormatModel(
@@ -72,8 +79,10 @@ public class ParquetFormatModel<D, S, R>
       Class<S> schemaType,
       WriterFunction<ParquetValueWriter<?>, S, MessageType> writerFunction,
       ReaderFunction<R, S, MessageType> readerFunction,
+      BiFunction<Schema, Integer[][], Combiner<D>> combinerFunction,
       boolean isBatchReader) {
     super(type, schemaType, writerFunction, readerFunction);
+    this.combinerFunction = combinerFunction;
     this.isBatchReader = isBatchReader;
   }
 
@@ -90,6 +99,11 @@ public class ParquetFormatModel<D, S, R>
   @Override
   public ReadBuilder<D, S> readBuilder(InputFile inputFile) {
     return new ReadBuilderWrapper<>(inputFile, readerFunction(), isBatchReader);
+  }
+
+  @Override
+  public BiFunction<Schema, Integer[][], Combiner<D>> combiner() {
+    return combinerFunction;
   }
 
   private static class WriteBuilderWrapper<D, S> implements ModelWriteBuilder<D, S> {

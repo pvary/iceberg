@@ -18,11 +18,18 @@
  */
 package org.apache.iceberg.spark.source;
 
+import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.iceberg.ContentFile;
+import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.DataTask;
 import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.MetadataColumns;
+import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.ScanTaskGroup;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
@@ -32,6 +39,8 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.spark.source.metrics.TaskNumDeletes;
 import org.apache.iceberg.spark.source.metrics.TaskNumSplits;
+import org.apache.iceberg.types.TypeUtil;
+import org.apache.iceberg.types.Types;
 import org.apache.spark.rdd.InputFileBlockHolder;
 import org.apache.spark.sql.catalyst.InternalRow;
 import org.apache.spark.sql.connector.metric.CustomTaskMetric;
@@ -75,7 +84,27 @@ class RowDataReader extends BaseRowReader<FileScanTask> implements PartitionRead
 
   @Override
   protected Stream<ContentFile<?>> referencedFiles(FileScanTask task) {
-    return Stream.concat(Stream.of(task.file()), task.deletes().stream());
+    Stream<ContentFile<?>> dataAndDeleteFiles =
+        Stream.concat(Stream.of(task.file()), task.deletes().stream());
+
+    ContentFile<?> baseFile = task.file();
+    if (baseFile.columnUpdateDetails() == null || baseFile.columnUpdateDetails().isEmpty()) {
+      return dataAndDeleteFiles;
+    }
+
+    // TODO gaborkaszab: recordCount? fileSizeInBytes?
+    Stream<ContentFile<?>> columnUpdateFiles =
+        baseFile.columnUpdateDetails().stream()
+            .map(
+                updateDetails ->
+                    DataFiles.builder(PartitionSpec.unpartitioned())
+                        .withPath(updateDetails.filePath())
+                        .withFileSizeInBytes(0)
+                        .withRecordCount(0)
+                        .withEncryptionKeyMetadata(baseFile.keyMetadata())
+                        .build());
+
+    return Stream.concat(dataAndDeleteFiles, columnUpdateFiles);
   }
 
   @Override
@@ -104,14 +133,61 @@ class RowDataReader extends BaseRowReader<FileScanTask> implements PartitionRead
       InputFile inputFile = getInputFile(task.file().location());
       Preconditions.checkNotNull(
           inputFile, "Could not find InputFile associated with FileScanTask");
-      return newIterable(
-          inputFile,
-          task.file().format(),
-          task.start(),
-          task.length(),
-          task.residual(),
-          readSchema,
-          idToConstant);
+
+      if (task.file().columnUpdateDetails() != null
+          && !task.file().columnUpdateDetails().isEmpty()) {
+        Set<Integer> fieldIdsToAssign =
+            readSchema.columns().stream()
+                .map(Types.NestedField::fieldId)
+                .collect(Collectors.toSet());
+
+        Map<InputFile, List<Integer>> inputFileToFieldIds =
+            new LinkedHashMap<>(1 + task.file().columnUpdateDetails().size());
+        task.file()
+            .columnUpdateDetails()
+            .forEach(
+                updateDetails -> {
+                  // TODO gaborkaszab: Check that there is no overlap in updated fieldIds (corrupted
+                  // data).
+                  InputFile updateFile = getInputFile(updateDetails.filePath());
+                  Preconditions.checkNotNull(
+                      updateFile,
+                      "Could not find InputFile associated with FileScanTask: ",
+                      updateDetails.filePath());
+                  fieldIdsToAssign.removeAll(updateDetails.fieldIds());
+                  inputFileToFieldIds.put(updateFile, updateDetails.fieldIds());
+                });
+
+        // TODO gaborkaszab: is this needed?
+        Schema readSchemaWithRpwPosition = readSchema;
+        if (readSchema.findField(MetadataColumns.ROW_POSITION.fieldId()) == null) {
+          fieldIdsToAssign.add(MetadataColumns.ROW_POSITION.fieldId());
+          readSchemaWithRpwPosition =
+              TypeUtil.join(readSchema, new Schema(MetadataColumns.ROW_POSITION));
+        }
+
+        // TODO gaborkaszab: also test with metadata cols like ROW_ID
+        Preconditions.checkState(!fieldIdsToAssign.isEmpty());
+        inputFileToFieldIds.put(inputFile, fieldIdsToAssign.stream().toList());
+
+        return newIterable(
+            inputFileToFieldIds,
+            task.file().format(),
+            task.start(),
+            task.length(),
+            task.residual(),
+            readSchemaWithRpwPosition,
+            idToConstant);
+      } else {
+        return newIterable(
+            inputFile,
+            task.file().format(),
+            task.start(),
+            task.length(),
+            task.residual(),
+            readSchema,
+            idToConstant);
+      }
     }
   }
 

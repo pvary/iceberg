@@ -48,7 +48,8 @@ public class GenericFormatModels {
             (icebergSchema, fileSchema, engineSchema) ->
                 GenericParquetWriter.create(icebergSchema, fileSchema),
             (icebergSchema, fileSchema, engineSchema, idToConstant) ->
-                GenericParquetReaders.buildReader(icebergSchema, fileSchema, idToConstant)));
+                GenericParquetReaders.buildReader(icebergSchema, fileSchema, idToConstant),
+            null));
 
     FormatModelRegistry.register(ParquetFormatModel.forPositionDeletes());
 

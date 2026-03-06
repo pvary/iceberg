@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.spark.source;
 
+import java.util.List;
 import java.util.Map;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.ScanTask;
@@ -51,6 +52,27 @@ abstract class BaseRowReader<T extends ScanTask> extends BaseReader<InternalRow,
       Map<Integer, ?> idToConstant) {
     ReadBuilder<InternalRow, ?> reader =
         FormatModelRegistry.readBuilder(format, InternalRow.class, file);
+    return reader
+        .project(projection)
+        .idToConstant(idToConstant)
+        .reuseContainers()
+        .split(start, length)
+        .caseSensitive(caseSensitive())
+        .filter(residual)
+        .withNameMapping(nameMapping())
+        .build();
+  }
+
+  protected CloseableIterable<InternalRow> newIterable(
+      Map<InputFile, List<Integer>> columnSplits,
+      FileFormat format,
+      long start,
+      long length,
+      Expression residual,
+      Schema projection,
+      Map<Integer, ?> idToConstant) {
+    ReadBuilder<InternalRow, ?> reader =
+        FormatModelRegistry.readBuilder(format, InternalRow.class, columnSplits);
     return reader
         .project(projection)
         .idToConstant(idToConstant)

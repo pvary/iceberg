@@ -28,7 +28,9 @@ import org.apache.iceberg.io.CloseableGroup;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.SkippingCloseableIterator;
 import org.apache.iceberg.mapping.NameMapping;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.parquet.ParquetReadOptions;
 import org.apache.parquet.column.page.PageReadStore;
 import org.apache.parquet.hadoop.ParquetFileReader;
@@ -96,7 +98,7 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
     return iter;
   }
 
-  private static class FileIterator<T> implements CloseableIterator<T> {
+  private static class FileIterator<T> implements SkippingCloseableIterator<T> {
     private static final Logger LOG = LoggerFactory.getLogger(FileIterator.class);
 
     private final ParquetFileReader reader;
@@ -109,6 +111,7 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
     private long nextRowGroupStart = 0;
     private long valuesRead = 0;
     private T last = null;
+    private long firstPosition = -1;
 
     FileIterator(ReadConf<T> conf) {
       this.reader = conf.reader();
@@ -121,6 +124,40 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
     @Override
     public boolean hasNext() {
       return valuesRead < totalValues;
+    }
+
+    @Override
+    public long position() {
+      return firstPosition() + valuesRead;
+    }
+
+    private long firstPosition() {
+      if (firstPosition == -1) {
+        advance();
+      }
+
+      return firstPosition;
+    }
+
+    @Override
+    public void skipTo(long target) {
+      Preconditions.checkArgument(
+          target >= position(),
+          "Cannot skip backwards: current position %s, target position %s",
+          position(),
+          target);
+
+      // Skip entire row groups when possible
+      while (position() < target) {
+        while (firstPosition() + nextRowGroupStart <= target) {
+          valuesRead = nextRowGroupStart;
+          advance();
+        }
+
+        while (position() < target) {
+          next();
+        }
+      }
     }
 
     @Override
@@ -167,6 +204,15 @@ public class ParquetReader<T> extends CloseableGroup implements CloseableIterabl
       nextRowGroup += 1;
 
       model.setPageSource(pages);
+      if (firstPosition == -1) {
+        firstPosition =
+            pages
+                .getRowIndexOffset()
+                .orElseThrow(
+                    () ->
+                        new IllegalArgumentException(
+                            "PageReadStore does not contain row index offset"));
+      }
     }
 
     @Override

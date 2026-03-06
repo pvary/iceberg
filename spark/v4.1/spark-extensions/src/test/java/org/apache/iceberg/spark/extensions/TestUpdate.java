@@ -376,8 +376,8 @@ public abstract class TestUpdate extends SparkRowLevelOperationsTestBase {
     assertThat(table.currentSnapshot().addedDataFiles(table.io())).hasSize(1);
     assertThat(table.currentSnapshot().addedRows()).isEqualTo(numRowsToAdd);
 
-    String valueToUpdateTo = "some_updated_value";
-    sql("UPDATE %s AS t SET t.dep = concat('%s_', t.id)", commitTarget(), valueToUpdateTo);
+    String valuePrefix = "some_updated_value_";
+    sql("UPDATE %s AS t SET t.dep = concat('%s', t.id)", commitTarget(), valuePrefix);
 
     table.refresh();
     assertThat(table.snapshots()).as("Should have 2 snapshots").hasSize(2);
@@ -400,7 +400,7 @@ public abstract class TestUpdate extends SparkRowLevelOperationsTestBase {
       expectedData.add(
           row(
               i,
-              valueToUpdateTo + "_" + i,
+              valuePrefix + i,
               "column1_value_str_" + i,
               "column2_value_str_" + i,
               "column3_value_str_" + i,
@@ -606,6 +606,84 @@ public abstract class TestUpdate extends SparkRowLevelOperationsTestBase {
             row(3, "str3_updated3"),
             row(5, "str5_updated5"),
             row(6, "str6_updated6")),
+        sql("SELECT * FROM %s ORDER BY id", selectTarget()));
+  }
+
+  @TestTemplate
+  public void selectFieldNotInColumnUpdateFile() throws Exception {
+    assumeThat(fileFormat).isEqualTo(org.apache.iceberg.FileFormat.PARQUET);
+    assumeThat(vectorized).isFalse();
+
+    this.formatVersion = 4;
+
+    createAndInitTable("id INT, dep STRING");
+    sql("ALTER TABLE %s SET TBLPROPERTIES('write.update.mode'='column-update')", tableName);
+
+    append(tableName, "{ \"id\": 1, \"dep\": \"str1\" }\n" + "{ \"id\": 2, \"dep\": \"str2\" }");
+    append(tableName, "{ \"id\": 3, \"dep\": \"str3\" }\n" + "{ \"id\": 4, \"dep\": \"str4\" }");
+    createBranchIfNeeded();
+
+    String valueToUpdateTo = "_updated";
+    sql("UPDATE %s AS t SET t.dep = concat(t.dep, '%s')", commitTarget(), valueToUpdateTo);
+
+    assertEquals(
+        "Should have expected rows with id column",
+        ImmutableList.of(row(1), row(2), row(3), row(4)),
+        sql("SELECT id FROM %s ORDER BY id", selectTarget()));
+  }
+
+  @TestTemplate
+  public void updateDifferentFields() throws Exception {
+    assumeThat(fileFormat).isEqualTo(org.apache.iceberg.FileFormat.PARQUET);
+    assumeThat(vectorized).isFalse();
+
+    this.formatVersion = 4;
+
+    createAndInitTable("id INT, dep STRING");
+    sql("ALTER TABLE %s SET TBLPROPERTIES('write.update.mode'='column-update')", tableName);
+
+    append(tableName, "{ \"id\": 1, \"dep\": \"str1\" }\n" + "{ \"id\": 2, \"dep\": \"str2\" }");
+    append(tableName, "{ \"id\": 3, \"dep\": \"str3\" }\n" + "{ \"id\": 4, \"dep\": \"str4\" }");
+    createBranchIfNeeded();
+
+    String valueToUpdateTo = "_updated";
+    sql("UPDATE %s AS t SET t.dep = concat(t.dep, '%s')", commitTarget(), valueToUpdateTo);
+
+    // Second UPDATE: update only the 'id' column (which was NOT updated before)
+    sql("UPDATE %s AS t SET t.id = t.id + 10", commitTarget());
+
+    assertEquals(
+        "Should have expected rows with updated columns",
+        ImmutableList.of(
+            row(11, "str1_updated"),
+            row(12, "str2_updated"),
+            row(13, "str3_updated"),
+            row(14, "str4_updated")),
+        sql("SELECT * FROM %s ORDER BY id", selectTarget()));
+  }
+
+  @TestTemplate
+  public void sameUpdateTwice() throws Exception {
+    assumeThat(fileFormat).isEqualTo(org.apache.iceberg.FileFormat.PARQUET);
+    assumeThat(vectorized).isFalse();
+
+    this.formatVersion = 4;
+
+    createAndInitTable("id INT, col1 STRING, col2 STRING");
+    sql("ALTER TABLE %s SET TBLPROPERTIES('write.update.mode'='column-update')", tableName);
+
+    append(
+        tableName,
+        "{ \"id\": 1, \"col1\": \"a1\", \"col2\": \"b1\" }\n"
+            + "{ \"id\": 2, \"col1\": \"a2\", \"col2\": \"b2\" }");
+    createBranchIfNeeded();
+
+    sql("UPDATE %s AS t SET t.col1 = t.col2", commitTarget());
+    sql("UPDATE %s AS t SET t.col1 = t.col2", commitTarget());
+
+    assertEquals(
+        "Should have expected rows",
+        ImmutableList.of(row(1, "b1", "b1"), row(2, "b2", "b2")),
         sql("SELECT * FROM %s ORDER BY id", selectTarget()));
   }
 
