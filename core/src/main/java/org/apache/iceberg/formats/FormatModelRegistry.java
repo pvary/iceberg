@@ -20,6 +20,7 @@ package org.apache.iceberg.formats;
 
 import java.util.List;
 import java.util.Map;
+import java.util.stream.Collectors;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileFormat;
@@ -33,6 +34,7 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.Pair;
 import org.slf4j.Logger;
@@ -118,6 +120,23 @@ public final class FormatModelRegistry {
       FileFormat format, Class<? extends D> type, InputFile inputFile) {
     FormatModel<D, S> model = modelFor(format, type);
     return model.readBuilder(inputFile);
+  }
+
+  // TODO gaborkaszab: write comment
+  public static <D, S> ReadBuilder<D, S> readBuilder(
+      FileFormat format, Class<? extends D> type, Map<InputFile, List<Integer>> columnSplits) {
+    Preconditions.checkArgument(!columnSplits.isEmpty(), "Empty column splits");
+
+    if (columnSplits.size() == 1) {
+      return readBuilder(format, type, Iterables.getOnlyElement(columnSplits.keySet()));
+    }
+
+    FormatModel<D, S> model = modelFor(format, type);
+    Map<ReadBuilder<D, ?>, List<Integer>> readBuilderColumnSplits =
+        columnSplits.entrySet().stream()
+            .collect(
+                Collectors.toMap(entry -> model.readBuilder(entry.getKey()), Map.Entry::getValue));
+    return new ColumnSplitReadBuilder<>(readBuilderColumnSplits, model.combiner());
   }
 
   /**
