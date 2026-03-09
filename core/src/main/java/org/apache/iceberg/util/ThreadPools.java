@@ -160,16 +160,19 @@ public class ThreadPools {
   }
 
   /**
-   * Force manual shutdown of the thread pools created via the {@link #newExitingWorkerPool(String,
-   * int)}.
+   * Shuts down all thread pools registered via {@link #newExitingWorkerPool(String, int)} or {@link
+   * #newExitingScheduledPool(String, int, Duration)} and removes the JVM shutdown hook.
    *
-   * <p>This method allows: (1) to stop thread pools manually, to avoid leaks in hot-reload
-   * environments; (2) opt-out of the standard shutdown mechanism to manage graceful service stops
-   * (and commit the last pending files, if the client application needs to react to shutdown hooks
-   * on its own).
+   * <p>This method is useful for:
    *
-   * <p>Please only call this method at the end of the intended usage of the library, and NEVER
-   * before, as this method will stop thread pools required for normal library workflows.
+   * <ul>
+   *   <li>Preventing thread pool leaks in hot-reload environments
+   *   <li>Managing graceful application shutdown when the application needs to handle its own
+   *       shutdown hooks (e.g. to commit pending files before exiting)
+   * </ul>
+   *
+   * <p>Only call this method at the end of the intended usage of the library. Calling it earlier
+   * will stop thread pools required for normal library workflows.
    */
   public static void shutdownThreadPools() {
     THREAD_POOL_MANAGER.shutdownAll();
@@ -187,12 +190,9 @@ public class ThreadPools {
       shutdownHook =
           Executors.defaultThreadFactory()
               .newThread(
-                  new Runnable() {
-                    @Override
-                    public void run() {
-                      shutdownHook = null;
-                      shutdownThreadPools();
-                    }
+                  () -> {
+                    shutdownHook = null;
+                    shutdownThreadPools();
                   });
 
       try {
@@ -278,8 +278,7 @@ public class ThreadPools {
   }
 
   /** Manages the lifecycle of thread pools that need to be shut down gracefully. */
-  @VisibleForTesting
-  static class ThreadPoolManager {
+  private static class ThreadPoolManager {
     private final List<ExecutorServiceWithTimeout> threadPoolsToShutdown = Lists.newArrayList();
 
     /**
@@ -288,17 +287,17 @@ public class ThreadPools {
      * @param service the executor service to add
      * @param timeout the timeout for shutdown operations
      */
-    synchronized void addThreadPool(ExecutorService service, Duration timeout) {
+    private synchronized void addThreadPool(ExecutorService service, Duration timeout) {
       threadPoolsToShutdown.add(new ExecutorServiceWithTimeout(service, timeout));
     }
 
     /** Shut down all registered thread pools. */
-    synchronized void shutdownAll() {
+    private synchronized void shutdownAll() {
       long startTime = System.nanoTime();
       List<ExecutorServiceWithTimeout> pendingShutdown = Lists.newArrayList();
 
       for (ExecutorServiceWithTimeout item : threadPoolsToShutdown) {
-        item.getService().shutdown();
+        item.service().shutdown();
         pendingShutdown.add(item);
       }
 
@@ -306,39 +305,23 @@ public class ThreadPools {
 
       for (ExecutorServiceWithTimeout item : pendingShutdown) {
         long timeElapsed = System.nanoTime() - startTime;
-        long remainingTime = item.getTimeout().toNanos() - timeElapsed;
+        long remainingTime = item.timeout().toNanos() - timeElapsed;
         if (remainingTime > 0) {
 
           try {
             if (!item.service.awaitTermination(remainingTime, TimeUnit.NANOSECONDS)) {
-              item.getService().shutdownNow();
+              item.service().shutdownNow();
             }
           } catch (InterruptedException e) {
             LOG.warn("Interrupted while shutting down, ignoring", e);
           }
 
         } else {
-          item.getService().shutdownNow();
+          item.service().shutdownNow();
         }
       }
     }
   }
 
-  private static class ExecutorServiceWithTimeout {
-    private ExecutorService service;
-    private Duration timeout;
-
-    private ExecutorServiceWithTimeout(ExecutorService service, Duration timeout) {
-      this.service = service;
-      this.timeout = timeout;
-    }
-
-    private ExecutorService getService() {
-      return service;
-    }
-
-    private Duration getTimeout() {
-      return timeout;
-    }
-  }
+  private record ExecutorServiceWithTimeout(ExecutorService service, Duration timeout) {}
 }
