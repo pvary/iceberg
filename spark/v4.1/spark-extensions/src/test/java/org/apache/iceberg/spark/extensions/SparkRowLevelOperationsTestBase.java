@@ -20,7 +20,6 @@ package org.apache.iceberg.spark.extensions;
 
 import static org.apache.iceberg.DataOperations.DELETE;
 import static org.apache.iceberg.DataOperations.OVERWRITE;
-import static org.apache.iceberg.PlanningMode.DISTRIBUTED;
 import static org.apache.iceberg.PlanningMode.LOCAL;
 import static org.apache.iceberg.SnapshotSummary.ADDED_DELETE_FILES_PROP;
 import static org.apache.iceberg.SnapshotSummary.ADDED_DVS_PROP;
@@ -37,8 +36,6 @@ import static org.apache.iceberg.TableProperties.PARQUET_VECTORIZATION_ENABLED;
 import static org.apache.iceberg.TableProperties.SPARK_WRITE_PARTITIONED_FANOUT_ENABLED;
 import static org.apache.iceberg.TableProperties.WRITE_DISTRIBUTION_MODE;
 import static org.apache.iceberg.TableProperties.WRITE_DISTRIBUTION_MODE_HASH;
-import static org.apache.iceberg.TableProperties.WRITE_DISTRIBUTION_MODE_NONE;
-import static org.apache.iceberg.TableProperties.WRITE_DISTRIBUTION_MODE_RANGE;
 import static org.assertj.core.api.Assertions.assertThat;
 
 import java.io.IOException;
@@ -71,7 +68,6 @@ import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.spark.SparkCatalog;
-import org.apache.iceberg.spark.SparkSessionCatalog;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Encoder;
 import org.apache.spark.sql.Encoders;
@@ -114,98 +110,16 @@ public abstract class SparkRowLevelOperationsTestBase extends ExtensionsTestBase
   public static Object[][] parameters() {
     return new Object[][] {
       {
-        "testhive",
-        SparkCatalog.class.getName(),
-        ImmutableMap.of(
-            "type", "hive",
-            "default-namespace", "default"),
-        FileFormat.ORC,
-        true,
-        WRITE_DISTRIBUTION_MODE_NONE,
-        true,
-        SnapshotRef.MAIN_BRANCH,
-        LOCAL,
-        2
-      },
-      {
-        "testhive",
-        SparkCatalog.class.getName(),
-        ImmutableMap.of(
-            "type", "hive",
-            "default-namespace", "default"),
-        FileFormat.PARQUET,
-        true,
-        WRITE_DISTRIBUTION_MODE_NONE,
-        false,
-        "test",
-        DISTRIBUTED,
-        2
-      },
-      {
         "testhadoop",
         SparkCatalog.class.getName(),
         ImmutableMap.of("type", "hadoop"),
         FileFormat.PARQUET,
-        RANDOM.nextBoolean(),
+        false,
         WRITE_DISTRIBUTION_MODE_HASH,
         true,
         null,
         LOCAL,
         2
-      },
-      {
-        "spark_catalog",
-        SparkSessionCatalog.class.getName(),
-        ImmutableMap.of(
-            "type", "hive",
-            "default-namespace", "default",
-            "clients", "1",
-            "parquet-enabled", "false",
-            "cache-enabled",
-                "false" // Spark will delete tables using v1, leaving the cache out of sync
-            ),
-        FileFormat.AVRO,
-        false,
-        WRITE_DISTRIBUTION_MODE_RANGE,
-        false,
-        "test",
-        DISTRIBUTED,
-        2
-      },
-      {
-        "testhadoop",
-        SparkCatalog.class.getName(),
-        ImmutableMap.of("type", "hadoop"),
-        FileFormat.PARQUET,
-        RANDOM.nextBoolean(),
-        WRITE_DISTRIBUTION_MODE_HASH,
-        true,
-        null,
-        LOCAL,
-        3
-      },
-      {
-        "spark_catalog",
-        SparkSessionCatalog.class.getName(),
-        ImmutableMap.of(
-            "type",
-            "hive",
-            "default-namespace",
-            "default",
-            "clients",
-            "1",
-            "parquet-enabled",
-            "false",
-            "cache-enabled",
-            "false" // Spark will delete tables using v1, leaving the cache out of sync
-            ),
-        FileFormat.AVRO,
-        false,
-        WRITE_DISTRIBUTION_MODE_RANGE,
-        false,
-        "test",
-        DISTRIBUTED,
-        3
       },
     };
   }

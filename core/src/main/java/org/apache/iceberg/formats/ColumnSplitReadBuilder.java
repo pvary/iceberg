@@ -22,6 +22,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.function.BiFunction;
 import java.util.stream.Collectors;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.io.CloseableIterable;
@@ -41,8 +42,15 @@ class ColumnSplitReadBuilder<X, T> implements ReadBuilder<X, T> {
 
   @Override
   public ReadBuilder<X, T> split(long newStart, long newLength) {
-    // throw new UnsupportedOperationException("Not supported");
-    // TODO gaborkaszab: currently this doesn't do anything
+    readBuilders.entrySet().stream()
+        .filter(entry -> entry.getValue().contains(MetadataColumns.ROW_POSITION.fieldId()))
+        .findAny()
+        .orElseThrow(
+            () ->
+                new IllegalStateException(
+                    "Cannot split read by row position because no read builder includes the row position column"))
+        .getKey()
+        .split(newStart, newLength);
     return this;
   }
 

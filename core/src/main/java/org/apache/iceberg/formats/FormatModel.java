@@ -34,7 +34,9 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.SkippingCloseableIterator;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Queues;
 
@@ -115,15 +117,23 @@ public interface FormatModel<D, S> {
 
   static <E> CloseableIterable<E> combiner(
       Collection<CloseableIterable<E>> iterable, Combiner<E> combiner, boolean multiThreaded) {
+    List<SkippingCloseableIterator<E>> iterators =
+        iterable.stream()
+            .map(
+                ci -> {
+                  CloseableIterator<E> iterator = ci.iterator();
+                  if (iterator instanceof SkippingCloseableIterator<E>) {
+                    return (SkippingCloseableIterator<E>) iterator;
+                  } else {
+                    return SkippingCloseableIterator.wrap(iterator);
+                  }
+                })
+            .collect(Collectors.toList());
     return CloseableIterable.combine(
         () ->
             multiThreaded
-                ? new MultiThreadedCombiningReadIterator<>(
-                    iterable.stream().map(Iterable::iterator).collect(Collectors.toList()),
-                    combiner)
-                : new SingleThreadedCombiningReadIterator<>(
-                    iterable.stream().map(Iterable::iterator).collect(Collectors.toList()),
-                    combiner),
+                ? new MultiThreadedCombiningReadIterator<>(iterators, combiner)
+                : new SingleThreadedCombiningReadIterator<>(iterators, combiner),
         () -> {
           for (CloseableIterable<E> inner : iterable) {
             inner.close();
@@ -132,14 +142,20 @@ public interface FormatModel<D, S> {
   }
 
   class SingleThreadedCombiningReadIterator<E> implements Iterator<E>, Closeable {
-    private final Collection<Iterator<E>> iterators;
+    private final List<SkippingCloseableIterator<E>> iterators;
     private final Combiner<E> combiner;
+    private final List<E> nextElements;
     private boolean closed = false;
+    private long position = 0L;
 
     private SingleThreadedCombiningReadIterator(
-        Collection<Iterator<E>> iterators, Combiner<E> combiner) {
+        List<SkippingCloseableIterator<E>> iterators, Combiner<E> combiner) {
       this.iterators = iterators;
       this.combiner = combiner;
+      this.nextElements = Lists.newArrayListWithExpectedSize(iterators.size());
+      for (int i = 0; i < iterators.size(); ++i) {
+        nextElements.add(null);
+      }
     }
 
     @Override
@@ -164,7 +180,51 @@ public interface FormatModel<D, S> {
         throw new NoSuchElementException();
       }
 
-      return combiner.combine(iterators.stream().map(Iterator::next).collect(Collectors.toList()));
+      int savedIndex = -1;
+      while (true) {
+        boolean needsRealign = false;
+
+        for (int i = 0; i < iterators.size(); ++i) {
+          // If this iterator already provided its value and only doing realignment now, reuse the
+          // old value kept in the nextElements list and skip to the next iterator
+          if (i == savedIndex) {
+            savedIndex = -1;
+            continue;
+          }
+
+          SkippingCloseableIterator<E> iterator = iterators.get(i);
+          // Ensure the iterator is at the pre-read position before calling next()
+          if (iterator.position() < position) {
+            iterator.skipTo(position);
+          }
+
+          if (!iterator.hasNext()) {
+            throw new NoSuchElementException();
+          }
+
+          E value = iterator.next();
+          long newPosition = iterator.position();
+
+          if (newPosition > position + 1) {
+            // This iterator jumped ahead — keep its value in nextElements and discard
+            // results from previous iterators, then restart from the first iterator
+            nextElements.set(i, value);
+            position = newPosition - 1;
+            savedIndex = i;
+            needsRealign = true;
+            break;
+          }
+
+          nextElements.set(i, value);
+        }
+
+        if (needsRealign) {
+          continue;
+        }
+
+        position++;
+        return combiner.combine(nextElements);
+      }
     }
 
     @Override
@@ -182,7 +242,7 @@ public interface FormatModel<D, S> {
     private boolean fetching = false;
 
     private MultiThreadedCombiningReadIterator(
-        Collection<Iterator<E>> iterators, Combiner<E> combiner) {
+        Collection<SkippingCloseableIterator<E>> iterators, Combiner<E> combiner) {
       this.iterators = Lists.newArrayList(iterators);
       this.combiner = combiner;
       this.executorService = Executors.newFixedThreadPool(iterators.size());

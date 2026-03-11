@@ -362,8 +362,7 @@ public class ParquetValueWriters {
 
     @Override
     public void write(int repetitionLevel, CharSequence value) {
-      if (value instanceof Utf8) {
-        Utf8 utf8 = (Utf8) value;
+      if (value instanceof Utf8 utf8) {
         column.writeBinary(
             repetitionLevel, Binary.fromReusedByteArray(utf8.getBytes(), 0, utf8.getByteLength()));
       } else {

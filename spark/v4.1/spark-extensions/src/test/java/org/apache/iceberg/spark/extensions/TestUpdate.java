@@ -339,8 +339,8 @@ public abstract class TestUpdate extends SparkRowLevelOperationsTestBase {
     assumeThat(vectorized).isFalse();
 
     this.formatVersion = 4;
-    long rowGroupSizeBytes = 1024 * 1024 * 128; // 128 MB => fits into one row group
-    // long rowGroupSizeBytes = 1024 * 5; // 1 KB => multiple row groups => multiple read splits
+    // long rowGroupSizeBytes = 1024 * 1024 * 128; // 128 MB => fits into one row group
+    long rowGroupSizeBytes = 1024 * 5; // 1 KB => multiple row groups => multiple read splits
 
     createAndInitTable(
         "id INT, dep STRING, col1 STRING, col2 STRING, col3 STRING, col4 STRING, col5 STRING, col6 STRING, col7 STRING, col8 STRING, col9 STRING, col10 STRING");
@@ -368,8 +368,8 @@ public abstract class TestUpdate extends SparkRowLevelOperationsTestBase {
     assertThat(table.currentSnapshot().addedDataFiles(table.io())).hasSize(1);
     assertThat(table.currentSnapshot().addedRows()).isEqualTo(numRowsToAdd);
 
-    String valueToUpdateTo = "some_updated_value";
-    sql("UPDATE %s AS t SET t.dep = '%s'", commitTarget(), valueToUpdateTo);
+    String valuePrefix = "some_updated_value_";
+    sql("UPDATE %s AS t SET t.dep = concat('%s', t.id)", commitTarget(), valuePrefix);
 
     table.refresh();
     assertThat(table.snapshots()).as("Should have 2 snapshots").hasSize(2);
@@ -392,7 +392,7 @@ public abstract class TestUpdate extends SparkRowLevelOperationsTestBase {
       expectedData.add(
           row(
               i,
-              valueToUpdateTo,
+              valuePrefix + i,
               "column1_value_str_" + i,
               "column2_value_str_" + i,
               "column3_value_str_" + i,
