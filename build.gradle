@@ -407,6 +407,7 @@ project(':iceberg-data') {
     implementation project(path: ':iceberg-bundled-guava', configuration: 'shadow')
     api project(':iceberg-api')
     implementation project(':iceberg-core')
+    implementation libs.caffeine
     compileOnly project(':iceberg-parquet')
     compileOnly project(':iceberg-orc')
     compileOnly(libs.hadoop3.common) {
