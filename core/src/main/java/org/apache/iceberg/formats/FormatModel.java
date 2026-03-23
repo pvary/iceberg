@@ -23,7 +23,6 @@ import java.util.Collection;
 import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.concurrent.ArrayBlockingQueue;
-import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
@@ -253,34 +252,139 @@ public interface FormatModel<D, S> {
   }
 
   /**
-   * An immutable pair of a value and the position of the iterator at the time it was produced.
-   * Position represents the iterator's position <em>after</em> calling {@code next()}, so element
-   * at position {@code p} was the {@code p}-th element returned (1-based).
+   * A batch of elements with their corresponding positions. Stores data in parallel arrays
+   * (struct-of-arrays layout) for better cache locality and to avoid per-element object allocation.
    *
-   * <p>A sentinel instance with position {@code -1} signals that the producer has finished.
+   * <p>The producer fills the batch by calling {@link #add(Object, long)} repeatedly, then calls
+   * {@link #seal()} to prepare it for reading. The consumer reads elements sequentially using
+   * {@link #hasRemaining()}, {@link #value()}, {@link #position()}, and {@link #advance()}.
+   *
+   * <p>A sentinel batch (where {@link #isSentinel()} returns {@code true}) signals that the
+   * producer has finished.
+   *
+   * @param <E> the element type
    */
-  record PositionedElement<E>(long position, E value) {
-    private static final long SENTINEL_POSITION = -1L;
-    private static final PositionedElement<?> SENTINEL =
-        new PositionedElement<>(SENTINEL_POSITION, null);
+  class Batch<E> {
+    private static final Batch<?> SENTINEL = new Batch<>();
 
-    @SuppressWarnings("unchecked")
-    static <E> PositionedElement<E> sentinel() {
-      return (PositionedElement<E>) SENTINEL;
+    private final Object[] values;
+    private final long[] positions;
+    private int size;
+    private int offset;
+
+    /**
+     * Creates an empty batch that can hold up to {@code capacity} elements.
+     *
+     * @param capacity maximum number of elements this batch can hold
+     */
+    Batch(int capacity) {
+      this.values = new Object[capacity];
+      this.positions = new long[capacity];
+      this.size = 0;
+      this.offset = 0;
     }
 
+    /** Creates a sentinel batch that signals end-of-stream. */
+    private Batch() {
+      this.values = null;
+      this.positions = null;
+      this.size = 0;
+      this.offset = 0;
+    }
+
+    /**
+     * Appends an element to this batch.
+     *
+     * @param value the element value
+     * @param position the iterator position associated with this element
+     * @return {@code true} if the batch is full after this add
+     */
+    boolean add(E value, long position) {
+      values[size] = value;
+      positions[size] = position;
+      size++;
+      return size == values.length;
+    }
+
+    /** Returns {@code true} if no elements have been added to this batch. */
+    boolean isEmpty() {
+      return size == 0;
+    }
+
+    /**
+     * Prepares this batch for reading by resetting the read offset to the beginning. Must be called
+     * after the producer has finished adding elements and before the batch is handed to the
+     * consumer.
+     */
+    void seal() {
+      this.offset = 0;
+    }
+
+    /** Returns a shared sentinel instance that signals end-of-stream. */
+    @SuppressWarnings("unchecked")
+    static <E> Batch<E> sentinel() {
+      return (Batch<E>) SENTINEL;
+    }
+
+    /** Returns {@code true} if this is a sentinel batch signaling end-of-stream. */
     boolean isSentinel() {
-      return position == SENTINEL_POSITION;
+      return values == null;
+    }
+
+    /** Returns {@code true} if there are unread elements remaining in this batch. */
+    boolean hasRemaining() {
+      return offset < size;
+    }
+
+    /** Returns the value of the current element at the read offset. */
+    @SuppressWarnings("unchecked")
+    E value() {
+      return (E) values[offset];
+    }
+
+    /** Returns the position of the current element at the read offset. */
+    long position() {
+      return positions[offset];
+    }
+
+    /** Advances the read offset to the next element. */
+    void advance() {
+      offset++;
     }
   }
 
+  /**
+   * A multi-threaded combining iterator that uses batched {@link ArrayBlockingQueue}s for
+   * producer-consumer coordination.
+   *
+   * <p>Each producer reads elements into fixed-size {@link Batch} objects and puts each full batch
+   * into its queue as a single operation. The consumer takes one batch per queue at a time and
+   * iterates through elements locally without any queue interaction.
+   *
+   * <p>This amortizes per-record synchronization: instead of 2N queue operations per record (N
+   * {@code put()} + N {@code take()}), the cost is 2N queue operations per <em>batch</em>, reducing
+   * lock acquisitions by a factor of {@link #BATCH_SIZE}.
+   *
+   * <p>Producers can read ahead into the queue (up to {@link #QUEUE_CAPACITY} batches), preserving
+   * the I/O pipelining that makes multi-threading beneficial. Position realignment on skips is
+   * handled through a shared {@code targetPosition} that producers check before each element read.
+   */
   class MultiThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
-    private static final int BUFFER_CAPACITY = 128;
+    /**
+     * Number of elements per batch. Each queue {@code put()}/{@code take()} transfers this many
+     * elements, reducing lock acquisitions by this factor compared to per-element queuing.
+     */
+    private static final int BATCH_SIZE = 1024;
+
+    /**
+     * Number of batches each queue can hold. Total buffered elements = BATCH_SIZE * QUEUE_CAPACITY.
+     */
+    private static final int QUEUE_CAPACITY = 16;
 
     private final List<SkippingCloseableIterator<E>> iterators;
     private final Combiner<E> combiner;
     private final ExecutorService executorService;
-    private final List<BlockingQueue<PositionedElement<E>>> buffers;
+    private final List<ArrayBlockingQueue<Batch<E>>> buffers;
     private final List<E> elements;
 
     /** Shared target position: producers skip elements below this position. */
@@ -298,37 +402,55 @@ public interface FormatModel<D, S> {
     /** Set once any producer's sentinel has been consumed; no more results will be produced. */
     private boolean exhausted = false;
 
+    /** Current batch from each producer. */
+    private final Batch<E>[] currentBatches;
+
+    @SuppressWarnings("unchecked")
     private MultiThreadedCombiningReadIterator(
         Collection<SkippingCloseableIterator<E>> iterators, Combiner<E> combiner) {
       this.iterators = Lists.newArrayList(iterators);
       this.combiner = combiner;
-      this.executorService = Executors.newFixedThreadPool(iterators.size());
-      this.buffers = Lists.newArrayListWithExpectedSize(this.iterators.size());
-      this.elements = Lists.newArrayListWithExpectedSize(this.iterators.size());
+      int size = this.iterators.size();
+      this.executorService = Executors.newFixedThreadPool(size);
+      this.buffers = Lists.newArrayListWithExpectedSize(size);
+      this.elements = Lists.newArrayListWithExpectedSize(size);
+      this.currentBatches = new Batch[size];
 
-      for (int i = 0; i < this.iterators.size(); ++i) {
+      for (int i = 0; i < size; ++i) {
         elements.add(null);
-      }
-
-      for (int idx = 0; idx < this.iterators.size(); idx++) {
-        this.buffers.add(new ArrayBlockingQueue<>(BUFFER_CAPACITY));
+        buffers.add(new ArrayBlockingQueue<>(QUEUE_CAPACITY));
       }
     }
 
+    /**
+     * Starts one producer thread per iterator. Each producer reads elements into {@link Batch}
+     * objects and puts them into its dedicated queue. Producers check the shared {@code
+     * targetPosition} before each read to skip ahead when the consumer detects a position gap.
+     */
     private void startFetching() {
       fetching = true;
 
       for (int i = 0; i < iterators.size(); i++) {
         final SkippingCloseableIterator<E> iterator = iterators.get(i);
-        final BlockingQueue<PositionedElement<E>> buffer = buffers.get(i);
+        final ArrayBlockingQueue<Batch<E>> buffer = buffers.get(i);
         executorService.execute(
             () -> {
               try {
+                Batch<E> batch = new Batch<>(BATCH_SIZE);
+
                 while (!closed && iterator.hasNext()) {
                   long currentTarget = targetPosition.get();
 
                   // Skip ahead if the iterator is behind the shared target position
                   if (iterator.position() < currentTarget) {
+                    // Flush any partial batch before skipping — the consumer needs
+                    // these elements to detect the position gap
+                    if (!batch.isEmpty()) {
+                      batch.seal();
+                      buffer.put(batch);
+                      batch = new Batch<>(BATCH_SIZE);
+                    }
+
                     iterator.skipTo(currentTarget);
                   }
 
@@ -339,15 +461,25 @@ public interface FormatModel<D, S> {
                   E value = iterator.next();
                   long pos = iterator.position();
 
-                  // Only enqueue if this element is still at or ahead of the target
+                  // Only include if this element is still at or ahead of the target
                   if (pos > targetPosition.get()) {
-                    buffer.put(new PositionedElement<>(pos, value));
+                    if (batch.add(value, pos)) {
+                      batch.seal();
+                      buffer.put(batch);
+                      batch = new Batch<>(BATCH_SIZE);
+                    }
                   }
                   // Otherwise discard and loop — the target moved while we were reading
                 }
 
-                // Signal completion with a sentinel
-                buffer.put(PositionedElement.sentinel());
+                // Flush remaining partial batch
+                if (!batch.isEmpty()) {
+                  batch.seal();
+                  buffer.put(batch);
+                }
+
+                // Signal completion with a sentinel batch
+                buffer.put(Batch.sentinel());
               } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 producerError.compareAndSet(null, e);
@@ -366,30 +498,46 @@ public interface FormatModel<D, S> {
     }
 
     /**
-     * Takes the next aligned element from the given blocking queue, consuming and discarding any
-     * elements whose position is below the current target position. Returns {@code null} if the
-     * producer has finished (sentinel encountered).
+     * Returns the position of the next non-stale element from producer {@code i}, fetching a new
+     * batch from the queue if the current one is exhausted. As a side effect, the element value is
+     * stored in {@code elements.get(i)} for later use by the combiner.
+     *
+     * @param i the producer index
+     * @return the element's position, or {@code -1} if the producer has finished
+     * @throws InterruptedException if interrupted while waiting for a batch
      */
-    private PositionedElement<E> takeAligned(BlockingQueue<PositionedElement<E>> buffer)
-        throws InterruptedException {
+    private long nextFromProducer(int i) throws InterruptedException {
       while (true) {
-        PositionedElement<E> element = buffer.take();
-        if (element.isSentinel()) {
-          return null;
+        Batch<E> batch = currentBatches[i];
+        // If we have a current batch with remaining elements, use it
+        if (batch != null && batch.hasRemaining()) {
+          long pos = batch.position();
+
+          // Skip stale elements
+          if (pos > targetPosition.get()) {
+            elements.set(i, batch.value());
+            batch.advance();
+            return pos;
+          }
+
+          batch.advance();
+          continue;
         }
 
-        if (element.position() > targetPosition.get()) {
-          return element;
+        // Need a new batch
+        Batch<E> newBatch = buffers.get(i).take();
+        if (newBatch.isSentinel()) {
+          return -1;
         }
 
-        // Discard stale element and try the next one
+        currentBatches[i] = newBatch;
       }
     }
 
     /**
-     * Attempts to compute the next aligned, combined result from all buffers. Returns {@code true}
-     * if a result was produced and stored in {@link #pendingResult}, {@code false} if any producer
-     * has finished (sentinel).
+     * Attempts to compute the next aligned, combined result from all producers. Returns {@code
+     * true} if a result was produced and stored in {@link #pendingResult}, {@code false} if any
+     * producer has finished (sentinel).
      */
     private boolean tryAdvance() {
       if (pendingResult != null) {
@@ -419,19 +567,16 @@ public interface FormatModel<D, S> {
               continue;
             }
 
-            PositionedElement<E> pe = takeAligned(buffers.get(i));
-            if (pe == null) {
+            long pePosition = nextFromProducer(i);
+            if (pePosition < 0) {
               // Producer finished — no more combined results
               exhausted = true;
               return false;
             }
 
-            elements.set(i, pe.value());
-            long pePosition = pe.position();
-
             if (pePosition > currentTarget + 1) {
               // This buffer skipped ahead — keep its value and update the shared target
-              // position so producers and subsequent takeAligned calls discard stale elements
+              // position so producers and subsequent nextFromProducer calls discard stale elements
               targetPosition.set(pePosition - 1);
               savedIndex = i;
               needsRealign = true;

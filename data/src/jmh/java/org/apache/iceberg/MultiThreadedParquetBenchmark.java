@@ -18,206 +18,345 @@
  */
 package org.apache.iceberg;
 
-import static org.apache.iceberg.types.Types.NestedField.required;
+import static org.apache.iceberg.data.FileAccessFactoryRegistry.MULTI_THREADED;
+import static org.apache.iceberg.types.Types.NestedField.optional;
 
 import java.io.File;
 import java.io.IOException;
-import java.util.Collection;
+import java.nio.file.Path;
+import java.util.Comparator;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
-import org.apache.iceberg.data.CombinedRecord;
+import java.util.stream.Stream;
+import org.apache.iceberg.data.FileAccessFactoryRegistry;
+import org.apache.iceberg.data.GenericObjectModels;
 import org.apache.iceberg.data.RandomGenericData;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.data.parquet.GenericParquetReaders;
 import org.apache.iceberg.data.parquet.GenericParquetWriter;
-import org.apache.iceberg.formats.FormatModel;
+import org.apache.iceberg.encryption.EncryptedOutputFile;
+import org.apache.iceberg.encryption.EncryptionUtil;
+import org.apache.iceberg.formats.FileWriterBuilder;
+import org.apache.iceberg.formats.FormatModelRegistry;
+import org.apache.iceberg.formats.ReadBuilder;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.CloseableIterator;
+import org.apache.iceberg.io.DataWriter;
 import org.apache.iceberg.io.FileAppender;
+import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.ReadBuilder;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
+import org.apache.iceberg.util.Pair;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
+import org.openjdk.jmh.annotations.Level;
 import org.openjdk.jmh.annotations.Measurement;
 import org.openjdk.jmh.annotations.Mode;
-import org.openjdk.jmh.annotations.OutputTimeUnit;
+import org.openjdk.jmh.annotations.Param;
 import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Threads;
-import org.openjdk.jmh.annotations.Timeout;
 import org.openjdk.jmh.annotations.Warmup;
-import org.openjdk.jmh.infra.Blackhole;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-/**
- * JMH benchmark comparing the performance of {@link
- * FormatModel.SingleThreadedCombiningReadIterator} and {@link
- * FormatModel.MultiThreadedCombiningReadIterator} with actual Parquet file readers.
- *
- * <p>A wide table with 10,000 integer columns is split across 10 Parquet files (1,000 columns
- * each). Each benchmark iteration opens real Parquet readers for all files and combines them using
- * {@link CombinedRecord} via the respective iterator implementation.
- */
-@Fork(1)
+@Fork(value = 1)
 @State(Scope.Benchmark)
-@Warmup(iterations = 3)
-@Measurement(iterations = 5)
-@Timeout(time = 1000, timeUnit = TimeUnit.HOURS)
+@Warmup(iterations = 1)
+@Measurement(iterations = 3)
 @BenchmarkMode(Mode.SingleShotTime)
-@OutputTimeUnit(TimeUnit.MILLISECONDS)
 public class MultiThreadedParquetBenchmark {
   private static final Logger LOG = LoggerFactory.getLogger(MultiThreadedParquetBenchmark.class);
 
-  /** Number of Parquet files (column families). */
-  private static final int NUM_FILES = 10;
+  private static final int SEED = -2;
+  private static final int BATCH_SIZE = 10000;
+  private static final int DATA_SIZE = 100_000_000;
+  private static final String TEST_DIR =
+      "/Users/petervary/iceberg-generic-parquet-reader-benchmark/";
+  private static final String READ_DIR = "read/";
+  private static final String WRITE_DIR = "write/";
+  private static final String SOURCE = "source/data.parquet";
+  private Schema testSchema;
+  private List<List<Integer>> familyIds;
+  private int testDataSize;
 
-  /** Total number of integer columns across all files. */
-  private static final int NUM_COLUMNS = 10_000;
+  @Param({"100", "1000", "10000"})
+  private int columns;
 
-  /** Number of columns per file. */
-  private static final int COLUMNS_PER_FILE = NUM_COLUMNS / NUM_FILES;
+  @Param({"0", "1", "2", "5", "10"})
+  private int families;
 
-  /** Number of rows per file. */
-  private static final int NUM_ROWS = 5_000;
+  @Param({"true", "false"})
+  private boolean multiThreaded;
 
-  private static final int SEED = 42;
+  {
+    // Only delete the write directory to avoid deleting the read/source directory and losing the
+    // pregenerated test records.
+    delete(WRITE_DIR);
+    Path readDirPath = Path.of(TEST_DIR, READ_DIR);
+    Path writeDirPath = Path.of(TEST_DIR, WRITE_DIR);
+    try {
+      if (!java.nio.file.Files.exists(readDirPath)) {
+        java.nio.file.Files.createDirectories(readDirPath);
+      }
+      if (!java.nio.file.Files.exists(writeDirPath)) {
+        java.nio.file.Files.createDirectories(writeDirPath);
+      }
+    } catch (IOException e) {
+      throw new RuntimeException("Failed to create directories", e);
+    }
+  }
 
-  /** The full schema spanning all 10,000 columns. */
-  private Schema fullSchema;
-
-  /** Per-file sub-schemas, each containing its family's columns. */
-  private List<Schema> fileSchemas;
-
-  /** Per-file family arrays (field IDs belonging to each file). */
-  private Integer[][] families;
-
-  private List<File> testFiles;
-
-  @Setup
+  @Setup(Level.Trial)
   public void setupBenchmark() throws IOException {
-    // Build the full schema with NUM_COLUMNS required integer columns (field IDs 1..NUM_COLUMNS)
-    List<Types.NestedField> allFields = Lists.newArrayListWithCapacity(NUM_COLUMNS);
-    for (int i = 0; i < NUM_COLUMNS; i++) {
-      allFields.add(required(i + 1, "col_" + i, Types.IntegerType.get()));
+    System.err.println("Run: " + columns + ", F: " + families + ", MT: " + multiThreaded);
+    List<Types.NestedField> fieldList = Lists.newArrayListWithCapacity(columns);
+    familyIds = Lists.newArrayListWithCapacity(families);
+    for (int i = 0; i < families; ++i) {
+      familyIds.add(Lists.newArrayList());
     }
-    fullSchema = new Schema(allFields);
 
-    // Split into NUM_FILES families, each with COLUMNS_PER_FILE columns
-    families = new Integer[NUM_FILES][];
-    fileSchemas = Lists.newArrayListWithCapacity(NUM_FILES);
-    for (int f = 0; f < NUM_FILES; f++) {
-      int startCol = f * COLUMNS_PER_FILE;
-      Integer[] familyIds = new Integer[COLUMNS_PER_FILE];
-      List<Types.NestedField> familyFields = Lists.newArrayListWithCapacity(COLUMNS_PER_FILE);
-      for (int c = 0; c < COLUMNS_PER_FILE; c++) {
-        int fieldId = startCol + c + 1;
-        familyIds[c] = fieldId;
-        familyFields.add(required(fieldId, "col_" + (startCol + c), Types.IntegerType.get()));
+    // Generate the column families and the schema.
+    int family = 0;
+    for (int i = 0; i < columns; ++i) {
+      fieldList.add(optional(i, "col" + i, Types.DoubleType.get()));
+      if (families > 0) {
+        List<Integer> familyIdsForColumn = familyIds.get(family);
+        if (familyIdsForColumn == null) {
+          familyIdsForColumn = Lists.newArrayList();
+          familyIds.add(familyIdsForColumn);
+        }
+
+        familyIdsForColumn.add(i);
+        family = (family + 1) % families;
       }
-      families[f] = familyIds;
-      fileSchemas.add(new Schema(familyFields));
     }
 
-    // Write NUM_FILES Parquet files, each containing its family's columns
-    testFiles = Lists.newArrayListWithCapacity(NUM_FILES);
-    for (int f = 0; f < NUM_FILES; f++) {
-      File file =
-          java.nio.file.Files.createTempFile("combining-bench-" + f + "-", ".parquet").toFile();
-      file.delete();
-      testFiles.add(file);
+    testSchema = new Schema(fieldList);
+    testDataSize = DATA_SIZE / columns;
 
-      Schema fileSchema = fileSchemas.get(f);
-      List<Record> records = RandomGenericData.generate(fileSchema, NUM_ROWS, SEED + f);
-
-      try (FileAppender<Record> writer =
-          Parquet.write(Files.localOutput(file))
-              .schema(fileSchema)
-              .createWriterFunc(GenericParquetWriter::create)
-              .build()) {
-        writer.addAll(records);
-      }
-
-      LOG.info("Wrote file {} ({} bytes)", file.getName(), file.length());
-    }
-
-    LOG.info(
-        "Setup complete: {} files, {} columns total ({} per file), {} rows per file",
-        NUM_FILES,
-        NUM_COLUMNS,
-        COLUMNS_PER_FILE,
-        NUM_ROWS);
+    initSourceRecords();
+    initReaderRecords();
   }
 
   @TearDown
-  public void tearDownBenchmark() {
-    if (testFiles != null) {
-      for (File file : testFiles) {
-        file.delete();
-      }
-    }
+  public void tearDownBenchmark() throws IOException {
+    // To keep the generated files to speed up the tests, we do not delete the files here.
+    //   delete(WRITE_DIR);
+    //   delete(READ_DIR);
   }
 
-  /** Opens a Parquet reader for the given file projected to its family sub-schema. */
-  private CloseableIterable<Record> openReader(int fileIndex) {
-    File file = testFiles.get(fileIndex);
-    Schema fileSchema = fileSchemas.get(fileIndex);
-    return Parquet.read(Files.localInput(file))
-        .project(fileSchema)
-        .createReaderFunc(
-            parquetSchema -> GenericParquetReaders.buildReader(fileSchema, parquetSchema))
+  //  private static int counter = 0;
+  //
+  //  @Benchmark
+  //  @Threads(1)
+  //  public void write() throws IOException {
+  //    write(WRITE_DIR + counter++ + "_write_" + multiThreaded + "_");
+  //  }
+
+  @Benchmark
+  @Threads(1)
+  public void read() throws IOException {
+    long val = 0;
+
+    if (families == 0) {
+      if (multiThreaded) {
+        // no test here
+        return;
+      }
+
+      String file = readFileName(0);
+      try (CloseableIterable<Record> reader =
+          Parquet.read(Files.localInput(file))
+              .project(testSchema)
+              .createReaderFunc(
+                  fileSchema -> GenericParquetReaders.buildReader(testSchema, fileSchema))
+              .build()) {
+        for (Record record : reader) {
+          // access something to ensure the compiler doesn't optimize this away
+          if (record.get(0) != null) {
+            val ^= ((Double) record.get(0)).longValue();
+          }
+        }
+      }
+    } else {
+      try (CloseableIterable<Record> reader = reader()) {
+        for (Record record : reader) {
+          // access something to ensure the compiler doesn't optimize this away
+          if (record.get(0) != null) {
+            val ^= ((Double) record.get(0)).longValue();
+          }
+        }
+      }
+    }
+
+    LOG.info("XOR val: {}", val);
+  }
+
+  private void write(String prefix) throws IOException {
+    long val = 0;
+    if (families == 0) {
+      if (multiThreaded) {
+        // no test here
+        return;
+      }
+
+      String file = TEST_DIR + prefix + columns + "_" + families;
+      try (FileAppender<Record> writer =
+          Parquet.write(Files.localOutput(file))
+              .schema(testSchema)
+              .createWriterFunc(GenericParquetWriter::create)
+              .build()) {
+        CloseableIterator<Record> iterator = testData().iterator();
+        while (iterator.hasNext()) {
+          Record record = iterator.next();
+          // access something to ensure the compiler doesn't optimize this away
+          writer.add(record);
+          if (record.get(0) != null) {
+            val ^= ((Double) record.get(0)).longValue();
+          }
+        }
+      }
+    } else {
+      try (FileAppender<Record> writer = writer(prefix)) {
+        CloseableIterator<Record> iterator = testData().iterator();
+        while (iterator.hasNext()) {
+          Record record = iterator.next();
+          // access something to ensure the compiler doesn't optimize this away
+          writer.add(record);
+          if (record.get(0) != null) {
+            val ^= ((Double) record.get(0)).longValue();
+          }
+        }
+      }
+    }
+
+    LOG.info("XOR val: {}", val);
+  }
+
+  private String readFileName(int family) {
+    return TEST_DIR + READ_DIR + columns + "_" + (families < 2 ? "0" : families + "_" + family);
+  }
+
+  private CloseableIterable<Record> testData() {
+    String file = TEST_DIR + SOURCE + "_" + columns + "_" + testDataSize;
+    CloseableIterable<Record> iterator =
+        Parquet.read(Files.localInput(file))
+            .project(testSchema)
+            .createReaderFunc(
+                fileSchema -> GenericParquetReaders.buildReader(testSchema, fileSchema))
+            .build();
+    return CloseableIterable.combine(
+        () -> new LimitedIterator(iterator.iterator(), testDataSize), iterator);
+  }
+
+  private CloseableIterable<Record> reader() {
+    List<Pair<InputFile, Integer[]>> files = Lists.newArrayListWithCapacity(familyIds.size());
+    for (int i = 0; i < familyIds.size(); ++i) {
+      String file = readFileName(i);
+      files.add(Pair.of(Files.localInput(file), familyIds.get(i).toArray(new Integer[] {})));
+    }
+
+    ReadBuilder<Record, ?> builder =
+        FormatModelRegistry.readBuilder(
+            FileFormat.PARQUET, Record.class, files.toArray(new Pair[] {}));
+    return builder
+        .project(testSchema)
+        .set("multi-threaded", Boolean.toString(multiThreaded))
         .build();
   }
 
-  /** Creates a collection of readers, one per file. */
-  private Collection<CloseableIterable<Record>> createReaders() {
-    List<CloseableIterable<Record>> readers = Lists.newArrayListWithCapacity(NUM_FILES);
-    for (int f = 0; f < NUM_FILES; f++) {
-      readers.add(openReader(f));
+  private FileAppender<Record> writer(String prefix) throws IOException {
+    List<Pair<EncryptedOutputFile, Integer[]>> files =
+        Lists.newArrayListWithCapacity(familyIds.size());
+    for (int i = 0; i < familyIds.size(); ++i) {
+      String file = TEST_DIR + prefix + columns + "_" + families + "_" + i;
+      files.add(
+          Pair.of(
+              EncryptionUtil.plainAsEncryptedOutput(Files.localOutput(file)),
+              familyIds.get(i).toArray(new Integer[] {})));
     }
-    return readers;
+
+    FileWriterBuilder<DataWriter<Record>, ?, Record> builder =
+        FileAccessFactoryRegistry.writeBuilder(
+            FileFormat.PARQUET,
+            GenericObjectModels.GENERIC_OBJECT_MODEL,
+            files.toArray(new Pair[] {}));
+    if (multiThreaded) {
+      builder = builder.set(MULTI_THREADED, "true");
+    }
+
+    return builder.fileSchema(testSchema).build();
   }
 
-  /**
-   * Combiner that assembles a {@link CombinedRecord} from per-file records. Each element in the
-   * input list corresponds to one file's record; the combiner maps it into the appropriate family
-   * slot of the output CombinedRecord.
-   */
-  private FormatModel.Combiner<Record> createCombiner() {
-    // Pre-create a template CombinedRecord to clone per row for efficiency
-    CombinedRecord template = CombinedRecord.create(fullSchema, families);
-    return elements -> {
-      CombinedRecord combined = CombinedRecord.clone(template);
-      for (int f = 0; f < elements.size(); f++) {
-        combined.setFamily(f, elements.get(f));
-      }
-      return combined;
-    };
-  }
-
-  @Benchmark
-  @Threads(1)
-  public void singleThreadedCombiner(Blackhole blackhole) throws IOException {
-    FormatModel.Combiner<Record> combiner = createCombiner();
-    try (CloseableIterable<Record> result =
-        FormatModel.combiner(createReaders(), combiner, false)) {
-      for (Record row : result) {
-        blackhole.consume(row);
-      }
+  private void delete(String path) {
+    Path pathToBeDeleted = Path.of(TEST_DIR, path);
+    try (Stream<Path> paths = java.nio.file.Files.walk(pathToBeDeleted)) {
+      paths.sorted(Comparator.reverseOrder()).map(Path::toFile).forEach(File::delete);
+    } catch (Exception e) {
+      // Ignore exceptions during deletion
     }
   }
 
-  @Benchmark
-  @Threads(1)
-  public void multiThreadedCombiner(Blackhole blackhole) throws IOException {
-    FormatModel.Combiner<Record> combiner = createCombiner();
-    try (CloseableIterable<Record> result = FormatModel.combiner(createReaders(), combiner, true)) {
-      for (Record row : result) {
-        blackhole.consume(row);
+  private void initSourceRecords() throws IOException {
+    String file = TEST_DIR + SOURCE + "_" + columns + "_" + testDataSize;
+    if (!Files.localInput(file).exists()) {
+      System.err.println("New writer source file: " + file);
+      try (FileAppender<Record> writer =
+          Parquet.write(Files.localOutput(file))
+              .schema(testSchema)
+              .createWriterFunc(GenericParquetWriter::create)
+              .build()) {
+        for (int i = 0; i < testDataSize; i += BATCH_SIZE) {
+          writer.addAll(RandomGenericData.generate(testSchema, BATCH_SIZE, SEED + i));
+          System.err.println("Status: " + i);
+        }
       }
+      System.err.println("New writer source file created: " + file);
+    } else {
+      System.err.println("Writer source file already exists: " + file);
+    }
+  }
+
+  private void initReaderRecords() throws IOException {
+    String file1 = readFileName(0);
+    if (!Files.localInput(file1).exists()) {
+      System.err.println("Generating new file for readers: " + file1);
+      write(READ_DIR);
+    }
+  }
+
+  private static class LimitedIterator implements CloseableIterator<Record> {
+    private final CloseableIterator<Record> iterator;
+    private int remaining;
+
+    public LimitedIterator(CloseableIterator<Record> iterator, int limit) {
+      this.iterator = iterator;
+      this.remaining = limit;
+    }
+
+    @Override
+    public boolean hasNext() {
+      return remaining > 0 && iterator.hasNext();
+    }
+
+    @Override
+    public Record next() {
+      if (remaining <= 0) {
+        throw new IllegalStateException("No more elements available");
+      }
+
+      remaining--;
+      return iterator.next();
+    }
+
+    @Override
+    public void close() throws IOException {
+      iterator.close();
     }
   }
 }
