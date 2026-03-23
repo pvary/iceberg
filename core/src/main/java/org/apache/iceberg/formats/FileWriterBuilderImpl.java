@@ -58,6 +58,13 @@ abstract class FileWriterBuilderImpl<W extends FileWriter<D, ?>, D, S>
     return new DataFileWriterBuilder<>(model, outputFile);
   }
 
+  static <D, S> FileWriterBuilder<DataWriter<D>, S> forDataFile(
+      ModelWriteBuilder<D, S> modelWriteBuilder,
+      FileFormat format,
+      EncryptedOutputFile outputFile) {
+    return new DataFileWriterBuilder<>(modelWriteBuilder, format, outputFile);
+  }
+
   /**
    * Creates a builder for {@link EqualityDeleteWriter} instances for writing equality delete files.
    */
@@ -79,6 +86,17 @@ abstract class FileWriterBuilderImpl<W extends FileWriter<D, ?>, D, S>
     this.modelWriteBuilder = model.writeBuilder(outputFile).content(content);
     this.location = outputFile.encryptingOutputFile().location();
     this.format = model.format();
+    this.content = content;
+  }
+
+  private FileWriterBuilderImpl(
+      ModelWriteBuilder<D, S> modelWriteBuilder,
+      FileFormat format,
+      EncryptedOutputFile outputFile,
+      FileContent content) {
+    this.modelWriteBuilder = modelWriteBuilder.content(content);
+    this.location = outputFile.encryptingOutputFile().location();
+    this.format = format;
     this.content = content;
   }
 
@@ -221,6 +239,13 @@ abstract class FileWriterBuilderImpl<W extends FileWriter<D, ?>, D, S>
 
     private DataFileWriterBuilder(FormatModel<D, S> model, EncryptedOutputFile outputFile) {
       super(model, outputFile, FileContent.DATA);
+    }
+
+    private DataFileWriterBuilder(
+        ModelWriteBuilder<D, S> modelWriteBuilder,
+        FileFormat format,
+        EncryptedOutputFile outputFile) {
+      super(modelWriteBuilder, format, outputFile, FileContent.DATA);
     }
 
     @Override

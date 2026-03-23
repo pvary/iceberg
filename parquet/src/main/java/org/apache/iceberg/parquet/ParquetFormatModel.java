@@ -51,10 +51,11 @@ public class ParquetFormatModel<D, S, R>
 
   // TODO gaborkaszab: move to base if all the children implements this?
   private final BiFunction<Schema, Integer[][], Combiner<D>> combinerFunction;
+  private final BiFunction<Schema, Integer[], Narrower<D>> narrowerFunction;
 
   public static <D> ParquetFormatModel<PositionDelete<D>, Void, Object> forPositionDeletes() {
     return new ParquetFormatModel<>(
-        PositionDelete.deleteClass(), Void.class, null, null, null, false);
+        PositionDelete.deleteClass(), Void.class, null, null, null, null, false);
   }
 
   public static <D, S> ParquetFormatModel<D, S, ParquetValueReader<?>> create(
@@ -62,16 +63,23 @@ public class ParquetFormatModel<D, S, R>
       Class<S> schemaType,
       WriterFunction<ParquetValueWriter<?>, S, MessageType> writerFunction,
       ReaderFunction<ParquetValueReader<?>, S, MessageType> readerFunction,
-      BiFunction<Schema, Integer[][], Combiner<D>> combinerFunction) {
+      BiFunction<Schema, Integer[][], Combiner<D>> combinerFunction,
+      BiFunction<Schema, Integer[], Narrower<D>> narrowerFunction) {
     return new ParquetFormatModel<>(
-        type, schemaType, writerFunction, readerFunction, combinerFunction, false);
+        type,
+        schemaType,
+        writerFunction,
+        readerFunction,
+        combinerFunction,
+        narrowerFunction,
+        false);
   }
 
   public static <D, S> ParquetFormatModel<D, S, VectorizedReader<?>> create(
       Class<? extends D> type,
       Class<S> schemaType,
       ReaderFunction<VectorizedReader<?>, S, MessageType> batchReaderFunction) {
-    return new ParquetFormatModel<>(type, schemaType, null, batchReaderFunction, null, true);
+    return new ParquetFormatModel<>(type, schemaType, null, batchReaderFunction, null, null, true);
   }
 
   private ParquetFormatModel(
@@ -80,9 +88,11 @@ public class ParquetFormatModel<D, S, R>
       WriterFunction<ParquetValueWriter<?>, S, MessageType> writerFunction,
       ReaderFunction<R, S, MessageType> readerFunction,
       BiFunction<Schema, Integer[][], Combiner<D>> combinerFunction,
+      BiFunction<Schema, Integer[], Narrower<D>> narrowerFunction,
       boolean isBatchReader) {
     super(type, schemaType, writerFunction, readerFunction);
     this.combinerFunction = combinerFunction;
+    this.narrowerFunction = narrowerFunction;
     this.isBatchReader = isBatchReader;
   }
 
@@ -104,6 +114,11 @@ public class ParquetFormatModel<D, S, R>
   @Override
   public BiFunction<Schema, Integer[][], Combiner<D>> combiner() {
     return combinerFunction;
+  }
+
+  @Override
+  public BiFunction<Schema, Integer[], Narrower<D>> narrower() {
+    return narrowerFunction;
   }
 
   private static class WriteBuilderWrapper<D, S> implements ModelWriteBuilder<D, S> {

@@ -56,7 +56,8 @@ public class SparkFormatModels {
             (icebergSchema, families) -> {
               CombinedInternalRow record = CombinedInternalRow.create(icebergSchema, families);
               return new InternalRowCombiner(record);
-            }));
+            },
+            null));
 
     FormatModelRegistry.register(
         ParquetFormatModel.create(

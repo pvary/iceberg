@@ -160,6 +160,28 @@ public final class FormatModelRegistry {
     return FileWriterBuilderImpl.forDataFile(model, outputFile);
   }
 
+  public static <D, S> FileWriterBuilder<DataWriter<D>, S> dataWriteBuilder(
+      FileFormat format,
+      Class<? extends D> type,
+      Map<EncryptedOutputFile, List<Integer>> columnSplits) {
+    Preconditions.checkArgument(!columnSplits.isEmpty(), "Empty column splits");
+
+    if (columnSplits.size() == 1) {
+      return dataWriteBuilder(format, type, Iterables.getOnlyElement(columnSplits.keySet()));
+    }
+
+    FormatModel<D, S> model = modelFor(format, type);
+    Map<ModelWriteBuilder<D, S>, List<Integer>> writeBuilderColumnSplits =
+        columnSplits.entrySet().stream()
+            .collect(
+                Collectors.toMap(entry -> model.writeBuilder(entry.getKey()), Map.Entry::getValue));
+
+    return FileWriterBuilderImpl.forDataFile(
+        new ColumnSplitWriteBuilder<>(writeBuilderColumnSplits, model.narrower()),
+        format,
+        columnSplits.keySet().iterator().next());
+  }
+
   /**
    * Creates a writer builder for generating a {@link DeleteFile} with equality deletes.
    *

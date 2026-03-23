@@ -35,6 +35,7 @@ class ColumnSplitReadBuilder<X, T> implements ReadBuilder<X, T> {
   private final Map<ReadBuilder<X, ?>, List<Integer>> readBuilders;
   private final BiFunction<Schema, Integer[][], FormatModel.Combiner<X>> combinerBuilder;
   private Schema schema;
+  private boolean multiThreaded = false;
 
   ColumnSplitReadBuilder(
       Map<ReadBuilder<X, ?>, List<Integer>> readBuilders,
@@ -105,6 +106,10 @@ class ColumnSplitReadBuilder<X, T> implements ReadBuilder<X, T> {
 
   @Override
   public ReadBuilder<X, T> set(String key, String value) {
+    if (FormatModel.MULTI_THREADED.equals(key)) {
+      this.multiThreaded = Boolean.parseBoolean(value);
+    }
+
     readBuilders.keySet().forEach(r -> r.set(key, value));
     return this;
   }
@@ -144,6 +149,6 @@ class ColumnSplitReadBuilder<X, T> implements ReadBuilder<X, T> {
     return FormatModel.combiner(
         readBuilders.keySet().stream().map(ReadBuilder::build).collect(Collectors.toList()),
         combiner,
-        false);
+        multiThreaded);
   }
 }

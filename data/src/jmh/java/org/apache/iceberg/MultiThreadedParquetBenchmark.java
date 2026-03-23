@@ -18,17 +18,18 @@
  */
 package org.apache.iceberg;
 
-import static org.apache.iceberg.data.FileAccessFactoryRegistry.MULTI_THREADED;
+import static org.apache.iceberg.formats.FormatModel.MULTI_THREADED;
 import static org.apache.iceberg.types.Types.NestedField.optional;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Path;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Stream;
-import org.apache.iceberg.data.FileAccessFactoryRegistry;
-import org.apache.iceberg.data.GenericObjectModels;
 import org.apache.iceberg.data.RandomGenericData;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.data.parquet.GenericParquetReaders;
@@ -43,11 +44,9 @@ import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.DataWriter;
 import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.InputFile;
-import org.apache.iceberg.io.ReadBuilder;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
-import org.apache.iceberg.util.Pair;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -107,7 +106,7 @@ public class MultiThreadedParquetBenchmark {
         java.nio.file.Files.createDirectories(writeDirPath);
       }
     } catch (IOException e) {
-      throw new RuntimeException("Failed to create directories", e);
+      throw new UncheckedIOException("Failed to create directories", e);
     }
   }
 
@@ -150,13 +149,13 @@ public class MultiThreadedParquetBenchmark {
     //   delete(READ_DIR);
   }
 
-  //  private static int counter = 0;
-  //
-  //  @Benchmark
-  //  @Threads(1)
-  //  public void write() throws IOException {
-  //    write(WRITE_DIR + counter++ + "_write_" + multiThreaded + "_");
-  //  }
+  private static int counter = 0;
+
+  @Benchmark
+  @Threads(1)
+  public void write() throws IOException {
+    write(WRITE_DIR + counter++ + "_write_" + multiThreaded + "_");
+  }
 
   @Benchmark
   @Threads(1)
@@ -222,12 +221,12 @@ public class MultiThreadedParquetBenchmark {
         }
       }
     } else {
-      try (FileAppender<Record> writer = writer(prefix)) {
+      try (DataWriter<Record> writer = writer(prefix)) {
         CloseableIterator<Record> iterator = testData().iterator();
         while (iterator.hasNext()) {
           Record record = iterator.next();
           // access something to ensure the compiler doesn't optimize this away
-          writer.add(record);
+          writer.write(record);
           if (record.get(0) != null) {
             val ^= ((Double) record.get(0)).longValue();
           }
@@ -255,42 +254,32 @@ public class MultiThreadedParquetBenchmark {
   }
 
   private CloseableIterable<Record> reader() {
-    List<Pair<InputFile, Integer[]>> files = Lists.newArrayListWithCapacity(familyIds.size());
+    Map<InputFile, List<Integer>> columnSplits = new LinkedHashMap<>();
     for (int i = 0; i < familyIds.size(); ++i) {
       String file = readFileName(i);
-      files.add(Pair.of(Files.localInput(file), familyIds.get(i).toArray(new Integer[] {})));
+      columnSplits.put(Files.localInput(file), familyIds.get(i));
     }
 
     ReadBuilder<Record, ?> builder =
-        FormatModelRegistry.readBuilder(
-            FileFormat.PARQUET, Record.class, files.toArray(new Pair[] {}));
-    return builder
-        .project(testSchema)
-        .set("multi-threaded", Boolean.toString(multiThreaded))
-        .build();
+        FormatModelRegistry.readBuilder(FileFormat.PARQUET, Record.class, columnSplits);
+    return builder.project(testSchema).set(MULTI_THREADED, Boolean.toString(multiThreaded)).build();
   }
 
-  private FileAppender<Record> writer(String prefix) throws IOException {
-    List<Pair<EncryptedOutputFile, Integer[]>> files =
-        Lists.newArrayListWithCapacity(familyIds.size());
+  private DataWriter<Record> writer(String prefix) throws IOException {
+    Map<EncryptedOutputFile, List<Integer>> columnSplits = new LinkedHashMap<>();
     for (int i = 0; i < familyIds.size(); ++i) {
       String file = TEST_DIR + prefix + columns + "_" + families + "_" + i;
-      files.add(
-          Pair.of(
-              EncryptionUtil.plainAsEncryptedOutput(Files.localOutput(file)),
-              familyIds.get(i).toArray(new Integer[] {})));
+      columnSplits.put(
+          EncryptionUtil.plainAsEncryptedOutput(Files.localOutput(file)), familyIds.get(i));
     }
 
-    FileWriterBuilder<DataWriter<Record>, ?, Record> builder =
-        FileAccessFactoryRegistry.writeBuilder(
-            FileFormat.PARQUET,
-            GenericObjectModels.GENERIC_OBJECT_MODEL,
-            files.toArray(new Pair[] {}));
-    if (multiThreaded) {
-      builder = builder.set(MULTI_THREADED, "true");
-    }
-
-    return builder.fileSchema(testSchema).build();
+    FileWriterBuilder<DataWriter<Record>, ?> builder =
+        FormatModelRegistry.dataWriteBuilder(FileFormat.PARQUET, Record.class, columnSplits);
+    return builder
+        .schema(testSchema)
+        .spec(PartitionSpec.unpartitioned())
+        .set(MULTI_THREADED, Boolean.toString(multiThreaded))
+        .build();
   }
 
   private void delete(String path) {

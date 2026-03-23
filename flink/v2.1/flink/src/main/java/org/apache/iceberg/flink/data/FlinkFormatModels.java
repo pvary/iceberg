@@ -35,6 +35,7 @@ public class FlinkFormatModels {
                 FlinkParquetWriters.buildWriter(engineSchema, fileSchema),
             (icebergSchema, fileSchema, engineSchema, idToConstant) ->
                 FlinkParquetReaders.buildReader(icebergSchema, fileSchema, idToConstant),
+            null,
             null));
 
     FormatModelRegistry.register(

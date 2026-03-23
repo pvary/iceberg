@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.data;
 
+import java.util.List;
 import org.apache.iceberg.avro.AvroFormatModel;
 import org.apache.iceberg.data.avro.DataWriter;
 import org.apache.iceberg.data.avro.PlannedDataReader;
@@ -25,6 +26,7 @@ import org.apache.iceberg.data.orc.GenericOrcReader;
 import org.apache.iceberg.data.orc.GenericOrcWriter;
 import org.apache.iceberg.data.parquet.GenericParquetReaders;
 import org.apache.iceberg.data.parquet.GenericParquetWriter;
+import org.apache.iceberg.formats.FormatModel;
 import org.apache.iceberg.formats.FormatModelRegistry;
 import org.apache.iceberg.orc.ORCFormatModel;
 import org.apache.iceberg.parquet.ParquetFormatModel;
@@ -49,7 +51,14 @@ public class GenericFormatModels {
                 GenericParquetWriter.create(icebergSchema, fileSchema),
             (icebergSchema, fileSchema, engineSchema, idToConstant) ->
                 GenericParquetReaders.buildReader(icebergSchema, fileSchema, idToConstant),
-            null));
+            (icebergSchema, families) -> {
+              CombinedRecord record = CombinedRecord.create(icebergSchema, families);
+              return new MyCombiner(record);
+            },
+            (icebergSchema, family) -> {
+              NarrowedRecord record = NarrowedRecord.create(icebergSchema, family);
+              return new MyNarrower(record);
+            }));
 
     FormatModelRegistry.register(ParquetFormatModel.forPositionDeletes());
 
@@ -63,6 +72,39 @@ public class GenericFormatModels {
                 GenericOrcReader.buildReader(icebergSchema, fileSchema, idToConstant)));
 
     FormatModelRegistry.register(ORCFormatModel.forPositionDeletes());
+  }
+
+  private static class MyNarrower implements FormatModel.Narrower<Record> {
+    private final NarrowedRecord record;
+
+    MyNarrower(NarrowedRecord record) {
+      this.record = record;
+    }
+
+    @Override
+    public Record narrow(Record wrappedRecord) {
+      record.set(wrappedRecord);
+
+      return record;
+    }
+  }
+
+  private static class MyCombiner implements FormatModel.Combiner<Record> {
+    private final CombinedRecord template;
+
+    MyCombiner(CombinedRecord template) {
+      this.template = template;
+    }
+
+    @Override
+    public Record combine(List<Record> records) {
+      CombinedRecord clonedRecord = CombinedRecord.clone(template);
+      for (int i = 0; i < records.size(); i++) {
+        clonedRecord.setFamily(i, records.get(i));
+      }
+
+      return clonedRecord;
+    }
   }
 
   private GenericFormatModels() {}

@@ -19,24 +19,37 @@
 package org.apache.iceberg.formats;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiFunction;
+import java.util.stream.Collectors;
 import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.Metrics;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.exceptions.RuntimeIOException;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.CloseableIterator;
+import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.SkippingCloseableIterator;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
+import org.apache.iceberg.relocated.com.google.common.collect.Queues;
+import org.apache.iceberg.util.Pair;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Interface that provides a unified abstraction for converting between data file formats and
@@ -56,6 +69,11 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
  * @param <S> the type of the schema for the input/output data
  */
 public interface FormatModel<D, S> {
+  Logger LOG = LoggerFactory.getLogger(FormatModel.class);
+
+  /** Property key to enable multi-threaded reading and writing for column splits. */
+  String MULTI_THREADED = "multi-threaded";
+
   /** The file format which is read/written by the object model. */
   FileFormat format();
 
@@ -109,7 +127,15 @@ public interface FormatModel<D, S> {
     E combine(List<E> elements);
   }
 
+  interface Narrower<E> {
+    E narrow(E elements);
+  }
+
   default BiFunction<Schema, Integer[][], Combiner<D>> combiner() {
+    throw new UnsupportedOperationException("Not implemented");
+  }
+
+  default BiFunction<Schema, Integer[], Narrower<D>> narrower() {
     throw new UnsupportedOperationException("Not implemented");
   }
 
@@ -384,7 +410,7 @@ public interface FormatModel<D, S> {
     private final List<SkippingCloseableIterator<E>> iterators;
     private final Combiner<E> combiner;
     private final ExecutorService executorService;
-    private final List<ArrayBlockingQueue<Batch<E>>> buffers;
+    private final List<BlockingQueue<Batch<E>>> buffers;
     private final List<E> elements;
 
     /** Shared target position: producers skip elements below this position. */
@@ -418,7 +444,7 @@ public interface FormatModel<D, S> {
 
       for (int i = 0; i < size; ++i) {
         elements.add(null);
-        buffers.add(new ArrayBlockingQueue<>(QUEUE_CAPACITY));
+        buffers.add(Queues.newArrayBlockingQueue(QUEUE_CAPACITY));
       }
     }
 
@@ -432,7 +458,7 @@ public interface FormatModel<D, S> {
 
       for (int i = 0; i < iterators.size(); i++) {
         final SkippingCloseableIterator<E> iterator = iterators.get(i);
-        final ArrayBlockingQueue<Batch<E>> buffer = buffers.get(i);
+        final BlockingQueue<Batch<E>> buffer = buffers.get(i);
         executorService.execute(
             () -> {
               try {
@@ -502,20 +528,20 @@ public interface FormatModel<D, S> {
      * batch from the queue if the current one is exhausted. As a side effect, the element value is
      * stored in {@code elements.get(i)} for later use by the combiner.
      *
-     * @param i the producer index
+     * @param producerIndex the producer index
      * @return the element's position, or {@code -1} if the producer has finished
      * @throws InterruptedException if interrupted while waiting for a batch
      */
-    private long nextFromProducer(int i) throws InterruptedException {
+    private long nextFromProducer(int producerIndex) throws InterruptedException {
       while (true) {
-        Batch<E> batch = currentBatches[i];
+        Batch<E> batch = currentBatches[producerIndex];
         // If we have a current batch with remaining elements, use it
         if (batch != null && batch.hasRemaining()) {
           long pos = batch.position();
 
           // Skip stale elements
           if (pos > targetPosition.get()) {
-            elements.set(i, batch.value());
+            elements.set(producerIndex, batch.value());
             batch.advance();
             return pos;
           }
@@ -525,12 +551,12 @@ public interface FormatModel<D, S> {
         }
 
         // Need a new batch
-        Batch<E> newBatch = buffers.get(i).take();
+        Batch<E> newBatch = buffers.get(producerIndex).take();
         if (newBatch.isSentinel()) {
           return -1;
         }
 
-        currentBatches[i] = newBatch;
+        currentBatches[producerIndex] = newBatch;
       }
     }
 
@@ -625,6 +651,268 @@ public interface FormatModel<D, S> {
     public void close() throws IOException {
       closed = true;
       executorService.shutdownNow();
+    }
+  }
+
+  static <E> FileAppender<E> narrower(
+      List<Pair<FileAppender<E>, Narrower<E>>> appenders, boolean multiThreaded) {
+    return multiThreaded
+        ? new MultiThreadedFileAppender<>(appenders)
+        : new SingleThreadedFileAppender<>(appenders);
+  }
+
+  /**
+   * Base class for narrowing {@link FileAppender} implementations that holds the shared appender
+   * list and provides common {@link #metrics()}, {@link #length()}, and {@link #close()} logic.
+   *
+   * <p>Subclasses only need to implement {@link #add(Object)} and {@link #toString()}. If a
+   * subclass needs additional close logic, it should override {@link #close()} and call {@code
+   * super.close()} to close the underlying appenders.
+   */
+  abstract class AbstractNarrowingFileAppender<X> implements FileAppender<X> {
+    private final List<Pair<FileAppender<X>, Narrower<X>>> appenders;
+
+    protected AbstractNarrowingFileAppender(List<Pair<FileAppender<X>, Narrower<X>>> appenders) {
+      this.appenders = appenders;
+    }
+
+    protected List<Pair<FileAppender<X>, Narrower<X>>> appenders() {
+      return appenders;
+    }
+
+    @Override
+    public Metrics metrics() {
+      Long rowCount = null;
+      Map<Integer, Long> columnSizes = Maps.newHashMap();
+      Map<Integer, Long> valueCounts = Maps.newHashMap();
+      Map<Integer, Long> nullValueCounts = Maps.newHashMap();
+      Map<Integer, Long> nanValueCounts = Maps.newHashMap();
+      Map<Integer, ByteBuffer> lowerBounds = Maps.newHashMap();
+      Map<Integer, ByteBuffer> upperBounds = Maps.newHashMap();
+
+      for (Pair<FileAppender<X>, Narrower<X>> pair : appenders) {
+        Metrics metrics = pair.first().metrics();
+        if (metrics.recordCount() != null) {
+          if (rowCount == null) {
+            rowCount = metrics.recordCount();
+          } else {
+            Preconditions.checkState(
+                rowCount.equals(metrics.recordCount()),
+                "Record count mismatch across column split appenders: expected %s but got %s",
+                rowCount,
+                metrics.recordCount());
+          }
+        }
+
+        if (metrics.columnSizes() != null) {
+          columnSizes.putAll(metrics.columnSizes());
+        }
+
+        if (metrics.valueCounts() != null) {
+          valueCounts.putAll(metrics.valueCounts());
+        }
+
+        if (metrics.nullValueCounts() != null) {
+          nullValueCounts.putAll(metrics.nullValueCounts());
+        }
+
+        if (metrics.nanValueCounts() != null) {
+          nanValueCounts.putAll(metrics.nanValueCounts());
+        }
+
+        if (metrics.lowerBounds() != null) {
+          lowerBounds.putAll(metrics.lowerBounds());
+        }
+
+        if (metrics.upperBounds() != null) {
+          upperBounds.putAll(metrics.upperBounds());
+        }
+      }
+
+      return new Metrics(
+          rowCount,
+          columnSizes,
+          valueCounts,
+          nullValueCounts,
+          nanValueCounts,
+          lowerBounds,
+          upperBounds);
+    }
+
+    @Override
+    public long length() {
+      return appenders.stream().mapToLong(pair -> pair.first().length()).sum();
+    }
+
+    @Override
+    public void close() throws IOException {
+      for (Pair<FileAppender<X>, Narrower<X>> pair : appenders) {
+        pair.first().close();
+      }
+    }
+  }
+
+  /**
+   * A single-threaded {@link FileAppender} that narrows each record using per-writer {@link
+   * Narrower}s and delegates the narrowed record to the corresponding underlying appender.
+   */
+  class SingleThreadedFileAppender<X> extends AbstractNarrowingFileAppender<X> {
+
+    private SingleThreadedFileAppender(List<Pair<FileAppender<X>, Narrower<X>>> appenders) {
+      super(appenders);
+    }
+
+    @Override
+    public void add(X record) {
+      appenders().forEach(pair -> pair.first().add(pair.second().narrow(record)));
+    }
+
+    @Override
+    public String toString() {
+      return "SingleThreadedFileAppender{" + "appenders=" + appenders() + '}';
+    }
+  }
+
+  /**
+   * A multi-threaded {@link FileAppender} that narrows each record using per-writer {@link
+   * Narrower}s and delegates the narrowed record to the corresponding underlying appender.
+   *
+   * <p>Each underlying appender runs in its own thread. The producer ({@link #add}) collects
+   * records into fixed-size batches and puts each full batch into every consumer's queue as a
+   * single operation. Consumers take one batch at a time, apply the narrower, and write every
+   * element to the appender without touching the queue.
+   *
+   * <p>This amortizes per-record synchronization: instead of N queue operations per record (one
+   * {@code put()} per consumer), the cost is N queue operations per <em>batch</em>, reducing lock
+   * acquisitions by a factor of {@link #BATCH_SIZE}.
+   */
+  class MultiThreadedFileAppender<X> extends AbstractNarrowingFileAppender<X> {
+    /**
+     * Number of elements per batch. Each queue {@code put()}/{@code take()} transfers this many
+     * elements, reducing lock acquisitions by this factor compared to per-element queuing.
+     */
+    private static final int BATCH_SIZE = 1024;
+
+    /**
+     * Number of batches each queue can hold. Total buffered elements = BATCH_SIZE * QUEUE_CAPACITY.
+     */
+    private static final int QUEUE_CAPACITY = 16;
+
+    private final ExecutorService executorService;
+    private final List<BlockingQueue<X[]>> queues;
+    private final CountDownLatch finished;
+    private final AtomicReference<Throwable> consumerError = new AtomicReference<>(null);
+    private boolean started = false;
+    private X[] currentBatch = newBatch();
+    private int batchOffset = 0;
+
+    private MultiThreadedFileAppender(List<Pair<FileAppender<X>, Narrower<X>>> appenders) {
+      super(appenders);
+      this.executorService = Executors.newFixedThreadPool(appenders().size());
+      this.queues =
+          appenders().stream()
+              .map(i -> Queues.<X[]>newArrayBlockingQueue(QUEUE_CAPACITY))
+              .collect(Collectors.toList());
+      this.finished = new CountDownLatch(appenders().size());
+    }
+
+    private void startConsumers() {
+      started = true;
+      for (int i = 0; i < appenders().size(); i++) {
+        final BlockingQueue<X[]> queue = queues.get(i);
+        final FileAppender<X> appender = appenders().get(i).first();
+        final Narrower<X> narrower = appenders().get(i).second();
+        final int index = i;
+        executorService.execute(
+            () -> {
+              try {
+                while (true) {
+                  for (X element : queue.take()) {
+                    if (element == null) {
+                      // end of data in this batch
+                      return;
+                    }
+
+                    appender.add(narrower.narrow(element));
+                  }
+                }
+              } catch (Exception e) {
+                consumerError.compareAndSet(null, e);
+                LOG.error("Error processing records in appender {}", index, e);
+              } finally {
+                finished.countDown();
+              }
+            });
+      }
+    }
+
+    @Override
+    public void add(X record) {
+      if (!started) {
+        startConsumers();
+      }
+
+      checkConsumerError();
+
+      currentBatch[batchOffset++] = record;
+      if (batchOffset == BATCH_SIZE) {
+        flushBatch();
+      }
+    }
+
+    private void flushBatch() {
+      // Place a null sentinel at the end of a partial batch so consumers know where data ends
+      if (batchOffset < BATCH_SIZE) {
+        currentBatch[batchOffset] = null;
+      }
+
+      queues.forEach(
+          q -> {
+            try {
+              q.put(currentBatch);
+            } catch (InterruptedException e) {
+              Thread.currentThread().interrupt();
+              throw new RuntimeException(e);
+            }
+          });
+      currentBatch = newBatch();
+      batchOffset = 0;
+    }
+
+    @SuppressWarnings("unchecked")
+    private X[] newBatch() {
+      return (X[]) new Object[BATCH_SIZE];
+    }
+
+    private void checkConsumerError() {
+      Throwable error = consumerError.get();
+      if (error != null) {
+        throw new RuntimeException("Consumer thread failed", error);
+      }
+    }
+
+    @Override
+    public void close() throws IOException {
+      if (started) {
+        flushBatch();
+
+        try {
+          finished.await();
+        } catch (InterruptedException e) {
+          Thread.currentThread().interrupt();
+          throw new IOException("Interrupted while waiting for appender to finish", e);
+        }
+
+        checkConsumerError();
+      }
+
+      super.close();
+      executorService.shutdown();
+    }
+
+    @Override
+    public String toString() {
+      return "MultiThreadedFileAppender{" + "appenders=" + appenders() + '}';
     }
   }
 }
