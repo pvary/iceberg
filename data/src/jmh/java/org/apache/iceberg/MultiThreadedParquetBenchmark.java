@@ -18,7 +18,9 @@
  */
 package org.apache.iceberg;
 
+import static org.apache.iceberg.formats.FormatModel.BATCH_SIZE;
 import static org.apache.iceberg.formats.FormatModel.MULTI_THREADED;
+import static org.apache.iceberg.formats.FormatModel.QUEUE_CAPACITY;
 import static org.apache.iceberg.types.Types.NestedField.optional;
 
 import java.io.File;
@@ -72,7 +74,7 @@ public class MultiThreadedParquetBenchmark {
   private static final Logger LOG = LoggerFactory.getLogger(MultiThreadedParquetBenchmark.class);
 
   private static final int SEED = -2;
-  private static final int BATCH_SIZE = 10000;
+  private static final int TEST_BATCH_SIZE = 10000;
   private static final int DATA_SIZE = 100_000_000;
   private static final String TEST_DIR =
       "/Users/petervary/iceberg-generic-parquet-reader-benchmark/";
@@ -91,6 +93,12 @@ public class MultiThreadedParquetBenchmark {
 
   @Param({"true", "false"})
   private boolean multiThreaded;
+
+  @Param({"128", "256", "512", "1024", "2048", "4096", "8192"})
+  private int batchSize;
+
+  @Param({"2", "4", "8"})
+  private int queueCapacity;
 
   {
     // Only delete the write directory to avoid deleting the read/source directory and losing the
@@ -262,7 +270,12 @@ public class MultiThreadedParquetBenchmark {
 
     ReadBuilder<Record, ?> builder =
         FormatModelRegistry.readBuilder(FileFormat.PARQUET, Record.class, columnSplits);
-    return builder.project(testSchema).set(MULTI_THREADED, Boolean.toString(multiThreaded)).build();
+    return builder
+        .project(testSchema)
+        .set(MULTI_THREADED, Boolean.toString(multiThreaded))
+        .set(QUEUE_CAPACITY, String.valueOf(queueCapacity))
+        .set(BATCH_SIZE, String.valueOf(batchSize))
+        .build();
   }
 
   private DataWriter<Record> writer(String prefix) throws IOException {
@@ -279,6 +292,8 @@ public class MultiThreadedParquetBenchmark {
         .schema(testSchema)
         .spec(PartitionSpec.unpartitioned())
         .set(MULTI_THREADED, Boolean.toString(multiThreaded))
+        .set(QUEUE_CAPACITY, String.valueOf(queueCapacity))
+        .set(BATCH_SIZE, String.valueOf(batchSize))
         .build();
   }
 
@@ -300,8 +315,8 @@ public class MultiThreadedParquetBenchmark {
               .schema(testSchema)
               .createWriterFunc(GenericParquetWriter::create)
               .build()) {
-        for (int i = 0; i < testDataSize; i += BATCH_SIZE) {
-          writer.addAll(RandomGenericData.generate(testSchema, BATCH_SIZE, SEED + i));
+        for (int i = 0; i < testDataSize; i += TEST_BATCH_SIZE) {
+          writer.addAll(RandomGenericData.generate(testSchema, TEST_BATCH_SIZE, SEED + i));
           System.err.println("Status: " + i);
         }
       }
