@@ -18,6 +18,8 @@
  */
 package org.apache.iceberg.formats;
 
+import static org.apache.iceberg.formats.FormatModel.DEFAULT_BATCH_SIZE;
+import static org.apache.iceberg.formats.FormatModel.DEFAULT_QUEUE_CAPACITY;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -32,7 +34,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
-class TestCombiningReadIterator {
+class TestColumnSplitReadBuilder {
 
   /**
    * A test SkippingCloseableIterator backed by an array. Follows the same position convention as
@@ -70,13 +72,14 @@ class TestCombiningReadIterator {
       if (!hasNext()) {
         throw new NoSuchElementException();
       }
+
       Integer value = values[(int) pos];
       pos++;
       return value;
     }
 
     @Override
-    public void close() throws IOException {
+    public void close() {
       closed = true;
     }
 
@@ -123,6 +126,7 @@ class TestCombiningReadIterator {
       while (nextPos < values.length && skipped[(int) nextPos]) {
         nextPos++;
       }
+
       return nextPos < values.length;
     }
 
@@ -132,21 +136,23 @@ class TestCombiningReadIterator {
       while (pos < values.length && skipped[(int) pos]) {
         pos++;
       }
+
       if (pos >= values.length) {
         throw new NoSuchElementException();
       }
+
       Integer value = values[(int) pos];
       pos++;
       return value;
     }
 
     @Override
-    public void close() throws IOException {}
+    public void close() {}
   }
 
   /** Wraps a TestSkippingIterator into a CloseableIterable for use with FormatModel.combiner. */
   private static CloseableIterable<Integer> iterableOf(SkippingCloseableIterator<Integer> iter) {
-    return new CloseableIterable<Integer>() {
+    return new CloseableIterable<>() {
       @Override
       public CloseableIterator<Integer> iterator() {
         return iter;
@@ -179,8 +185,12 @@ class TestCombiningReadIterator {
     TestSkippingIterator iter2 = new TestSkippingIterator(1, 2, 3);
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(
-            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)), SUM_COMBINER, multiThreaded)) {
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            SUM_COMBINER,
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
       assertThat(collected).containsExactly(11, 22, 33);
     }
@@ -192,7 +202,12 @@ class TestCombiningReadIterator {
     TestSkippingIterator iter = new TestSkippingIterator(5, 10, 15);
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(ImmutableList.of(iterableOf(iter)), FIRST_COMBINER, multiThreaded)) {
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter)),
+            FIRST_COMBINER,
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
       assertThat(collected).containsExactly(5, 10, 15);
     }
@@ -205,8 +220,12 @@ class TestCombiningReadIterator {
     TestSkippingIterator iter2 = new TestSkippingIterator();
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(
-            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)), SUM_COMBINER, multiThreaded)) {
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            SUM_COMBINER,
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       CloseableIterator<Integer> iterator = result.iterator();
       assertThat(iterator.hasNext()).isFalse();
     }
@@ -219,7 +238,12 @@ class TestCombiningReadIterator {
     TestSkippingIterator iter = new TestSkippingIterator(1);
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(ImmutableList.of(iterableOf(iter)), FIRST_COMBINER, multiThreaded)) {
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter)),
+            FIRST_COMBINER,
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       CloseableIterator<Integer> iterator = result.iterator();
       assertThat(iterator.next()).isEqualTo(1);
       assertThat(iterator.hasNext()).isFalse();
@@ -236,8 +260,12 @@ class TestCombiningReadIterator {
     TestSkippingIterator iter2 = new TestSkippingIterator(1, 2, 3, 4);
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(
-            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)), SUM_COMBINER, multiThreaded)) {
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            SUM_COMBINER,
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
       // Position 0 is skipped by iter1, so the first combined result should be at position 1
       // iter1 at pos 1 = 20, iter2 at pos 1 = 2 => 22
@@ -256,8 +284,12 @@ class TestCombiningReadIterator {
     SkippingTestIterator iter2 = new SkippingTestIterator(new Integer[] {1, 2, 3, 4}, 0);
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(
-            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)), SUM_COMBINER, multiThreaded)) {
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            SUM_COMBINER,
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
       // iter1 reads pos 0 = 10, iter2 skips to pos 1 = 2 => realign
       // After realign: iter1 skips to pos 1 and reads pos 1 = 20, iter2 reads pos 1...
@@ -277,8 +309,12 @@ class TestCombiningReadIterator {
     SkippingTestIterator iter2 = new SkippingTestIterator(new Integer[] {1, 2, 3, 4, 5}, 0);
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(
-            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)), SUM_COMBINER, multiThreaded)) {
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            SUM_COMBINER,
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
       // Both skip pos 0, iter1 also skips pos 1. Aligned at pos 2.
       // pos 2: 30+3=33, pos 3: 40+4=44, pos 4: 50+5=55
@@ -294,10 +330,12 @@ class TestCombiningReadIterator {
     TestSkippingIterator iter3 = new TestSkippingIterator(100, 200, 300);
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(
+        ColumnSplitReadBuilder.combiner(
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2), iterableOf(iter3)),
             SUM_COMBINER,
-            multiThreaded)) {
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
       assertThat(collected).containsExactly(111, 222, 333);
     }
@@ -310,8 +348,12 @@ class TestCombiningReadIterator {
     TestSkippingIterator iter2 = new TestSkippingIterator(3, 4);
 
     CloseableIterable<Integer> result =
-        FormatModel.combiner(
-            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)), SUM_COMBINER, multiThreaded);
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            SUM_COMBINER,
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY);
 
     CloseableIterator<Integer> iterator = result.iterator();
     assertThat(iterator.hasNext()).isTrue();
@@ -328,8 +370,12 @@ class TestCombiningReadIterator {
     TestSkippingIterator iter2 = new TestSkippingIterator(10, 20);
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(
-            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)), SUM_COMBINER, multiThreaded)) {
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            SUM_COMBINER,
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
       // Should stop when the shorter iterator is exhausted
       assertThat(collected).containsExactly(11, 22);
@@ -344,8 +390,12 @@ class TestCombiningReadIterator {
     TestSkippingIterator iter2 = new TestSkippingIterator(1, 2, 3, 4);
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(
-            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)), SUM_COMBINER, multiThreaded)) {
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            SUM_COMBINER,
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
       // pos 0: iter1=10, iter2=1 => 11
       // pos 1: iter1 skips to pos 2 (=30), iter2 needs to realign to pos 2 (=3) => 33
@@ -388,7 +438,7 @@ class TestCombiningReadIterator {
     }
 
     @Override
-    public void close() throws IOException {
+    public void close() {
       delegate.close();
     }
 
@@ -411,10 +461,12 @@ class TestCombiningReadIterator {
     TestSkippingIterator iter3 = new TestSkippingIterator(100, 200, 300, 400);
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(
+        ColumnSplitReadBuilder.combiner(
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2), iterableOf(iter3)),
             SUM_COMBINER,
-            multiThreaded)) {
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
       // Position 0 is skipped by iter2, so alignment starts at position 1.
       // pos 1: iter1=20, iter2=2, iter3=200 => 222
@@ -441,8 +493,12 @@ class TestCombiningReadIterator {
     TestSkippingIterator iter2 = new TestSkippingIterator(1, 2, 3);
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(
-            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)), SUM_COMBINER, multiThreaded)) {
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            SUM_COMBINER,
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       CloseableIterator<Integer> iterator = result.iterator();
 
       // Call hasNext() multiple times — it must be idempotent and not advance state
@@ -469,8 +525,12 @@ class TestCombiningReadIterator {
     TestSkippingIterator iter2 = new TestSkippingIterator(1, 2);
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(
-            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)), SUM_COMBINER, multiThreaded)) {
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            SUM_COMBINER,
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       CloseableIterator<Integer> iterator = result.iterator();
 
       // iter1's first element is at position 3, but iter2 only has positions 0-1.
@@ -487,8 +547,12 @@ class TestCombiningReadIterator {
     SkippingTestIterator iter2 = new SkippingTestIterator(new Integer[] {1, 2, 3, 4, 5}, 2);
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(
-            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)), SUM_COMBINER, multiThreaded)) {
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            SUM_COMBINER,
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       CloseableIterator<Integer> iterator = result.iterator();
 
       // pos 0: 10+1=11, pos 1: 20+2=22, then iter2 skips pos 2, realign to pos 3: 40+4=44,
@@ -520,8 +584,12 @@ class TestCombiningReadIterator {
     TestSkippingIterator iter2 = new TestSkippingIterator(1, 2, 3);
 
     try (CloseableIterable<Integer> result =
-        FormatModel.combiner(
-            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)), SUM_COMBINER, multiThreaded)) {
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            SUM_COMBINER,
+            multiThreaded,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
       CloseableIterator<Integer> iterator = result.iterator();
 
       // Just check hasNext — the tryAdvance pattern should compute the result and cache it,

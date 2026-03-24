@@ -28,6 +28,7 @@ import org.apache.iceberg.FileContent;
 import org.apache.iceberg.MetricsConfig;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.io.FileAppender;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.util.Pair;
 
@@ -36,6 +37,8 @@ class ColumnSplitWriteBuilder<X, T> implements ModelWriteBuilder<X, T> {
   private final BiFunction<Schema, Integer[], FormatModel.Narrower<X>> narrowerBuilder;
   private Schema schema;
   private boolean multiThreaded = false;
+  private int batchSize = FormatModel.DEFAULT_BATCH_SIZE;
+  private int queueCapacity = FormatModel.DEFAULT_QUEUE_CAPACITY;
 
   ColumnSplitWriteBuilder(
       Map<ModelWriteBuilder<X, T>, List<Integer>> writeBuilders,
@@ -66,6 +69,10 @@ class ColumnSplitWriteBuilder<X, T> implements ModelWriteBuilder<X, T> {
   public ColumnSplitWriteBuilder<X, T> set(String property, String value) {
     if (FormatModel.MULTI_THREADED.equals(property)) {
       this.multiThreaded = Boolean.parseBoolean(value);
+    } else if (FormatModel.BATCH_SIZE.equals(property)) {
+      this.batchSize = Integer.parseInt(value);
+    } else if (FormatModel.QUEUE_CAPACITY.equals(property)) {
+      this.queueCapacity = Integer.parseInt(value);
     }
 
     writeBuilders.keySet().forEach(builder -> builder.set(property, value));
@@ -117,6 +124,17 @@ class ColumnSplitWriteBuilder<X, T> implements ModelWriteBuilder<X, T> {
       appenders.add(Pair.of(entry.getKey().build(), narrowerBuilder.apply(schema, columnIds)));
     }
 
-    return FormatModel.narrower(appenders, multiThreaded);
+    return narrower(appenders, multiThreaded, batchSize, queueCapacity);
+  }
+
+  @VisibleForTesting
+  static <E> FileAppender<E> narrower(
+      List<Pair<FileAppender<E>, FormatModel.Narrower<E>>> appenders,
+      boolean multiThreaded,
+      int batchSize,
+      int queueCapacity) {
+    return multiThreaded
+        ? new MultiThreadedFileAppender<>(appenders, batchSize, queueCapacity)
+        : new SingleThreadedFileAppender<>(appenders);
   }
 }

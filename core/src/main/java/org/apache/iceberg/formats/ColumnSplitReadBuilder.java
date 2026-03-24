@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.formats;
 
+import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -28,7 +29,10 @@ import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.CloseableIterator;
+import org.apache.iceberg.io.SkippingCloseableIterator;
 import org.apache.iceberg.mapping.NameMapping;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
 import org.apache.iceberg.types.Types;
 
 class ColumnSplitReadBuilder<X, T> implements ReadBuilder<X, T> {
@@ -36,6 +40,8 @@ class ColumnSplitReadBuilder<X, T> implements ReadBuilder<X, T> {
   private final BiFunction<Schema, Integer[][], FormatModel.Combiner<X>> combinerBuilder;
   private Schema schema;
   private boolean multiThreaded = false;
+  private int batchSize = FormatModel.DEFAULT_BATCH_SIZE;
+  private int queueCapacity = FormatModel.DEFAULT_QUEUE_CAPACITY;
 
   ColumnSplitReadBuilder(
       Map<ReadBuilder<X, ?>, List<Integer>> readBuilders,
@@ -108,6 +114,10 @@ class ColumnSplitReadBuilder<X, T> implements ReadBuilder<X, T> {
   public ReadBuilder<X, T> set(String key, String value) {
     if (FormatModel.MULTI_THREADED.equals(key)) {
       this.multiThreaded = Boolean.parseBoolean(value);
+    } else if (FormatModel.BATCH_SIZE.equals(key)) {
+      this.batchSize = Integer.parseInt(value);
+    } else if (FormatModel.QUEUE_CAPACITY.equals(key)) {
+      this.queueCapacity = Integer.parseInt(value);
     }
 
     readBuilders.keySet().forEach(r -> r.set(key, value));
@@ -146,9 +156,45 @@ class ColumnSplitReadBuilder<X, T> implements ReadBuilder<X, T> {
             readBuilders.values().stream()
                 .map(list -> list.toArray(new Integer[0]))
                 .toArray(Integer[][]::new));
-    return FormatModel.combiner(
+    return combiner(
         readBuilders.keySet().stream().map(ReadBuilder::build).collect(Collectors.toList()),
         combiner,
-        multiThreaded);
+        multiThreaded,
+        batchSize,
+        queueCapacity);
+  }
+
+  @VisibleForTesting
+  static <E> CloseableIterable<E> combiner(
+      Collection<CloseableIterable<E>> iterable,
+      FormatModel.Combiner<E> combiner,
+      boolean multiThreaded,
+      int batchSize,
+      int queueCapacity) {
+    List<SkippingCloseableIterator<E>> iterators =
+        iterable.stream()
+            .map(
+                ci -> {
+                  CloseableIterator<E> iterator = ci.iterator();
+                  if (iterator instanceof SkippingCloseableIterator<E>) {
+                    return (SkippingCloseableIterator<E>) iterator;
+                  } else {
+                    return SkippingCloseableIterator.wrap(iterator);
+                  }
+                })
+            .toList();
+    CloseableIterator<E> combined =
+        multiThreaded
+            ? new MultiThreadedCombiningReadIterator<>(
+                iterators, combiner, batchSize, queueCapacity)
+            : new SingleThreadedCombiningReadIterator<>(iterators, combiner);
+    return CloseableIterable.combine(
+        () -> combined,
+        () -> {
+          combined.close();
+          for (CloseableIterable<E> inner : iterable) {
+            inner.close();
+          }
+        });
   }
 }
