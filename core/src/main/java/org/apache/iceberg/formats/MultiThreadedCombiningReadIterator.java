@@ -115,7 +115,7 @@ class MultiThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
    * objects and puts them into its dedicated queue. Producers check the shared {@code
    * targetPosition} before each read to skip ahead when the consumer detects a position gap.
    */
-  @SuppressWarnings("cyclomaticcomplexity")
+  @SuppressWarnings("CyclomaticComplexity")
   private void startFetching() {
     fetching = true;
 

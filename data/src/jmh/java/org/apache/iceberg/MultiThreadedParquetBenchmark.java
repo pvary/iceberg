@@ -18,9 +18,6 @@
  */
 package org.apache.iceberg;
 
-import static org.apache.iceberg.formats.FormatModel.BATCH_SIZE;
-import static org.apache.iceberg.formats.FormatModel.MULTI_THREADED;
-import static org.apache.iceberg.formats.FormatModel.QUEUE_CAPACITY;
 import static org.apache.iceberg.types.Types.NestedField.optional;
 
 import java.io.File;
@@ -39,6 +36,7 @@ import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.encryption.EncryptedOutputFile;
 import org.apache.iceberg.encryption.EncryptionUtil;
 import org.apache.iceberg.formats.FileWriterBuilder;
+import org.apache.iceberg.formats.FormatModel;
 import org.apache.iceberg.formats.FormatModelRegistry;
 import org.apache.iceberg.formats.ReadBuilder;
 import org.apache.iceberg.io.CloseableIterable;
@@ -94,16 +92,16 @@ public class MultiThreadedParquetBenchmark {
   @Param({"true", "false"})
   private boolean multiThreaded;
 
-  @Param({"128"})
+  @Param("128")
   private int batchSize;
 
-  @Param({"4"})
+  @Param("4")
   private int queueCapacity;
 
-  @Param({"false"})
+  @Param("false")
   private boolean fullFileRead;
 
-  @Param({"true"})
+  @Param("true")
   private boolean reuseContainers;
 
   {
@@ -126,19 +124,19 @@ public class MultiThreadedParquetBenchmark {
 
   @Setup(Level.Trial)
   public void setupBenchmark() throws IOException {
-    System.err.println(
-        "Run: "
-            + columns
-            + ", F: "
-            + families
-            + ", MT: "
-            + multiThreaded
-            + ", BS: "
-            + batchSize
-            + ", QC: "
-            + queueCapacity
-            + ", FFR: "
-            + fullFileRead);
+    /* System.err.println(
+    "Run: "
+        + columns
+        + ", F: "
+        + families
+        + ", MT: "
+        + multiThreaded
+        + ", BS: "
+        + batchSize
+        + ", QC: "
+        + queueCapacity
+        + ", FFR: "
+        + fullFileRead);*/
 
     List<Types.NestedField> fieldList = Lists.newArrayListWithCapacity(columns);
     familyIds = Lists.newArrayListWithCapacity(families);
@@ -323,9 +321,9 @@ public class MultiThreadedParquetBenchmark {
 
     return builder
         .project(testSchema)
-        .set(MULTI_THREADED, Boolean.toString(multiThreaded))
-        .set(QUEUE_CAPACITY, String.valueOf(queueCapacity))
-        .set(BATCH_SIZE, String.valueOf(batchSize))
+        .set(FormatModel.MULTI_THREADED, Boolean.toString(multiThreaded))
+        .set(FormatModel.QUEUE_CAPACITY, String.valueOf(queueCapacity))
+        .set(FormatModel.BATCH_SIZE, String.valueOf(batchSize))
         .build();
   }
 
@@ -342,9 +340,9 @@ public class MultiThreadedParquetBenchmark {
     return builder
         .schema(testSchema)
         .spec(PartitionSpec.unpartitioned())
-        .set(MULTI_THREADED, Boolean.toString(multiThreaded))
-        .set(QUEUE_CAPACITY, String.valueOf(queueCapacity))
-        .set(BATCH_SIZE, String.valueOf(batchSize))
+        .set(FormatModel.MULTI_THREADED, Boolean.toString(multiThreaded))
+        .set(FormatModel.QUEUE_CAPACITY, String.valueOf(queueCapacity))
+        .set(FormatModel.BATCH_SIZE, String.valueOf(batchSize))
         .build();
   }
 
@@ -360,7 +358,7 @@ public class MultiThreadedParquetBenchmark {
   private void initSourceRecords() throws IOException {
     String file = TEST_DIR + SOURCE + "_" + columns + "_" + testDataSize;
     if (!Files.localInput(file).exists()) {
-      System.err.println("New writer source file: " + file);
+      // System.err.println("New writer source file: " + file);
       try (FileAppender<Record> writer =
           Parquet.write(Files.localOutput(file))
               .schema(testSchema)
@@ -368,19 +366,19 @@ public class MultiThreadedParquetBenchmark {
               .build()) {
         for (int i = 0; i < testDataSize; i += TEST_BATCH_SIZE) {
           writer.addAll(RandomGenericData.generate(testSchema, TEST_BATCH_SIZE, SEED + i));
-          System.err.println("Status: " + i);
+          // System.err.println("Status: " + i);
         }
       }
-      System.err.println("New writer source file created: " + file);
-    } else {
-      System.err.println("Writer source file already exists: " + file);
-    }
+      // System.err.println("New writer source file created: " + file);
+    } /* else {
+        System.err.println("Writer source file already exists: " + file);
+      }*/
   }
 
   private void initReaderRecords() throws IOException {
     String file1 = readFileName(0);
     if (!Files.localInput(file1).exists()) {
-      System.err.println("Generating new file for readers: " + file1);
+      // System.err.println("Generating new file for readers: " + file1);
       write(READ_DIR);
     }
   }
@@ -389,7 +387,7 @@ public class MultiThreadedParquetBenchmark {
     private final CloseableIterator<Record> iterator;
     private int remaining;
 
-    public LimitedIterator(CloseableIterator<Record> iterator, int limit) {
+    LimitedIterator(CloseableIterator<Record> iterator, int limit) {
       this.iterator = iterator;
       this.remaining = limit;
     }

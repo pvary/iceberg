@@ -18,9 +18,6 @@
  */
 package org.apache.iceberg;
 
-import static org.apache.iceberg.formats.FormatModel.BATCH_SIZE;
-import static org.apache.iceberg.formats.FormatModel.MULTI_THREADED;
-import static org.apache.iceberg.formats.FormatModel.QUEUE_CAPACITY;
 import static org.apache.iceberg.types.Types.NestedField.optional;
 
 import java.io.IOException;
@@ -32,6 +29,7 @@ import java.util.Map;
 import org.apache.iceberg.data.RandomGenericData;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.data.parquet.GenericParquetWriter;
+import org.apache.iceberg.formats.FormatModel;
 import org.apache.iceberg.formats.FormatModelRegistry;
 import org.apache.iceberg.formats.ReadBuilder;
 import org.apache.iceberg.io.CloseableIterable;
@@ -94,10 +92,10 @@ public class ColumnUpdateParquetBenchmark {
   @Param({"true", "false"})
   private boolean multiThreaded;
 
-  @Param({"128"})
+  @Param("128")
   private int batchSize;
 
-  @Param({"4"})
+  @Param("4")
   private int queueCapacity;
 
   {
@@ -127,18 +125,18 @@ public class ColumnUpdateParquetBenchmark {
 
   @Setup(Level.Trial)
   public void setupBenchmark() throws IOException {
-    System.err.println(
-        "Setup: updatedColumns="
-            + updatedColumns
-            + ", MT="
-            + multiThreaded
-            + ", batch="
-            + batchSize
-            + ", queue="
-            + queueCapacity);
+    /* System.err.println(
+    "Setup: updatedColumns="
+        + updatedColumns
+        + ", MT="
+        + multiThreaded
+        + ", batch="
+        + batchSize
+        + ", queue="
+        + queueCapacity);*/
 
     if (shouldSkip()) {
-      System.err.println("Skipping benchmark - params irrelevant for updatedColumns=0");
+      // System.err.println("Skipping benchmark - params irrelevant for updatedColumns=0");
       return;
     }
 
@@ -219,16 +217,16 @@ public class ColumnUpdateParquetBenchmark {
         FormatModelRegistry.readBuilder(FileFormat.PARQUET, Record.class, columnSplits);
     return builder
         .project(fullSchema)
-        .set(MULTI_THREADED, Boolean.toString(multiThreaded))
-        .set(QUEUE_CAPACITY, String.valueOf(queueCapacity))
-        .set(BATCH_SIZE, String.valueOf(batchSize))
+        .set(FormatModel.MULTI_THREADED, Boolean.toString(multiThreaded))
+        .set(FormatModel.QUEUE_CAPACITY, String.valueOf(queueCapacity))
+        .set(FormatModel.BATCH_SIZE, String.valueOf(batchSize))
         .build();
   }
 
   /** Creates the base data file with all 80 int + 20 string columns if it doesn't exist. */
   private void initBaseFile() throws IOException {
     if (!Files.localInput(baseFilePath).exists()) {
-      System.err.println("Generating base data file: " + baseFilePath);
+      // System.err.println("Generating base data file: " + baseFilePath);
       try (FileAppender<Record> writer =
           Parquet.write(Files.localOutput(baseFilePath))
               .schema(fullSchema)
@@ -237,13 +235,13 @@ public class ColumnUpdateParquetBenchmark {
         for (int i = 0; i < NUM_ROWS; i += GEN_BATCH_SIZE) {
           int batchRows = Math.min(GEN_BATCH_SIZE, NUM_ROWS - i);
           writer.addAll(RandomGenericData.generate(fullSchema, batchRows, SEED + i));
-          System.err.println("Base file progress: " + (i + batchRows) + "/" + NUM_ROWS);
+          // System.err.println("Base file progress: " + (i + batchRows) + "/" + NUM_ROWS);
         }
       }
-      System.err.println("Base data file created: " + baseFilePath);
-    } else {
-      System.err.println("Base data file already exists: " + baseFilePath);
-    }
+      // System.err.println("Base data file created: " + baseFilePath);
+    } /* else {
+        System.err.println("Base data file already exists: " + baseFilePath);
+      }*/
   }
 
   /**
@@ -252,7 +250,7 @@ public class ColumnUpdateParquetBenchmark {
    */
   private void initUpdateFile(String filePath, int columnIndex) throws IOException {
     if (!Files.localInput(filePath).exists()) {
-      System.err.println("Generating update file for int_col" + columnIndex + ": " + filePath);
+      // System.err.println("Generating update file for int_col" + columnIndex + ": " + filePath);
       Schema singleColSchema =
           new Schema(optional(columnIndex, "int_col" + columnIndex, Types.IntegerType.get()));
       try (FileAppender<Record> writer =
@@ -263,18 +261,18 @@ public class ColumnUpdateParquetBenchmark {
         for (int i = 0; i < NUM_ROWS; i += GEN_BATCH_SIZE) {
           int batchRows = Math.min(GEN_BATCH_SIZE, NUM_ROWS - i);
           writer.addAll(RandomGenericData.generate(singleColSchema, batchRows, SEED + i + 1000));
-          System.err.println(
-              "Update file int_col"
-                  + columnIndex
-                  + " progress: "
-                  + (i + batchRows)
-                  + "/"
-                  + NUM_ROWS);
+          /* System.err.println(
+          "Update file int_col"
+              + columnIndex
+              + " progress: "
+              + (i + batchRows)
+              + "/"
+              + NUM_ROWS);*/
         }
       }
-      System.err.println("Update file created: " + filePath);
-    } else {
-      System.err.println("Update file already exists: " + filePath);
-    }
+      // System.err.println("Update file created: " + filePath);
+    } /* else {
+        System.err.println("Update file already exists: " + filePath);
+      }*/
   }
 }
