@@ -83,13 +83,13 @@ public class MultiThreadedParquetBenchmark {
   private List<List<Integer>> familyIds;
   private int testDataSize;
 
-  @Param({"100", "1000", "10000"})
+  @Param({"10000"})
   private int columns;
 
   @Param({"1", "2", "5", "10"})
   private int families;
 
-  @Param({"true", "false"})
+  @Param("false")
   private boolean multiThreaded;
 
   @Param("128")
@@ -124,19 +124,14 @@ public class MultiThreadedParquetBenchmark {
 
   @Setup(Level.Trial)
   public void setupBenchmark() throws IOException {
-    /* System.err.println(
-    "Run: "
-        + columns
-        + ", F: "
-        + families
-        + ", MT: "
-        + multiThreaded
-        + ", BS: "
-        + batchSize
-        + ", QC: "
-        + queueCapacity
-        + ", FFR: "
-        + fullFileRead);*/
+    LOG.info(
+        "Run: {}, F: {}, MT: {}, BS: {}, QC: {}, FFR: {}",
+        columns,
+        families,
+        multiThreaded,
+        batchSize,
+        queueCapacity,
+        fullFileRead);
 
     List<Types.NestedField> fieldList = Lists.newArrayListWithCapacity(columns);
     familyIds = Lists.newArrayListWithCapacity(families);

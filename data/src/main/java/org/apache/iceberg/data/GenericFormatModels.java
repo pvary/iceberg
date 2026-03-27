@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.data;
 
-import java.util.List;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.avro.AvroFormatModel;
 import org.apache.iceberg.data.avro.DataWriter;
@@ -97,13 +96,18 @@ public class GenericFormatModels {
     }
 
     @Override
-    public Record combine(List<Record> records) {
+    public Record combine(Record[] records) {
       CombinedRecord target = reuseContainers ? template : CombinedRecord.clone(template);
-      for (int i = 0; i < records.size(); i++) {
-        target.setFamily(i, records.get(i));
+      for (int i = 0; i < records.length; i++) {
+        target.setFamily(i, records[i]);
       }
 
       return target;
+    }
+
+    @Override
+    public Record[] newArray(int length) {
+      return new Record[length];
     }
 
     @Override

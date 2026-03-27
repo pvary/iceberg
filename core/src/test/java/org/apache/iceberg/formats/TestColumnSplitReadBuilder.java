@@ -31,6 +31,7 @@ import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.SkippingCloseableIterator;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.FieldSource;
@@ -178,16 +179,35 @@ class TestColumnSplitReadBuilder {
 
   /** Simple combiner that sums all elements. */
   private static final FormatModel.Combiner<Integer> SUM_COMBINER =
-      elements -> {
-        int sum = 0;
-        for (Integer e : elements) {
-          sum += e;
+      new FormatModel.Combiner<>() {
+        @Override
+        public Integer[] newArray(int size) {
+          return new Integer[size];
         }
-        return sum;
+
+        @Override
+        public Integer combine(Integer[] elements) {
+          int sum = 0;
+          for (Integer e : elements) {
+            sum += e;
+          }
+          return sum;
+        }
       };
 
-  /** Combiner that concatenates elements as a list string for traceability. */
-  private static final FormatModel.Combiner<Integer> FIRST_COMBINER = elements -> elements.get(0);
+  /** Combiner that returns the first element. */
+  private static final FormatModel.Combiner<Integer> FIRST_COMBINER =
+      new FormatModel.Combiner<>() {
+        @Override
+        public Integer[] newArray(int size) {
+          return new Integer[size];
+        }
+
+        @Override
+        public Integer combine(Integer[] elements) {
+          return elements[0];
+        }
+      };
 
   @ParameterizedTest
   @ValueSource(booleans = {false, true})
@@ -469,6 +489,57 @@ class TestColumnSplitReadBuilder {
     }
   }
 
+  private static class InstrumentedSkippingIterator extends TestSkippingIterator {
+    private int positionCallCount = 0;
+    private int skipToCallCount = 0;
+
+    InstrumentedSkippingIterator(Integer... values) {
+      super(values);
+    }
+
+    @Override
+    public void skipTo(long targetPosition) {
+      skipToCallCount++;
+      super.skipTo(targetPosition);
+    }
+
+    @Override
+    public long position() {
+      positionCallCount++;
+      return super.position();
+    }
+
+    int getPositionCallCount() {
+      return positionCallCount;
+    }
+
+    int getSkipToCallCount() {
+      return skipToCallCount;
+    }
+  }
+
+  @Test
+  void testSingleThreadedAlignedFastPathAvoidsRealignmentChecks() throws IOException {
+    InstrumentedSkippingIterator iter1 = new InstrumentedSkippingIterator(10, 20, 30);
+    InstrumentedSkippingIterator iter2 = new InstrumentedSkippingIterator(1, 2, 3);
+
+    try (CloseableIterable<Integer> result =
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            SUM_COMBINER,
+            false,
+            false,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
+      List<Integer> collected = Lists.newArrayList(result.iterator());
+      assertThat(collected).containsExactly(11, 22, 33);
+      assertThat(iter1.getSkipToCallCount()).isZero();
+      assertThat(iter2.getSkipToCallCount()).isZero();
+      assertThat(iter1.getPositionCallCount()).isEqualTo(3);
+      assertThat(iter2.getPositionCallCount()).isEqualTo(3);
+    }
+  }
+
   @ParameterizedTest
   @ValueSource(booleans = {false, true})
   void testUnalignedIteratorValueIsKeptNotReRead(boolean multiThreaded) throws IOException {
@@ -718,7 +789,7 @@ class TestColumnSplitReadBuilder {
     FormatModel.Combiner<MutableContainer> combiner =
         new FormatModel.Combiner<>() {
           @Override
-          public MutableContainer combine(List<MutableContainer> elements) {
+          public MutableContainer combine(MutableContainer[] elements) {
             MutableContainer target = reuseWrapper ? reusedResult : new MutableContainer(0);
             target.value = 0;
             for (MutableContainer e : elements) {
@@ -726,6 +797,11 @@ class TestColumnSplitReadBuilder {
             }
 
             return target;
+          }
+
+          @Override
+          public MutableContainer[] newArray(int length) {
+            return new MutableContainer[length];
           }
 
           @Override
@@ -788,12 +864,20 @@ class TestColumnSplitReadBuilder {
     // A combiner that creates a new container each time (like MyCombiner with
     // reuseContainers=false)
     FormatModel.Combiner<MutableContainer> cloneCombiner =
-        elements -> {
-          int sum = 0;
-          for (MutableContainer e : elements) {
-            sum += e.value;
+        new FormatModel.Combiner<>() {
+          @Override
+          public MutableContainer[] newArray(int size) {
+            return new MutableContainer[size];
           }
-          return new MutableContainer(sum);
+
+          @Override
+          public MutableContainer combine(MutableContainer[] elements) {
+            int sum = 0;
+            for (MutableContainer e : elements) {
+              sum += e.value;
+            }
+            return new MutableContainer(sum);
+          }
         };
 
     try (CloseableIterable<MutableContainer> result =

@@ -63,7 +63,7 @@ import org.slf4j.LoggerFactory;
  */
 @Fork(value = 1)
 @State(Scope.Benchmark)
-@Warmup(iterations = 5)
+@Warmup(iterations = 10)
 @Measurement(iterations = 20)
 @BenchmarkMode(Mode.SingleShotTime)
 public class ColumnUpdateParquetBenchmark {
@@ -86,10 +86,10 @@ public class ColumnUpdateParquetBenchmark {
   private List<String> updateFilePaths;
 
   /** Number of int columns that have been updated (each in a separate single-column file). */
-  @Param({"0", "1", "2", "3", "4", "5", "10", "40", "80"})
+  @Param({"0", "1", "2", "3", "10", "40"})
   private int updatedColumns;
 
-  @Param({"true", "false"})
+  @Param("false")
   private boolean multiThreaded;
 
   @Param("128")
@@ -113,32 +113,14 @@ public class ColumnUpdateParquetBenchmark {
     }
   }
 
-  /**
-   * When updatedColumns is 0 there is only a single base file, so multiThreaded/batchSize/
-   * queueCapacity are irrelevant. We skip all but the first multiThreaded @Param value to avoid
-   * redundant runs. Static state cannot be used here because JMH forks a new JVM for each parameter
-   * combination.
-   */
-  private boolean shouldSkip() {
-    return updatedColumns == 0 && !multiThreaded;
-  }
-
   @Setup(Level.Trial)
   public void setupBenchmark() throws IOException {
-    /* System.err.println(
-    "Setup: updatedColumns="
-        + updatedColumns
-        + ", MT="
-        + multiThreaded
-        + ", batch="
-        + batchSize
-        + ", queue="
-        + queueCapacity);*/
-
-    if (shouldSkip()) {
-      // System.err.println("Skipping benchmark - params irrelevant for updatedColumns=0");
-      return;
-    }
+    LOG.info(
+        "Setup: updatedColumns={}, multiThreaded={}, batchSize={}, queueCapacity={}",
+        updatedColumns,
+        multiThreaded,
+        batchSize,
+        queueCapacity);
 
     // Build the full schema: 80 int columns (ids 0..79) + 20 string columns (ids 80..99)
     List<Types.NestedField> fields = Lists.newArrayListWithCapacity(TOTAL_COLUMNS);
@@ -171,10 +153,6 @@ public class ColumnUpdateParquetBenchmark {
   @Benchmark
   @Threads(1)
   public void readWithColumnUpdates() throws IOException {
-    if (shouldSkip()) {
-      return;
-    }
-
     long val = 0;
 
     try (CloseableIterable<Record> reader = buildColumnSplitReader()) {

@@ -23,59 +23,76 @@ import java.util.List;
 import java.util.NoSuchElementException;
 import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.SkippingCloseableIterator;
-import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 
 class SingleThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
-  private final List<SkippingCloseableIterator<E>> iterators;
+  private final SkippingCloseableIterator<E>[] iterators;
   private final FormatModel.Combiner<E> combiner;
-  private final List<E> nextElements;
+  private final E[] nextElements;
   private boolean closed = false;
   private boolean exhausted = false;
   private long position = 0L;
 
-  /** Pre-fetched combined result, computed eagerly in {@link #tryAdvance()}. */
+  /** Pre-fetched combined result, computed eagerly in {@link #advanceAligned()}. */
   private E pendingResult = null;
 
+  @SuppressWarnings("unchecked")
   SingleThreadedCombiningReadIterator(
-      List<SkippingCloseableIterator<E>> iterators, FormatModel.Combiner<E> combiner) {
-    this.iterators = iterators;
+      List<SkippingCloseableIterator<E>> iteratorList, FormatModel.Combiner<E> combiner) {
+    this.iterators = iteratorList.toArray(new SkippingCloseableIterator[0]);
     this.combiner = combiner;
-    this.nextElements = Lists.newArrayListWithExpectedSize(iterators.size());
-    for (int i = 0; i < iterators.size(); ++i) {
-      nextElements.add(null);
-    }
+    this.nextElements = combiner.newArray(iterators.length);
   }
 
   /**
-   * Attempts to compute the next aligned, combined result from all iterators. Returns {@code true}
-   * if a result was produced and stored in {@link #pendingResult}, {@code false} if any iterator
-   * has been exhausted.
+   * Attempts to advance all iterators assuming they are already aligned at {@link #position}. This
+   * is the hot path for Spark reads without gaps/deletes: one {@code hasNext()}, one {@code
+   * next()}, and one {@code position()} per iterator. If any iterator jumps ahead, falls back to
+   * the slower realignment path.
    */
-  private boolean tryAdvance() {
-    if (pendingResult != null) {
-      return true;
+  private boolean advanceAligned() {
+    long expectedPosition = position + 1;
+
+    for (int i = 0; i < iterators.length; ++i) {
+      SkippingCloseableIterator<E> iterator = iterators[i];
+      if (!iterator.hasNext()) {
+        exhausted = true;
+        return false;
+      }
+
+      E value = iterator.next();
+      long newPosition = iterator.position();
+      nextElements[i] = value;
+
+      if (newPosition != expectedPosition) {
+        return realignFrom(i, newPosition);
+      }
     }
 
-    if (exhausted) {
-      return false;
-    }
+    position = expectedPosition;
+    pendingResult = combiner.combine(nextElements);
+    return true;
+  }
 
-    int savedIndex = -1;
+  /**
+   * Restarts alignment from the beginning after iterator {@code savedIndex} has already produced a
+   * value for logical position {@code savedPosition - 1}. Only used when an iterator jumps ahead.
+   */
+  private boolean realignFrom(int savedIndex, long savedPosition) {
+    position = savedPosition - 1;
+    int currentIndex = savedIndex;
+
     while (true) {
-      boolean needsRealign = false;
+      long targetPosition = position;
 
-      for (int i = 0; i < iterators.size(); ++i) {
-        // If this iterator already provided its value and only doing realignment now, reuse the
-        // old value kept in the nextElements list and skip to the next iterator
-        if (i == savedIndex) {
-          savedIndex = -1;
+      for (int i = 0; i < iterators.length; ++i) {
+        if (i == currentIndex) {
+          currentIndex = -1;
           continue;
         }
 
-        SkippingCloseableIterator<E> iterator = iterators.get(i);
-        // Ensure the iterator is at the pre-read position before calling next()
-        if (iterator.position() < position) {
-          iterator.skipTo(position);
+        SkippingCloseableIterator<E> iterator = iterators[i];
+        if (iterator.position() < targetPosition) {
+          iterator.skipTo(targetPosition);
         }
 
         if (!iterator.hasNext()) {
@@ -85,27 +102,20 @@ class SingleThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
 
         E value = iterator.next();
         long newPosition = iterator.position();
+        nextElements[i] = value;
 
-        if (newPosition > position + 1) {
-          // This iterator jumped ahead — keep its value in nextElements and discard
-          // results from previous iterators, then restart from the first iterator
-          nextElements.set(i, value);
+        if (newPosition != targetPosition + 1) {
           position = newPosition - 1;
-          savedIndex = i;
-          needsRealign = true;
+          currentIndex = i;
           break;
         }
-
-        nextElements.set(i, value);
       }
 
-      if (needsRealign) {
-        continue;
+      if (currentIndex == -1) {
+        position = targetPosition + 1;
+        pendingResult = combiner.combine(nextElements);
+        return true;
       }
-
-      position++;
-      pendingResult = combiner.combine(nextElements);
-      return true;
     }
   }
 
@@ -115,12 +125,20 @@ class SingleThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
       return false;
     }
 
-    return tryAdvance();
+    if (pendingResult != null) {
+      return true;
+    }
+
+    if (exhausted) {
+      return false;
+    }
+
+    return advanceAligned();
   }
 
   @Override
   public E next() {
-    if (!hasNext()) {
+    if (pendingResult == null && !hasNext()) {
       throw new NoSuchElementException();
     }
 
@@ -132,5 +150,8 @@ class SingleThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
   @Override
   public void close() throws IOException {
     closed = true;
+    for (SkippingCloseableIterator<E> iterator : iterators) {
+      iterator.close();
+    }
   }
 }

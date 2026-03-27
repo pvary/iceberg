@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.spark.source;
 
-import java.util.List;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.avro.AvroFormatModel;
 import org.apache.iceberg.formats.FormatModel;
@@ -103,13 +102,18 @@ public class SparkFormatModels {
     }
 
     @Override
-    public InternalRow combine(List<InternalRow> rows) {
+    public InternalRow combine(InternalRow[] rows) {
       CombinedInternalRow target = reuseContainers ? template : CombinedInternalRow.clone(template);
-      for (int i = 0; i < rows.size(); i++) {
-        target.setColumnSplit(i, rows.get(i));
+      for (int i = 0; i < rows.length; i++) {
+        target.setColumnSplit(i, rows[i]);
       }
 
       return target;
+    }
+
+    @Override
+    public InternalRow[] newArray(int size) {
+      return new InternalRow[size];
     }
 
     @Override

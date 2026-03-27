@@ -18,7 +18,6 @@
  */
 package org.apache.iceberg.formats;
 
-import java.util.List;
 import java.util.function.BiFunction;
 import org.apache.iceberg.FileFormat;
 import org.apache.iceberg.Schema;
@@ -112,7 +111,15 @@ public interface FormatModel<D, S> {
   ReadBuilder<D, S> readBuilder(InputFile inputFile);
 
   interface Combiner<E> {
-    E combine(List<E> elements);
+    E combine(E[] elements);
+
+    /**
+     * Creates a properly-typed array for use by the combining iterator. Java arrays are reified, so
+     * {@code (E[]) new Object[size]} fails at runtime when passed to code expecting a concrete type
+     * like {@code Record[]}. Implementations must return a correctly-typed array (e.g., {@code new
+     * Record[size]}).
+     */
+    E[] newArray(int length);
 
     /**
      * Shallow-copies the values from {@code source} into {@code target}, returning {@code target}.

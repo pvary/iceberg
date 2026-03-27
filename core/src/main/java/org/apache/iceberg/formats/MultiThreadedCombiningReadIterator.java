@@ -64,7 +64,7 @@ class MultiThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
    */
   private final List<BlockingQueue<Batch<E>>> returnQueues;
 
-  private final List<E> elements;
+  private final E[] elements;
 
   /** Shared target position: producers skip elements below this position. */
   private final AtomicLong targetPosition = new AtomicLong(0);
@@ -98,11 +98,10 @@ class MultiThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
     this.executorService = Executors.newFixedThreadPool(size);
     this.buffers = Lists.newArrayListWithExpectedSize(size);
     this.returnQueues = reuseContainers ? Lists.newArrayListWithExpectedSize(size) : null;
-    this.elements = Lists.newArrayListWithExpectedSize(size);
+    this.elements = combiner.newArray(size);
     this.currentBatches = new Batch[size];
 
     for (int i = 0; i < size; ++i) {
-      elements.add(null);
       buffers.add(Queues.newArrayBlockingQueue(queueCapacity));
       if (returnQueues != null) {
         returnQueues.add(Queues.newLinkedBlockingQueue());
@@ -223,7 +222,7 @@ class MultiThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
 
         // Skip stale elements
         if (pos > targetPosition.get()) {
-          elements.set(producerIndex, batch.value());
+          elements[producerIndex] = batch.value();
           batch.advance();
           return pos;
         }
