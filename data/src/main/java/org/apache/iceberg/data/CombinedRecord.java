@@ -33,37 +33,36 @@ import org.apache.iceberg.types.Types.StructType;
 import org.apache.iceberg.util.Pair;
 
 public class CombinedRecord implements Record, StructLike {
-  // Cache to address the column values based on the field name or id.
-  private static final LoadingCache<
-          Pair<StructType, Integer[][]>, Map<Object, Pair<Integer, Integer>>>
-      COMBINER_CACHE =
-          Caffeine.newBuilder()
-              .weakKeys()
-              .build(
-                  key -> {
-                    Map<Object, Pair<Integer, Integer>> nameAndIdToPos = Maps.newHashMap();
+  // Cache for position mappings: familyIndex[pos] and posInFamily[pos] for fast positional lookups.
+  private static final LoadingCache<Pair<StructType, Integer[][]>, PositionMapping> CACHE =
+      Caffeine.newBuilder()
+          .weakKeys()
+          .build(
+              key -> {
+                StructType structType = key.first();
+                Integer[][] fams = key.second();
+                int numFields = structType.fields().size();
+                int[] familyIndex = new int[numFields];
+                int[] posInFamily = new int[numFields];
 
-                    // Populate the map with field names and their corresponding record and field
-                    // positions.
-                    for (int recordId = 0; recordId < key.second().length; recordId += 1) {
-                      for (int recordFieldPos = 0;
-                          recordFieldPos < key.second()[recordId].length;
-                          recordFieldPos += 1) {
-                        Types.NestedField field =
-                            key.first().field(key.second()[recordId][recordFieldPos]);
-                        nameAndIdToPos.put(field.name(), Pair.of(recordId, recordFieldPos));
-                      }
-                    }
+                // Build a lookup from field name to (familyIdx, posWithinFamily)
+                Map<String, int[]> nameToInternalPos = Maps.newHashMapWithExpectedSize(numFields);
+                for (int famIdx = 0; famIdx < fams.length; famIdx++) {
+                  for (int famFieldPos = 0; famFieldPos < fams[famIdx].length; famFieldPos++) {
+                    Types.NestedField field = structType.field(fams[famIdx][famFieldPos]);
+                    nameToInternalPos.put(field.name(), new int[] {famIdx, famFieldPos});
+                  }
+                }
 
-                    // Populate the map with field ids and their corresponding record and field
-                    // positions.
-                    for (int fieldPos = 0; fieldPos < key.first().fields().size(); fieldPos += 1) {
-                      nameAndIdToPos.put(
-                          fieldPos, nameAndIdToPos.get(key.first().fields().get(fieldPos).name()));
-                    }
+                // Map each field position to the corresponding family and position within family
+                for (int fieldPos = 0; fieldPos < numFields; fieldPos++) {
+                  int[] internal = nameToInternalPos.get(structType.fields().get(fieldPos).name());
+                  familyIndex[fieldPos] = internal[0];
+                  posInFamily[fieldPos] = internal[1];
+                }
 
-                    return nameAndIdToPos;
-                  });
+                return new PositionMapping(familyIndex, posInFamily);
+              });
 
   public static CombinedRecord create(Schema schema, Integer[]... families) {
     return new CombinedRecord(schema.asStruct(), families);
@@ -76,14 +75,14 @@ public class CombinedRecord implements Record, StructLike {
   private final StructType struct;
   private final Integer[][] families;
   private final int size;
-  private final Map<Object, Pair<Integer, Integer>> nameAndIdToPos;
+  private final PositionMapping mapping;
   private final Record[] values;
 
   private CombinedRecord(CombinedRecord toClone) {
     this.struct = toClone.struct;
     this.families = toClone.families;
     this.size = toClone.size;
-    this.nameAndIdToPos = toClone.nameAndIdToPos;
+    this.mapping = toClone.mapping;
     this.values = new Record[families.length];
   }
 
@@ -91,7 +90,7 @@ public class CombinedRecord implements Record, StructLike {
     this.struct = struct;
     this.families = families;
     this.size = struct.fields().size();
-    this.nameAndIdToPos = COMBINER_CACHE.get(Pair.of(struct, families));
+    this.mapping = CACHE.get(Pair.of(struct, families));
     this.values = new Record[families.length];
   }
 
@@ -117,9 +116,13 @@ public class CombinedRecord implements Record, StructLike {
 
   @Override
   public Object getField(String name) {
-    Pair<Integer, Integer> internalPos = nameAndIdToPos.get(name);
-    if (internalPos != null) {
-      return values[internalPos.first()].get(internalPos.second());
+    // Not on the hot path since this is only used for debugging and to support field access by
+    // name, which is not expected to be common. If this becomes a bottleneck, we can add a
+    // name-to-position mapping cache.
+    for (int i = 0; i < size; i++) {
+      if (struct.fields().get(i).name().equals(name)) {
+        return values[mapping.familyIndex[i]].get(mapping.posInFamily[i]);
+      }
     }
 
     return null;
@@ -127,9 +130,17 @@ public class CombinedRecord implements Record, StructLike {
 
   @Override
   public void setField(String name, Object value) {
-    Pair<Integer, Integer> internalPos = nameAndIdToPos.get(name);
-    Preconditions.checkArgument(internalPos != null, "Cannot set unknown field named: %s", name);
-    values[internalPos.first()].set(internalPos.second(), value);
+    // Not on the hot path since this is only used for debugging and to support field access by
+    // name, which is not expected to be common. If this becomes a bottleneck, we can add a
+    // name-to-position mapping cache.
+    for (int i = 0; i < size; i++) {
+      if (struct.fields().get(i).name().equals(name)) {
+        values[mapping.familyIndex[i]].set(mapping.posInFamily[i], value);
+        return;
+      }
+    }
+
+    throw new IllegalArgumentException("Cannot set unknown field named: " + name);
   }
 
   @Override
@@ -139,8 +150,7 @@ public class CombinedRecord implements Record, StructLike {
 
   @Override
   public Object get(int pos) {
-    Pair<Integer, Integer> internalPos = nameAndIdToPos.get(pos);
-    return values[internalPos.first()].get(internalPos.second());
+    return values[mapping.familyIndex[pos]].get(mapping.posInFamily[pos]);
   }
 
   @Override
@@ -155,9 +165,7 @@ public class CombinedRecord implements Record, StructLike {
 
   @Override
   public <T> void set(int pos, T value) {
-    Pair<Integer, Integer> internalPos = nameAndIdToPos.get(pos);
-    Preconditions.checkArgument(internalPos != null, "Cannot set unknown field with id: %s", pos);
-    values[internalPos.first()].set(internalPos.second(), value);
+    values[mapping.familyIndex[pos]].set(mapping.posInFamily[pos], value);
   }
 
   @Override
@@ -206,5 +214,15 @@ public class CombinedRecord implements Record, StructLike {
   @Override
   public int hashCode() {
     return Objects.hashCode((Object[]) values);
+  }
+
+  private static class PositionMapping {
+    final int[] familyIndex;
+    final int[] posInFamily;
+
+    PositionMapping(int[] familyIndex, int[] posInFamily) {
+      this.familyIndex = familyIndex;
+      this.posInFamily = posInFamily;
+    }
   }
 }

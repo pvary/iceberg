@@ -28,39 +28,33 @@ import org.apache.iceberg.relocated.com.google.common.base.Objects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
-import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.types.Types.StructType;
 import org.apache.iceberg.util.Pair;
 
 public class NarrowedRecord implements Record, StructLike {
-  // Cache to address the column values based on the field name or id.
-  private static final LoadingCache<Pair<StructType, StructType>, Map<Object, Integer>>
-      COMBINER_CACHE =
-          Caffeine.newBuilder()
-              .weakKeys()
-              .build(
-                  key -> {
-                    Map<Object, Integer> nameAndIdToPos = Maps.newHashMap();
+  // Cache for position mappings: posMapping[narrowedPos] = originalPos
+  private static final LoadingCache<Pair<StructType, StructType>, int[]> CACHE =
+      Caffeine.newBuilder()
+          .weakKeys()
+          .build(
+              key -> {
+                List<Types.NestedField> projectedFields = key.second().fields();
+                List<Types.NestedField> originalFields = key.first().fields();
+                int[] posMapping = new int[projectedFields.size()];
 
-                    // Populate the map with field names and their corresponding record and field
-                    // positions.
-                    for (int recordId = 0; recordId < key.second().fields().size(); recordId += 1) {
-                      Types.NestedField projectedField = key.second().fields().get(recordId);
-                      for (int originalPos = 0;
-                          originalPos < key.first().fields().size();
-                          originalPos += 1) {
-                        Types.NestedField originalField = key.first().fields().get(originalPos);
-                        if (originalField.fieldId() == projectedField.fieldId()) {
-                          nameAndIdToPos.put(projectedField.name(), originalPos);
-                          nameAndIdToPos.put(recordId, originalPos);
-                          break;
-                        }
-                      }
+                for (int narrowedPos = 0; narrowedPos < projectedFields.size(); narrowedPos++) {
+                  Types.NestedField projectedField = projectedFields.get(narrowedPos);
+                  for (int originalPos = 0; originalPos < originalFields.size(); originalPos++) {
+                    if (originalFields.get(originalPos).fieldId() == projectedField.fieldId()) {
+                      posMapping[narrowedPos] = originalPos;
+                      break;
                     }
+                  }
+                }
 
-                    return nameAndIdToPos;
-                  });
+                return posMapping;
+              });
 
   public static NarrowedRecord create(Schema schema, Integer[] family) {
     return new NarrowedRecord(schema.asStruct(), family);
@@ -68,7 +62,7 @@ public class NarrowedRecord implements Record, StructLike {
 
   private final StructType struct;
   private final int size;
-  private final Map<Object, Integer> nameAndIdToPos;
+  private final int[] posMapping;
   private Record wrappedRecord;
 
   private NarrowedRecord(StructType original, Integer[] family) {
@@ -81,7 +75,7 @@ public class NarrowedRecord implements Record, StructLike {
 
     this.struct = StructType.of(fields);
     this.size = struct.fields().size();
-    this.nameAndIdToPos = COMBINER_CACHE.get(Pair.of(original, struct));
+    this.posMapping = CACHE.get(Pair.of(original, struct));
   }
 
   public void set(Record newValue) {
@@ -95,9 +89,13 @@ public class NarrowedRecord implements Record, StructLike {
 
   @Override
   public Object getField(String name) {
-    Integer wrappedPos = nameAndIdToPos.get(name);
-    if (wrappedPos != null) {
-      return wrappedRecord.get(wrappedPos);
+    // Not on the hot path since this is only used for debugging and to support field access by
+    // name, which is not expected to be common. If this becomes a bottleneck, we can add a
+    // name-to-position mapping cache.
+    for (int i = 0; i < size; i++) {
+      if (struct.fields().get(i).name().equals(name)) {
+        return wrappedRecord.get(posMapping[i]);
+      }
     }
 
     return null;
@@ -105,9 +103,17 @@ public class NarrowedRecord implements Record, StructLike {
 
   @Override
   public void setField(String name, Object value) {
-    Integer wrappedPos = nameAndIdToPos.get(name);
-    Preconditions.checkArgument(wrappedPos != null, "Cannot set unknown field named: %s", name);
-    wrappedRecord.set(wrappedPos, value);
+    // Not on the hot path since this is only used for debugging and to support field access by
+    // name, which is not expected to be common. If this becomes a bottleneck, we can add a
+    // name-to-position mapping cache.
+    for (int i = 0; i < size; i++) {
+      if (struct.fields().get(i).name().equals(name)) {
+        wrappedRecord.set(posMapping[i], value);
+        return;
+      }
+    }
+
+    throw new IllegalArgumentException("Cannot set unknown field named: " + name);
   }
 
   @Override
@@ -117,8 +123,7 @@ public class NarrowedRecord implements Record, StructLike {
 
   @Override
   public Object get(int pos) {
-    Integer wrappedPos = nameAndIdToPos.get(pos);
-    return wrappedRecord.get(wrappedPos);
+    return wrappedRecord.get(posMapping[pos]);
   }
 
   @Override
@@ -133,8 +138,7 @@ public class NarrowedRecord implements Record, StructLike {
 
   @Override
   public <T> void set(int pos, T value) {
-    Integer wrappedPos = nameAndIdToPos.get(pos);
-    wrappedRecord.set(wrappedPos, value);
+    wrappedRecord.set(posMapping[pos], value);
   }
 
   @Override

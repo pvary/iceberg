@@ -67,8 +67,8 @@ import org.slf4j.LoggerFactory;
 
 @Fork(value = 1)
 @State(Scope.Benchmark)
-@Warmup(iterations = 1)
-@Measurement(iterations = 3)
+@Warmup(iterations = 10)
+@Measurement(iterations = 20)
 @BenchmarkMode(Mode.SingleShotTime)
 public class MultiThreadedParquetBenchmark {
   private static final Logger LOG = LoggerFactory.getLogger(MultiThreadedParquetBenchmark.class);
@@ -88,17 +88,20 @@ public class MultiThreadedParquetBenchmark {
   @Param({"100", "1000", "10000"})
   private int columns;
 
-  @Param({"0", "1", "2", "5", "10"})
+  @Param({"1", "2", "5", "10"})
   private int families;
 
   @Param({"true", "false"})
   private boolean multiThreaded;
 
-  @Param({"128", "256", "512", "1024", "2048", "4096", "8192"})
+  @Param({"128"})
   private int batchSize;
 
-  @Param({"2", "4", "8"})
+  @Param({"4"})
   private int queueCapacity;
+
+  @Param({"false"})
+  private boolean fullFileRead;
 
   {
     // Only delete the write directory to avoid deleting the read/source directory and losing the
@@ -120,7 +123,20 @@ public class MultiThreadedParquetBenchmark {
 
   @Setup(Level.Trial)
   public void setupBenchmark() throws IOException {
-    System.err.println("Run: " + columns + ", F: " + families + ", MT: " + multiThreaded);
+    System.err.println(
+        "Run: "
+            + columns
+            + ", F: "
+            + families
+            + ", MT: "
+            + multiThreaded
+            + ", BS: "
+            + batchSize
+            + ", QC: "
+            + queueCapacity
+            + ", FFR: "
+            + fullFileRead);
+
     List<Types.NestedField> fieldList = Lists.newArrayListWithCapacity(columns);
     familyIds = Lists.newArrayListWithCapacity(families);
     for (int i = 0; i < families; ++i) {
@@ -131,16 +147,15 @@ public class MultiThreadedParquetBenchmark {
     int family = 0;
     for (int i = 0; i < columns; ++i) {
       fieldList.add(optional(i, "col" + i, Types.DoubleType.get()));
-      if (families > 0) {
-        List<Integer> familyIdsForColumn = familyIds.get(family);
-        if (familyIdsForColumn == null) {
-          familyIdsForColumn = Lists.newArrayList();
-          familyIds.add(familyIdsForColumn);
-        }
 
-        familyIdsForColumn.add(i);
-        family = (family + 1) % families;
+      List<Integer> familyIdsForColumn = familyIds.get(family);
+      if (familyIdsForColumn == null) {
+        familyIdsForColumn = Lists.newArrayList();
+        familyIds.add(familyIdsForColumn);
       }
+
+      familyIdsForColumn.add(i);
+      family = (family + 1) % families;
     }
 
     testSchema = new Schema(fieldList);
@@ -162,41 +177,86 @@ public class MultiThreadedParquetBenchmark {
   @Benchmark
   @Threads(1)
   public void write() throws IOException {
-    write(WRITE_DIR + counter++ + "_write_" + multiThreaded + "_");
+    long val = 0;
+    String prefix = WRITE_DIR + counter++ + "_write_" + multiThreaded + "_";
+    try (DataWriter<Record> writer = writer(prefix);
+        CloseableIterable<Record> data = testData()) {
+      for (Record record : data) {
+        // access something to ensure the compiler doesn't optimize this away
+        writer.write(record);
+        if (record.get(0) != null) {
+          val ^= ((Double) record.get(0)).longValue();
+        }
+      }
+    }
+
+    LOG.info("XOR val: {}", val);
+  }
+
+  @Benchmark
+  @Threads(1)
+  public void writeBaseline() throws IOException {
+    if (families != 1 || multiThreaded) {
+      return;
+    }
+
+    long val = 0;
+
+    String file = TEST_DIR + WRITE_DIR + counter++ + "_write_base_" + columns;
+    try (FileAppender<Record> writer =
+            Parquet.write(Files.localOutput(file))
+                .schema(testSchema)
+                .createWriterFunc(GenericParquetWriter::create)
+                .build();
+        CloseableIterable<Record> data = testData()) {
+      for (Record record : data) {
+        // access something to ensure the compiler doesn't optimize this away
+        writer.add(record);
+        if (record.get(0) != null) {
+          val ^= ((Double) record.get(0)).longValue();
+        }
+      }
+    }
+
+    LOG.info("XOR val: {}", val);
   }
 
   @Benchmark
   @Threads(1)
   public void read() throws IOException {
+
     long val = 0;
-
-    if (families == 0) {
-      if (multiThreaded) {
-        // no test here
-        return;
-      }
-
-      String file = readFileName(0);
-      try (CloseableIterable<Record> reader =
-          Parquet.read(Files.localInput(file))
-              .project(testSchema)
-              .createReaderFunc(
-                  fileSchema -> GenericParquetReaders.buildReader(testSchema, fileSchema))
-              .build()) {
-        for (Record record : reader) {
-          // access something to ensure the compiler doesn't optimize this away
-          if (record.get(0) != null) {
-            val ^= ((Double) record.get(0)).longValue();
-          }
+    try (CloseableIterable<Record> reader = reader()) {
+      for (Record record : reader) {
+        // access something to ensure the compiler doesn't optimize this away
+        if (record.get(0) != null) {
+          val ^= ((Double) record.get(0)).longValue();
         }
       }
-    } else {
-      try (CloseableIterable<Record> reader = reader()) {
-        for (Record record : reader) {
-          // access something to ensure the compiler doesn't optimize this away
-          if (record.get(0) != null) {
-            val ^= ((Double) record.get(0)).longValue();
-          }
+    }
+
+    LOG.info("XOR val: {}", val);
+  }
+
+  @Benchmark
+  @Threads(1)
+  public void readBaseline() throws IOException {
+    if (families != 1 || multiThreaded) {
+      return;
+    }
+    long val = 0;
+
+    String file = readFileName(0);
+    try (CloseableIterable<Record> reader =
+        Parquet.read(Files.localInput(file))
+            .project(testSchema)
+            .createReaderFunc(
+                fileSchema -> GenericParquetReaders.buildReader(testSchema, fileSchema))
+            .build()) {
+      for (Record record : reader) {
+        // access something to ensure the compiler doesn't optimize this away
+        if (record.get(0) != null) {
+          val ^= ((Double) record.get(0)).longValue();
         }
       }
     }
@@ -206,38 +266,16 @@ public class MultiThreadedParquetBenchmark {
 
   private void write(String prefix) throws IOException {
     long val = 0;
-    if (families == 0) {
-      if (multiThreaded) {
-        // no test here
-        return;
-      }
 
-      String file = TEST_DIR + prefix + columns + "_" + families;
-      try (FileAppender<Record> writer =
-          Parquet.write(Files.localOutput(file))
-              .schema(testSchema)
-              .createWriterFunc(GenericParquetWriter::create)
-              .build()) {
-        CloseableIterator<Record> iterator = testData().iterator();
-        while (iterator.hasNext()) {
-          Record record = iterator.next();
-          // access something to ensure the compiler doesn't optimize this away
-          writer.add(record);
-          if (record.get(0) != null) {
-            val ^= ((Double) record.get(0)).longValue();
-          }
-        }
-      }
-    } else {
-      try (DataWriter<Record> writer = writer(prefix)) {
-        CloseableIterator<Record> iterator = testData().iterator();
-        while (iterator.hasNext()) {
-          Record record = iterator.next();
-          // access something to ensure the compiler doesn't optimize this away
-          writer.write(record);
-          if (record.get(0) != null) {
-            val ^= ((Double) record.get(0)).longValue();
-          }
+    try (DataWriter<Record> writer = writer(prefix);
+        CloseableIterable<Record> data = testData();
+        CloseableIterator<Record> iterator = data.iterator()) {
+      while (iterator.hasNext()) {
+        Record record = iterator.next();
+        // access something to ensure the compiler doesn't optimize this away
+        writer.write(record);
+        if (record.get(0) != null) {
+          val ^= ((Double) record.get(0)).longValue();
         }
       }
     }
@@ -246,7 +284,9 @@ public class MultiThreadedParquetBenchmark {
   }
 
   private String readFileName(int family) {
-    return TEST_DIR + READ_DIR + columns + "_" + (families < 2 ? "0" : families + "_" + family);
+    return fullFileRead
+        ? TEST_DIR + READ_DIR + columns + "_0"
+        : TEST_DIR + READ_DIR + columns + "_" + (families < 2 ? "0" : families + "_" + family);
   }
 
   private CloseableIterable<Record> testData() {

@@ -132,6 +132,7 @@ class MultiThreadedFileAppender<X> extends AbstractNarrowingFileAppender<X> {
             throw new RuntimeException(e);
           }
         });
+
     currentBatch = newBatch();
     batchOffset = 0;
   }
