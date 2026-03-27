@@ -21,11 +21,9 @@ package org.apache.iceberg.spark.source;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import java.util.Arrays;
-import java.util.Map;
+import java.util.Objects;
 import org.apache.iceberg.Schema;
-import org.apache.iceberg.relocated.com.google.common.base.Objects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
-import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.Pair;
 import org.apache.spark.sql.catalyst.InternalRow;
@@ -46,36 +44,42 @@ import org.apache.spark.unsafe.types.VariantVal;
  * but for Spark's InternalRow.
  */
 public class CombinedInternalRow extends InternalRow {
+
+  /**
+   * Pre-computed position mapping for O(1) field access. For a field at schema position {@code
+   * ordinal}: {@code familyIndex[ordinal]} gives the index into the {@code values} array, and
+   * {@code posInFamily[ordinal]} gives the field position within that family's InternalRow.
+   */
+  private record PositionMapping(int[] familyIndex, int[] posInFamily) {}
+
   // Cache to address the column values based on the field position.
-  private static final LoadingCache<
-          Pair<Types.StructType, Integer[][]>, Map<Integer, Pair<Integer, Integer>>>
+  private static final LoadingCache<Pair<Types.StructType, Integer[][]>, PositionMapping>
       COMBINER_CACHE =
           Caffeine.newBuilder()
               .weakKeys()
               .build(
                   key -> {
-                    Map<Integer, Pair<Integer, Integer>> posToInternalPos = Maps.newHashMap();
+                    int numFields = key.first().fields().size();
+                    int[] familyIndex = new int[numFields];
+                    int[] posInFamily = new int[numFields];
+                    Arrays.fill(familyIndex, -1);
 
-                    // Populate the map with field positions and their corresponding row and field
-                    // positions.
-                    for (int rowId = 0; rowId < key.second().length; rowId += 1) {
+                    for (int rowId = 0; rowId < key.second().length; rowId++) {
                       for (int rowFieldPos = 0;
                           rowFieldPos < key.second()[rowId].length;
-                          rowFieldPos += 1) {
+                          rowFieldPos++) {
                         int fieldId = key.second()[rowId][rowFieldPos];
-                        // Find the position of this field in the schema
-                        for (int fieldPos = 0;
-                            fieldPos < key.first().fields().size();
-                            fieldPos += 1) {
+                        for (int fieldPos = 0; fieldPos < numFields; fieldPos++) {
                           if (key.first().fields().get(fieldPos).fieldId() == fieldId) {
-                            posToInternalPos.put(fieldPos, Pair.of(rowId, rowFieldPos));
+                            familyIndex[fieldPos] = rowId;
+                            posInFamily[fieldPos] = rowFieldPos;
                             break;
                           }
                         }
                       }
                     }
 
-                    return posToInternalPos;
+                    return new PositionMapping(familyIndex, posInFamily);
                   });
 
   public static CombinedInternalRow create(
@@ -90,7 +94,7 @@ public class CombinedInternalRow extends InternalRow {
   private final Types.StructType struct;
   private final Integer[][] columnSplits;
   private final int size;
-  private final Map<Integer, Pair<Integer, Integer>> posToInternalPos;
+  private final PositionMapping mapping;
   private final InternalRow[] values;
   private final boolean reuseContainers;
 
@@ -98,7 +102,7 @@ public class CombinedInternalRow extends InternalRow {
     this.struct = toClone.struct;
     this.columnSplits = toClone.columnSplits;
     this.size = toClone.size;
-    this.posToInternalPos = toClone.posToInternalPos;
+    this.mapping = toClone.mapping;
     this.reuseContainers = toClone.reuseContainers;
     this.values = new InternalRow[columnSplits.length];
     if (reuseContainers) {
@@ -113,7 +117,7 @@ public class CombinedInternalRow extends InternalRow {
     this.struct = struct;
     this.columnSplits = columnSplits;
     this.size = struct.fields().size();
-    this.posToInternalPos = COMBINER_CACHE.get(Pair.of(struct, columnSplits));
+    this.mapping = COMBINER_CACHE.get(Pair.of(struct, columnSplits));
     this.reuseContainers = reuseContainers;
     this.values = new InternalRow[columnSplits.length];
     if (reuseContainers) {
@@ -189,119 +193,101 @@ public class CombinedInternalRow extends InternalRow {
 
   @Override
   public boolean isNullAt(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    if (internalPos == null) {
+    if (mapping.familyIndex[ordinal] < 0) {
       return true;
     }
-    return values[internalPos.first()].isNullAt(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].isNullAt(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public boolean getBoolean(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getBoolean(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getBoolean(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public byte getByte(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getByte(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getByte(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public short getShort(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getShort(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getShort(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public int getInt(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getInt(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getInt(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public long getLong(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getLong(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getLong(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public float getFloat(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getFloat(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getFloat(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public double getDouble(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getDouble(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getDouble(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public Decimal getDecimal(int ordinal, int precision, int scale) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getDecimal(internalPos.second(), precision, scale);
+    return values[mapping.familyIndex[ordinal]].getDecimal(
+        mapping.posInFamily[ordinal], precision, scale);
   }
 
   @Override
   public UTF8String getUTF8String(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getUTF8String(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getUTF8String(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public byte[] getBinary(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getBinary(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getBinary(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public CalendarInterval getInterval(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getInterval(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getInterval(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public InternalRow getStruct(int ordinal, int numFields) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getStruct(internalPos.second(), numFields);
+    return values[mapping.familyIndex[ordinal]].getStruct(mapping.posInFamily[ordinal], numFields);
   }
 
   @Override
   public ArrayData getArray(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getArray(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getArray(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public MapData getMap(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getMap(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getMap(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public VariantVal getVariant(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getVariant(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getVariant(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public GeographyVal getGeography(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getGeography(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getGeography(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public GeometryVal getGeometry(int ordinal) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].getGeometry(internalPos.second());
+    return values[mapping.familyIndex[ordinal]].getGeometry(mapping.posInFamily[ordinal]);
   }
 
   @Override
   public Object get(int ordinal, DataType dataType) {
-    Pair<Integer, Integer> internalPos = posToInternalPos.get(ordinal);
-    return values[internalPos.first()].get(internalPos.second(), dataType);
+    return values[mapping.familyIndex[ordinal]].get(mapping.posInFamily[ordinal], dataType);
   }
 
   @Override
