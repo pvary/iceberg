@@ -54,6 +54,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.FieldSource;
 
 public class TestGenericFormatModels {
@@ -61,12 +62,20 @@ public class TestGenericFormatModels {
       RandomGenericData.generate(TestBase.SCHEMA, 10, 1L);
 
   private static final List<Record> LARGE_TEST_RECORDS =
-      RandomGenericData.generate(TestBase.SCHEMA, 5000, 2L);
+      RandomGenericData.generate(TestBase.SCHEMA, 50000, 2L);
 
   private static final FileFormat[] FILE_FORMATS =
       new FileFormat[] {FileFormat.AVRO, FileFormat.PARQUET, FileFormat.ORC};
 
   private static final boolean[] MULTI_THREADED = new boolean[] {false, true};
+
+  private static final Arguments[] MULTI_THREADED_AND_REUSE =
+      new Arguments[] {
+        Arguments.of(false, false),
+        Arguments.of(false, true),
+        Arguments.of(true, false),
+        Arguments.of(true, true)
+      };
 
   @TempDir protected Path temp;
 
@@ -373,5 +382,74 @@ public class TestGenericFormatModels {
     if (fileIO.fileExists(outputFile2.encryptingOutputFile().location())) {
       fileIO.deleteFile(outputFile2.encryptingOutputFile());
     }
+  }
+
+  /**
+   * Writes column-split data and reads it back with all combinations of multiThreaded and
+   * reuseContainers. When reuseContainers=true, the underlying Parquet readers reuse their
+   * GenericRecord containers; CombinedRecord.setFamily snapshots the values via System.arraycopy
+   * into pre-allocated slots. In multi-threaded mode, Combiner.copyInto additionally snapshots
+   * reused containers into batch slots on the producer thread.
+   */
+  @ParameterizedTest
+  @FieldSource("MULTI_THREADED_AND_REUSE")
+  public void testColumnSplitReuseContainers(boolean multiThreaded, boolean reuseContainers)
+      throws IOException {
+    FileFormat fileFormat = FileFormat.PARQUET;
+    List<Record> records = LARGE_TEST_RECORDS;
+
+    EncryptedOutputFile outputFile1 =
+        EncryptedFiles.encryptedOutput(
+            fileIO.newOutputFile("reuse-split-file-1"), EncryptionKeyMetadata.EMPTY);
+    EncryptedOutputFile outputFile2 =
+        EncryptedFiles.encryptedOutput(
+            fileIO.newOutputFile("reuse-split-file-2"), EncryptionKeyMetadata.EMPTY);
+
+    // Split columns: file1 gets field 3 (id), file2 gets field 4 (data)
+    Map<EncryptedOutputFile, List<Integer>> writeColumnSplits = new LinkedHashMap<>();
+    writeColumnSplits.put(outputFile1, ImmutableList.of(3));
+    writeColumnSplits.put(outputFile2, ImmutableList.of(4));
+
+    FileWriterBuilder<DataWriter<Record>, Schema> writerBuilder =
+        FormatModelRegistry.dataWriteBuilder(fileFormat, Record.class, writeColumnSplits);
+
+    DataWriter<Record> writer =
+        writerBuilder
+            .schema(TestBase.SCHEMA)
+            .spec(PartitionSpec.unpartitioned())
+            .set(FormatModel.MULTI_THREADED, Boolean.toString(multiThreaded))
+            .build();
+    try (writer) {
+      for (Record record : records) {
+        writer.write(record);
+      }
+    }
+
+    // Read back using column-split reader with the given reuseContainers setting
+    InputFile inputFile1 = outputFile1.encryptingOutputFile().toInputFile();
+    InputFile inputFile2 = outputFile2.encryptingOutputFile().toInputFile();
+
+    Map<InputFile, List<Integer>> readColumnSplits = new LinkedHashMap<>();
+    readColumnSplits.put(inputFile1, ImmutableList.of(3));
+    readColumnSplits.put(inputFile2, ImmutableList.of(4));
+
+    List<Record> readRecords;
+    var readBuilder =
+        FormatModelRegistry.readBuilder(fileFormat, Record.class, readColumnSplits)
+            .project(TestBase.SCHEMA)
+            .set(FormatModel.MULTI_THREADED, Boolean.toString(multiThreaded));
+    if (reuseContainers) {
+      readBuilder.reuseContainers();
+    }
+
+    try (CloseableIterable<Record> reader = readBuilder.build()) {
+      readRecords = ImmutableList.copyOf(CloseableIterable.transform(reader, Record::copy));
+    }
+
+    DataTestHelpers.assertEquals(TestBase.SCHEMA.asStruct(), records, readRecords);
+
+    // Cleanup
+    fileIO.deleteFile(outputFile1.encryptingOutputFile());
+    fileIO.deleteFile(outputFile2.encryptingOutputFile());
   }
 }

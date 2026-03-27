@@ -19,6 +19,7 @@
 package org.apache.iceberg.spark.source;
 
 import java.util.List;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.avro.AvroFormatModel;
 import org.apache.iceberg.formats.FormatModel;
 import org.apache.iceberg.formats.FormatModelRegistry;
@@ -33,6 +34,7 @@ import org.apache.iceberg.spark.data.SparkPlannedAvroReader;
 import org.apache.iceberg.spark.data.vectorized.VectorizedSparkOrcReaders;
 import org.apache.iceberg.spark.data.vectorized.VectorizedSparkParquetReaders;
 import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
 import org.apache.spark.sql.types.StructType;
 import org.apache.spark.sql.vectorized.ColumnarBatch;
 
@@ -53,10 +55,7 @@ public class SparkFormatModels {
             SparkParquetWriters::buildWriter,
             (icebergSchema, fileSchema, engineSchema, idToConstant) ->
                 SparkParquetReaders.buildReader(icebergSchema, fileSchema, idToConstant),
-            (icebergSchema, families) -> {
-              CombinedInternalRow record = CombinedInternalRow.create(icebergSchema, families);
-              return new InternalRowCombiner(record);
-            },
+            InternalRowCombiner::new,
             null));
 
     FormatModelRegistry.register(
@@ -96,19 +95,39 @@ public class SparkFormatModels {
 
   private static class InternalRowCombiner implements FormatModel.Combiner<InternalRow> {
     private final CombinedInternalRow template;
+    private final boolean reuseContainers;
 
-    InternalRowCombiner(CombinedInternalRow template) {
-      this.template = template;
+    InternalRowCombiner(Schema schema, Integer[][] families, boolean reuseContainers) {
+      this.template = CombinedInternalRow.create(schema, families, reuseContainers);
+      this.reuseContainers = reuseContainers;
     }
 
     @Override
     public InternalRow combine(List<InternalRow> rows) {
-      CombinedInternalRow clonedRow = CombinedInternalRow.clone(template);
+      CombinedInternalRow target = reuseContainers ? template : CombinedInternalRow.clone(template);
       for (int i = 0; i < rows.size(); i++) {
-        clonedRow.setColumnSplit(i, rows.get(i));
+        target.setColumnSplit(i, rows.get(i));
       }
 
-      return clonedRow;
+      return target;
+    }
+
+    @Override
+    public InternalRow copyInto(InternalRow source, InternalRow target) {
+      if (!reuseContainers) {
+        return source;
+      }
+
+      if (source instanceof GenericInternalRow src) {
+        GenericInternalRow tgt =
+            target instanceof GenericInternalRow
+                ? (GenericInternalRow) target
+                : new GenericInternalRow(src.numFields());
+        System.arraycopy(src.values(), 0, tgt.values(), 0, src.numFields());
+        return tgt;
+      }
+
+      return source;
     }
   }
 }

@@ -113,17 +113,38 @@ public interface FormatModel<D, S> {
 
   interface Combiner<E> {
     E combine(List<E> elements);
+
+    /**
+     * Shallow-copies the values from {@code source} into {@code target}, returning {@code target}.
+     * Used by multi-threaded readers to snapshot reused containers into pre-allocated batch slots
+     * on the producer thread, before the underlying reader overwrites them.
+     *
+     * <p>When {@code reuseContainers} is false, the default returns {@code source} as-is (each
+     * element is already a distinct object, no copy needed).
+     *
+     * @param source the element to copy from (may be a reused container)
+     * @param target a pre-allocated element to copy into, or {@code null} on first use
+     * @return the element to store in the batch
+     */
+    default E copyInto(E source, E target) {
+      return source;
+    }
+  }
+
+  @FunctionalInterface
+  interface CombinerBuilderFunction<E> {
+    Combiner<E> build(Schema schema, Integer[][] families, boolean reuseContainers);
   }
 
   interface Narrower<E> {
     E narrow(E elements);
   }
 
-  default BiFunction<Schema, Integer[][], Combiner<D>> combiner() {
+  default CombinerBuilderFunction<D> combinerBuilder() {
     throw new UnsupportedOperationException("Not implemented");
   }
 
-  default BiFunction<Schema, Integer[], Narrower<D>> narrower() {
+  default BiFunction<Schema, Integer[], Narrower<D>> narrowerBuilder() {
     throw new UnsupportedOperationException("Not implemented");
   }
 }

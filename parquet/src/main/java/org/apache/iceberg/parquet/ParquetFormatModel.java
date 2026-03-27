@@ -50,7 +50,7 @@ public class ParquetFormatModel<D, S, R>
   private final boolean isBatchReader;
 
   // TODO gaborkaszab: move to base if all the children implements this?
-  private final BiFunction<Schema, Integer[][], Combiner<D>> combinerFunction;
+  private final CombinerBuilderFunction<D> combinerFunction;
   private final BiFunction<Schema, Integer[], Narrower<D>> narrowerFunction;
 
   public static <D> ParquetFormatModel<PositionDelete<D>, Void, Object> forPositionDeletes() {
@@ -63,14 +63,14 @@ public class ParquetFormatModel<D, S, R>
       Class<S> schemaType,
       WriterFunction<ParquetValueWriter<?>, S, MessageType> writerFunction,
       ReaderFunction<ParquetValueReader<?>, S, MessageType> readerFunction,
-      BiFunction<Schema, Integer[][], Combiner<D>> combinerFunction,
+      CombinerBuilderFunction<D> combinerBuilderFunction,
       BiFunction<Schema, Integer[], Narrower<D>> narrowerFunction) {
     return new ParquetFormatModel<>(
         type,
         schemaType,
         writerFunction,
         readerFunction,
-        combinerFunction,
+        combinerBuilderFunction,
         narrowerFunction,
         false);
   }
@@ -87,11 +87,11 @@ public class ParquetFormatModel<D, S, R>
       Class<S> schemaType,
       WriterFunction<ParquetValueWriter<?>, S, MessageType> writerFunction,
       ReaderFunction<R, S, MessageType> readerFunction,
-      BiFunction<Schema, Integer[][], Combiner<D>> combinerFunction,
+      CombinerBuilderFunction<D> combinerBuilderFunction,
       BiFunction<Schema, Integer[], Narrower<D>> narrowerFunction,
       boolean isBatchReader) {
     super(type, schemaType, writerFunction, readerFunction);
-    this.combinerFunction = combinerFunction;
+    this.combinerFunction = combinerBuilderFunction;
     this.narrowerFunction = narrowerFunction;
     this.isBatchReader = isBatchReader;
   }
@@ -112,12 +112,12 @@ public class ParquetFormatModel<D, S, R>
   }
 
   @Override
-  public BiFunction<Schema, Integer[][], Combiner<D>> combiner() {
+  public CombinerBuilderFunction<D> combinerBuilder() {
     return combinerFunction;
   }
 
   @Override
-  public BiFunction<Schema, Integer[], Narrower<D>> narrower() {
+  public BiFunction<Schema, Integer[], Narrower<D>> narrowerBuilder() {
     return narrowerFunction;
   }
 

@@ -136,7 +136,7 @@ public final class FormatModelRegistry {
         columnSplits.entrySet().stream()
             .collect(
                 Collectors.toMap(entry -> model.readBuilder(entry.getKey()), Map.Entry::getValue));
-    return new ColumnSplitReadBuilder<>(readBuilderColumnSplits, model.combiner());
+    return new ColumnSplitReadBuilder<>(readBuilderColumnSplits, model.combinerBuilder());
   }
 
   /**
@@ -177,7 +177,7 @@ public final class FormatModelRegistry {
                 Collectors.toMap(entry -> model.writeBuilder(entry.getKey()), Map.Entry::getValue));
 
     return FileWriterBuilderImpl.forDataFile(
-        new ColumnSplitWriteBuilder<>(writeBuilderColumnSplits, model.narrower()),
+        new ColumnSplitWriteBuilder<>(writeBuilderColumnSplits, model.narrowerBuilder()),
         format,
         columnSplits.keySet().iterator().next());
   }

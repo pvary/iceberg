@@ -103,6 +103,9 @@ public class MultiThreadedParquetBenchmark {
   @Param({"false"})
   private boolean fullFileRead;
 
+  @Param({"true"})
+  private boolean reuseContainers;
+
   {
     // Only delete the write directory to avoid deleting the read/source directory and losing the
     // pregenerated test records.
@@ -247,12 +250,16 @@ public class MultiThreadedParquetBenchmark {
     long val = 0;
 
     String file = readFileName(0);
-    try (CloseableIterable<Record> reader =
+    Parquet.ReadBuilder readerBuilder =
         Parquet.read(Files.localInput(file))
             .project(testSchema)
             .createReaderFunc(
-                fileSchema -> GenericParquetReaders.buildReader(testSchema, fileSchema))
-            .build()) {
+                fileSchema -> GenericParquetReaders.buildReader(testSchema, fileSchema));
+    if (reuseContainers) {
+      readerBuilder.reuseContainers();
+    }
+
+    try (CloseableIterable<Record> reader = readerBuilder.build()) {
       for (Record record : reader) {
         // access something to ensure the compiler doesn't optimize this away
         if (record.get(0) != null) {
@@ -310,6 +317,10 @@ public class MultiThreadedParquetBenchmark {
 
     ReadBuilder<Record, ?> builder =
         FormatModelRegistry.readBuilder(FileFormat.PARQUET, Record.class, columnSplits);
+    if (reuseContainers) {
+      builder.reuseContainers();
+    }
+
     return builder
         .project(testSchema)
         .set(MULTI_THREADED, Boolean.toString(multiThreaded))

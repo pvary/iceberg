@@ -23,7 +23,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.function.BiFunction;
 import java.util.stream.Collectors;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Schema;
@@ -37,15 +36,16 @@ import org.apache.iceberg.types.Types;
 
 class ColumnSplitReadBuilder<X, T> implements ReadBuilder<X, T> {
   private final Map<ReadBuilder<X, ?>, List<Integer>> readBuilders;
-  private final BiFunction<Schema, Integer[][], FormatModel.Combiner<X>> combinerBuilder;
+  private final FormatModel.CombinerBuilderFunction<X> combinerBuilder;
   private Schema schema;
   private boolean multiThreaded = false;
+  private boolean reuseContainers = false;
   private int batchSize = FormatModel.DEFAULT_BATCH_SIZE;
   private int queueCapacity = FormatModel.DEFAULT_QUEUE_CAPACITY;
 
   ColumnSplitReadBuilder(
       Map<ReadBuilder<X, ?>, List<Integer>> readBuilders,
-      BiFunction<Schema, Integer[][], FormatModel.Combiner<X>> newCombinerBuilder) {
+      FormatModel.CombinerBuilderFunction<X> newCombinerBuilder) {
     this.readBuilders = readBuilders;
     this.combinerBuilder = newCombinerBuilder;
   }
@@ -126,6 +126,7 @@ class ColumnSplitReadBuilder<X, T> implements ReadBuilder<X, T> {
 
   @Override
   public ReadBuilder<X, T> reuseContainers() {
+    this.reuseContainers = true;
     readBuilders.keySet().forEach(ReadBuilder::reuseContainers);
     return this;
   }
@@ -151,15 +152,18 @@ class ColumnSplitReadBuilder<X, T> implements ReadBuilder<X, T> {
   @Override
   public CloseableIterable<X> build() {
     FormatModel.Combiner<X> combiner =
-        combinerBuilder.apply(
+        combinerBuilder.build(
             schema,
             readBuilders.values().stream()
                 .map(list -> list.toArray(new Integer[0]))
-                .toArray(Integer[][]::new));
+                .toArray(Integer[][]::new),
+            reuseContainers);
+
     return combiner(
         readBuilders.keySet().stream().map(ReadBuilder::build).collect(Collectors.toList()),
         combiner,
         multiThreaded,
+        reuseContainers,
         batchSize,
         queueCapacity);
   }
@@ -169,6 +173,7 @@ class ColumnSplitReadBuilder<X, T> implements ReadBuilder<X, T> {
       Collection<CloseableIterable<E>> iterable,
       FormatModel.Combiner<E> combiner,
       boolean multiThreaded,
+      boolean reuseContainers,
       int batchSize,
       int queueCapacity) {
     List<SkippingCloseableIterator<E>> iterators =
@@ -186,7 +191,7 @@ class ColumnSplitReadBuilder<X, T> implements ReadBuilder<X, T> {
     CloseableIterator<E> combined =
         multiThreaded
             ? new MultiThreadedCombiningReadIterator<>(
-                iterators, combiner, batchSize, queueCapacity)
+                iterators, combiner, batchSize, queueCapacity, reuseContainers)
             : new SingleThreadedCombiningReadIterator<>(iterators, combiner);
     return CloseableIterable.combine(
         () -> combined,

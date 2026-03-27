@@ -19,6 +19,7 @@
 package org.apache.iceberg.data;
 
 import java.util.List;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.avro.AvroFormatModel;
 import org.apache.iceberg.data.avro.DataWriter;
 import org.apache.iceberg.data.avro.PlannedDataReader;
@@ -51,10 +52,7 @@ public class GenericFormatModels {
                 GenericParquetWriter.create(icebergSchema, fileSchema),
             (icebergSchema, fileSchema, engineSchema, idToConstant) ->
                 GenericParquetReaders.buildReader(icebergSchema, fileSchema, idToConstant),
-            (icebergSchema, families) -> {
-              CombinedRecord record = CombinedRecord.create(icebergSchema, families);
-              return new MyCombiner(record);
-            },
+            MyCombiner::new,
             (icebergSchema, family) -> {
               NarrowedRecord record = NarrowedRecord.create(icebergSchema, family);
               return new MyNarrower(record);
@@ -91,19 +89,39 @@ public class GenericFormatModels {
 
   private static class MyCombiner implements FormatModel.Combiner<Record> {
     private final CombinedRecord template;
+    private final boolean reuseContainers;
 
-    MyCombiner(CombinedRecord template) {
-      this.template = template;
+    MyCombiner(Schema schema, Integer[][] families, boolean reuseContainers) {
+      this.template = CombinedRecord.create(schema, families, reuseContainers);
+      this.reuseContainers = reuseContainers;
     }
 
     @Override
     public Record combine(List<Record> records) {
-      CombinedRecord clonedRecord = CombinedRecord.clone(template);
+      CombinedRecord target = reuseContainers ? template : CombinedRecord.clone(template);
       for (int i = 0; i < records.size(); i++) {
-        clonedRecord.setFamily(i, records.get(i));
+        target.setFamily(i, records.get(i));
       }
 
-      return clonedRecord;
+      return target;
+    }
+
+    @Override
+    public Record copyInto(Record source, Record target) {
+      if (!reuseContainers) {
+        return source;
+      }
+
+      if (source instanceof GenericRecord src) {
+        GenericRecord tgt =
+            target instanceof GenericRecord
+                ? (GenericRecord) target
+                : GenericRecord.create(src.struct());
+        System.arraycopy(src.values(), 0, tgt.values(), 0, src.size());
+        return tgt;
+      }
+
+      return source;
     }
   }
 

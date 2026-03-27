@@ -29,6 +29,7 @@ import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.util.Pair;
 import org.apache.spark.sql.catalyst.InternalRow;
+import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
 import org.apache.spark.sql.catalyst.util.ArrayData;
 import org.apache.spark.sql.catalyst.util.MapData;
 import org.apache.spark.sql.types.DataType;
@@ -77,8 +78,9 @@ public class CombinedInternalRow extends InternalRow {
                     return posToInternalPos;
                   });
 
-  public static CombinedInternalRow create(Schema schema, Integer[]... families) {
-    return new CombinedInternalRow(schema.asStruct(), families);
+  public static CombinedInternalRow create(
+      Schema schema, Integer[][] families, boolean reuseContainers) {
+    return new CombinedInternalRow(schema.asStruct(), families, reuseContainers);
   }
 
   public static CombinedInternalRow clone(CombinedInternalRow toClone) {
@@ -90,21 +92,35 @@ public class CombinedInternalRow extends InternalRow {
   private final int size;
   private final Map<Integer, Pair<Integer, Integer>> posToInternalPos;
   private final InternalRow[] values;
+  private final boolean reuseContainers;
 
   private CombinedInternalRow(CombinedInternalRow toClone) {
     this.struct = toClone.struct;
     this.columnSplits = toClone.columnSplits;
     this.size = toClone.size;
     this.posToInternalPos = toClone.posToInternalPos;
+    this.reuseContainers = toClone.reuseContainers;
     this.values = new InternalRow[columnSplits.length];
+    if (reuseContainers) {
+      for (int i = 0; i < columnSplits.length; i++) {
+        this.values[i] = new GenericInternalRow(columnSplits[i].length);
+      }
+    }
   }
 
-  private CombinedInternalRow(Types.StructType struct, Integer[][] columnSplits) {
+  private CombinedInternalRow(
+      Types.StructType struct, Integer[][] columnSplits, boolean reuseContainers) {
     this.struct = struct;
     this.columnSplits = columnSplits;
     this.size = struct.fields().size();
     this.posToInternalPos = COMBINER_CACHE.get(Pair.of(struct, columnSplits));
+    this.reuseContainers = reuseContainers;
     this.values = new InternalRow[columnSplits.length];
+    if (reuseContainers) {
+      for (int i = 0; i < columnSplits.length; i++) {
+        this.values[i] = new GenericInternalRow(columnSplits[i].length);
+      }
+    }
   }
 
   public void setColumnSplit(int rowPos, InternalRow value) {
@@ -119,7 +135,19 @@ public class CombinedInternalRow extends InternalRow {
         value.numFields(),
         rowPos,
         columnSplits[rowPos].length);
-    values[rowPos] = value;
+    if (reuseContainers && value instanceof GenericInternalRow source) {
+      // Fast path: single native memcpy of the values array into our pre-allocated row.
+      // This avoids storing a reference to a potentially reused container.
+      System.arraycopy(
+          source.values(),
+          0,
+          ((GenericInternalRow) values[rowPos]).values(),
+          0,
+          columnSplits[rowPos].length);
+    } else {
+      // No reuse: the underlying reader returns fresh objects, so storing the reference is safe.
+      values[rowPos] = value;
+    }
   }
 
   @Override
@@ -139,11 +167,21 @@ public class CombinedInternalRow extends InternalRow {
 
   @Override
   public InternalRow copy() {
-    // Copy all internal rows and create a new combined row
     CombinedInternalRow copy = new CombinedInternalRow(this);
     for (int i = 0; i < values.length; i++) {
       if (values[i] != null) {
-        copy.values[i] = values[i].copy();
+        if (reuseContainers) {
+          // Our owned GenericInternalRow slots — arraycopy into the clone's pre-allocated slots
+          System.arraycopy(
+              ((GenericInternalRow) values[i]).values(),
+              0,
+              ((GenericInternalRow) copy.values[i]).values(),
+              0,
+              columnSplits[i].length);
+        } else {
+          // Stored references — delegate to each row's own copy
+          copy.values[i] = values[i].copy();
+        }
       }
     }
     return copy;

@@ -56,6 +56,14 @@ class MultiThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
   private final FormatModel.Combiner<E> combiner;
   private final ExecutorService executorService;
   private final List<BlockingQueue<Batch<E>>> buffers;
+
+  /**
+   * Per-producer queues for returning consumed batches to producers for array reuse. Only populated
+   * when {@code reuseContainers} is true — batch recycling is only beneficial when copyInto
+   * snapshots reused containers into pre-allocated batch slots.
+   */
+  private final List<BlockingQueue<Batch<E>>> returnQueues;
+
   private final List<E> elements;
 
   /** Shared target position: producers skip elements below this position. */
@@ -81,19 +89,24 @@ class MultiThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
       Collection<SkippingCloseableIterator<E>> iterators,
       FormatModel.Combiner<E> combiner,
       int batchSize,
-      int queueCapacity) {
+      int queueCapacity,
+      boolean reuseContainers) {
     this.batchSize = batchSize;
     this.iterators = Lists.newArrayList(iterators);
     this.combiner = combiner;
     int size = this.iterators.size();
     this.executorService = Executors.newFixedThreadPool(size);
     this.buffers = Lists.newArrayListWithExpectedSize(size);
+    this.returnQueues = reuseContainers ? Lists.newArrayListWithExpectedSize(size) : null;
     this.elements = Lists.newArrayListWithExpectedSize(size);
     this.currentBatches = new Batch[size];
 
     for (int i = 0; i < size; ++i) {
       elements.add(null);
       buffers.add(Queues.newArrayBlockingQueue(queueCapacity));
+      if (returnQueues != null) {
+        returnQueues.add(Queues.newLinkedBlockingQueue());
+      }
     }
   }
 
@@ -102,16 +115,18 @@ class MultiThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
    * objects and puts them into its dedicated queue. Producers check the shared {@code
    * targetPosition} before each read to skip ahead when the consumer detects a position gap.
    */
+  @SuppressWarnings("cyclomaticcomplexity")
   private void startFetching() {
     fetching = true;
 
     for (int i = 0; i < iterators.size(); i++) {
       final SkippingCloseableIterator<E> iterator = iterators.get(i);
       final BlockingQueue<Batch<E>> buffer = buffers.get(i);
+      final BlockingQueue<Batch<E>> returnQueue = returnQueues != null ? returnQueues.get(i) : null;
       executorService.execute(
           () -> {
             try {
-              Batch<E> batch = new Batch<>(batchSize);
+              Batch<E> batch = newOrRecycledBatch(returnQueue);
 
               while (!closed && iterator.hasNext()) {
                 long currentTarget = targetPosition.get();
@@ -122,7 +137,7 @@ class MultiThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
                   // these elements to detect the position gap
                   if (!batch.isEmpty()) {
                     buffer.put(batch);
-                    batch = new Batch<>(batchSize);
+                    batch = newOrRecycledBatch(returnQueue);
                   }
 
                   iterator.skipTo(currentTarget);
@@ -137,9 +152,9 @@ class MultiThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
 
                 // Only include if this element is still at or ahead of the target
                 if (pos > targetPosition.get()) {
-                  if (batch.add(value, pos)) {
+                  if (batch.addCopy(value, pos, combiner)) {
                     buffer.put(batch);
-                    batch = new Batch<>(batchSize);
+                    batch = newOrRecycledBatch(returnQueue);
                   }
                 }
                 // Otherwise discard and loop — the target moved while we were reading
@@ -164,6 +179,23 @@ class MultiThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
             }
           });
     }
+  }
+
+  /**
+   * Returns a recycled batch from the return queue if available, otherwise creates a new one. When
+   * recycled, the batch's pre-allocated element slots are preserved for reuse by {@link
+   * Batch#addCopy}.
+   */
+  private Batch<E> newOrRecycledBatch(BlockingQueue<Batch<E>> returnQueue) {
+    if (returnQueue != null) {
+      Batch<E> recycled = returnQueue.poll();
+      if (recycled != null) {
+        recycled.reset();
+        return recycled;
+      }
+    }
+
+    return new Batch<>(batchSize);
   }
 
   private void checkProducerError() {
@@ -198,6 +230,12 @@ class MultiThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
 
         batch.advance();
         continue;
+      }
+
+      // Return the exhausted batch for recycling before blocking on the next one,
+      // so the producer can reuse it sooner
+      if (currentBatches[producerIndex] != null && returnQueues != null) {
+        returnQueues.get(producerIndex).offer(currentBatches[producerIndex]);
       }
 
       // Need a new batch
@@ -307,9 +345,9 @@ class MultiThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
    * A batch of elements with their corresponding positions. Stores data in parallel arrays
    * (struct-of-arrays layout) for better cache locality and to avoid per-element object allocation.
    *
-   * <p>The producer fills the batch by calling {@link #add(Object, long)} repeatedly. The consumer
-   * reads elements sequentially using {@link #hasRemaining()}, {@link #value()}, {@link
-   * #position()}, and {@link #advance()}.
+   * <p>The producer fills the batch by calling {@link #addCopy} repeatedly. The consumer reads
+   * elements sequentially using {@link #hasRemaining()}, {@link #value()}, {@link #position()}, and
+   * {@link #advance()}.
    *
    * <p>A sentinel batch (where {@link #isSentinel()} returns {@code true}) signals that the
    * producer has finished.
@@ -345,17 +383,28 @@ class MultiThreadedCombiningReadIterator<E> implements CloseableIterator<E> {
     }
 
     /**
-     * Appends an element to this batch.
+     * Appends an element to this batch, using {@link FormatModel.Combiner#copyInto} to shallow-copy
+     * reused containers into pre-allocated batch slots. When {@code reuseContainers} is false,
+     * {@code copyInto} returns the source as-is (no copy). When true, the existing slot value
+     * serves as the pre-allocated target for zero-allocation snapshots.
      *
-     * @param value the element value
+     * @param value the element value (may be a reused container)
      * @param position the iterator position associated with this element
+     * @param combiner the combiner providing the copyInto operation
      * @return {@code true} if the batch is full after this add
      */
-    private boolean add(T value, long position) {
-      values[size] = value;
+    @SuppressWarnings("unchecked")
+    private boolean addCopy(T value, long position, FormatModel.Combiner<T> combiner) {
+      values[size] = combiner.copyInto(value, (T) values[size]);
       positions[size] = position;
       size++;
       return size == values.length;
+    }
+
+    /** Resets this batch for reuse, preserving the pre-allocated element slots. */
+    private void reset() {
+      this.size = 0;
+      this.offset = 0;
     }
 
     /** Returns {@code true} if no elements have been added to this batch. */

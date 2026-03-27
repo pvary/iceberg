@@ -32,9 +32,20 @@ import org.apache.iceberg.io.SkippingCloseableIterator;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.FieldSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 class TestColumnSplitReadBuilder {
+
+  @SuppressWarnings("unused")
+  private static final Arguments[] MULTI_THREADED_AND_REUSE =
+      new Arguments[] {
+        Arguments.of(false, false),
+        Arguments.of(false, true),
+        Arguments.of(true, false),
+        Arguments.of(true, true)
+      };
 
   /**
    * A test SkippingCloseableIterator backed by an array. Follows the same position convention as
@@ -150,11 +161,11 @@ class TestColumnSplitReadBuilder {
     public void close() {}
   }
 
-  /** Wraps a TestSkippingIterator into a CloseableIterable for use with FormatModel.combiner. */
-  private static CloseableIterable<Integer> iterableOf(SkippingCloseableIterator<Integer> iter) {
+  /** Wraps a SkippingCloseableIterator into a CloseableIterable for use with combiner. */
+  private static <T> CloseableIterable<T> iterableOf(SkippingCloseableIterator<T> iter) {
     return new CloseableIterable<>() {
       @Override
-      public CloseableIterator<Integer> iterator() {
+      public CloseableIterator<T> iterator() {
         return iter;
       }
 
@@ -189,6 +200,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
             SUM_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
@@ -206,6 +218,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter)),
             FIRST_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
@@ -224,6 +237,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
             SUM_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       CloseableIterator<Integer> iterator = result.iterator();
@@ -242,6 +256,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter)),
             FIRST_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       CloseableIterator<Integer> iterator = result.iterator();
@@ -264,6 +279,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
             SUM_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
@@ -288,6 +304,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
             SUM_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
@@ -313,6 +330,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
             SUM_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
@@ -334,6 +352,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2), iterableOf(iter3)),
             SUM_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
@@ -352,6 +371,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
             SUM_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY);
 
@@ -374,6 +394,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
             SUM_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
@@ -394,6 +415,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
             SUM_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
@@ -465,6 +487,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2), iterableOf(iter3)),
             SUM_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       List<Integer> collected = Lists.newArrayList(result.iterator());
@@ -497,6 +520,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
             SUM_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       CloseableIterator<Integer> iterator = result.iterator();
@@ -529,6 +553,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
             SUM_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       CloseableIterator<Integer> iterator = result.iterator();
@@ -551,6 +576,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
             SUM_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       CloseableIterator<Integer> iterator = result.iterator();
@@ -588,6 +614,7 @@ class TestColumnSplitReadBuilder {
             ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
             SUM_COMBINER,
             multiThreaded,
+            false,
             DEFAULT_BATCH_SIZE,
             DEFAULT_QUEUE_CAPACITY)) {
       CloseableIterator<Integer> iterator = result.iterator();
@@ -599,6 +626,205 @@ class TestColumnSplitReadBuilder {
 
       // Now consume the cached value
       assertThat(iterator.next()).isEqualTo(22); // pos 1: 20+2
+    }
+  }
+
+  /**
+   * A container that holds a single mutable value, simulating a reusable record returned by a
+   * Parquet reader with reuseContainers=true.
+   */
+  private static class MutableContainer {
+    int value;
+
+    MutableContainer(int value) {
+      this.value = value;
+    }
+
+    @Override
+    public String toString() {
+      return "MutableContainer{" + value + "}";
+    }
+  }
+
+  /**
+   * A SkippingCloseableIterator that optionally reuses the same MutableContainer instance,
+   * simulating how a Parquet reader behaves with reuseContainers=true.
+   */
+  private static class ReusableContainerIterator
+      implements SkippingCloseableIterator<MutableContainer> {
+    private final int[] values;
+    private final boolean reuseContainers;
+    private final MutableContainer reusedContainer;
+    private long pos = 0;
+
+    ReusableContainerIterator(boolean reuseContainers, int... values) {
+      this.values = values;
+      this.reuseContainers = reuseContainers;
+      this.reusedContainer = reuseContainers ? new MutableContainer(0) : null;
+    }
+
+    @Override
+    public void skipTo(long targetPosition) {
+      if (targetPosition > pos) {
+        pos = targetPosition;
+      }
+    }
+
+    @Override
+    public long position() {
+      return pos;
+    }
+
+    @Override
+    public boolean hasNext() {
+      return pos < values.length;
+    }
+
+    @Override
+    public MutableContainer next() {
+      if (!hasNext()) {
+        throw new NoSuchElementException();
+      }
+
+      if (reuseContainers) {
+        reusedContainer.value = values[(int) pos];
+        pos++;
+        return reusedContainer;
+      } else {
+        MutableContainer container = new MutableContainer(values[(int) pos]);
+        pos++;
+        return container;
+      }
+    }
+
+    @Override
+    public void close() {}
+  }
+
+  @ParameterizedTest
+  @FieldSource("MULTI_THREADED_AND_REUSE")
+  void testReuseContainers(boolean reuseContainers, boolean multiThreaded) throws IOException {
+    // Underlying iterators reuse their container when reuseContainers=true.
+    // In multi-threaded mode, combiner.copyInto() snapshots reused containers
+    // into pre-allocated batch slots on the producer thread before the source
+    // is overwritten.
+    ReusableContainerIterator iter1 = new ReusableContainerIterator(reuseContainers, 10, 20, 30);
+    ReusableContainerIterator iter2 = new ReusableContainerIterator(reuseContainers, 1, 2, 3);
+
+    // Mimics the real combiner: reuses the combined wrapper in single-threaded mode,
+    // clones it in multi-threaded mode. copyInto does shallow copy when reuseContainers=true.
+    MutableContainer reusedResult = new MutableContainer(0);
+    boolean reuseWrapper = reuseContainers && !multiThreaded;
+    FormatModel.Combiner<MutableContainer> combiner =
+        new FormatModel.Combiner<>() {
+          @Override
+          public MutableContainer combine(List<MutableContainer> elements) {
+            MutableContainer target = reuseWrapper ? reusedResult : new MutableContainer(0);
+            target.value = 0;
+            for (MutableContainer e : elements) {
+              target.value += e.value;
+            }
+
+            return target;
+          }
+
+          @Override
+          public MutableContainer copyInto(MutableContainer source, MutableContainer target) {
+            if (!reuseContainers) {
+              return source;
+            }
+
+            MutableContainer dest = target != null ? target : new MutableContainer(0);
+            dest.value = source.value;
+            return dest;
+          }
+        };
+
+    try (CloseableIterable<MutableContainer> result =
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            combiner,
+            multiThreaded,
+            reuseContainers,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
+      CloseableIterator<MutableContainer> iterator = result.iterator();
+
+      MutableContainer first = iterator.next();
+      assertThat(first.value).isEqualTo(11); // 10 + 1
+
+      MutableContainer second = iterator.next();
+      assertThat(second.value).isEqualTo(22); // 20 + 2
+
+      MutableContainer third = iterator.next();
+      assertThat(third.value).isEqualTo(33); // 30 + 3
+
+      if (reuseWrapper) {
+        // Single-threaded + reuse: same wrapper instance
+        assertThat(first).isSameAs(reusedResult);
+        assertThat(second).isSameAs(reusedResult);
+        assertThat(third).isSameAs(reusedResult);
+      } else {
+        // All other cases: distinct instances with stable values
+        assertThat(second).isNotSameAs(first);
+        assertThat(third).isNotSameAs(second);
+        assertThat(first.value).isEqualTo(11);
+        assertThat(second.value).isEqualTo(22);
+      }
+
+      assertThat(iterator.hasNext()).isFalse();
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  void testNoReuseContainersReturnsDifferentInstances(boolean multiThreaded) throws IOException {
+    // Simulates reuseContainers=false: both the underlying iterators and the combiner create
+    // new containers. Each call to next() should return a different object, and previously
+    // returned objects should remain unchanged.
+    ReusableContainerIterator iter1 = new ReusableContainerIterator(false, 10, 20, 30);
+    ReusableContainerIterator iter2 = new ReusableContainerIterator(false, 1, 2, 3);
+
+    // A combiner that creates a new container each time (like MyCombiner with
+    // reuseContainers=false)
+    FormatModel.Combiner<MutableContainer> cloneCombiner =
+        elements -> {
+          int sum = 0;
+          for (MutableContainer e : elements) {
+            sum += e.value;
+          }
+          return new MutableContainer(sum);
+        };
+
+    try (CloseableIterable<MutableContainer> result =
+        ColumnSplitReadBuilder.combiner(
+            ImmutableList.of(iterableOf(iter1), iterableOf(iter2)),
+            cloneCombiner,
+            multiThreaded,
+            false,
+            DEFAULT_BATCH_SIZE,
+            DEFAULT_QUEUE_CAPACITY)) {
+      CloseableIterator<MutableContainer> iterator = result.iterator();
+
+      MutableContainer first = iterator.next();
+      assertThat(first.value).isEqualTo(11);
+
+      MutableContainer second = iterator.next();
+      assertThat(second.value).isEqualTo(22);
+      // Without reuse, each result is a distinct object
+      assertThat(second).isNotSameAs(first);
+      // Previously returned instance should still hold its original value
+      assertThat(first.value).isEqualTo(11);
+
+      MutableContainer third = iterator.next();
+      assertThat(third.value).isEqualTo(33);
+      assertThat(third).isNotSameAs(first);
+      assertThat(third).isNotSameAs(second);
+      // All previous instances retain their values
+      assertThat(first.value).isEqualTo(11);
+      assertThat(second.value).isEqualTo(22);
+
+      assertThat(iterator.hasNext()).isFalse();
     }
   }
 }

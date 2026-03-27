@@ -60,6 +60,11 @@ public class GenericRecord implements Record, StructLike {
   private final Object[] values;
   private final Map<String, Integer> nameToPos;
 
+  /** Package-private accessor for the backing values array, used by {@link CombinedRecord}. */
+  Object[] values() {
+    return values;
+  }
+
   private GenericRecord(StructType struct) {
     this.struct = struct;
     this.size = struct.fields().size();

@@ -64,8 +64,9 @@ public class CombinedRecord implements Record, StructLike {
                 return new PositionMapping(familyIndex, posInFamily);
               });
 
-  public static CombinedRecord create(Schema schema, Integer[]... families) {
-    return new CombinedRecord(schema.asStruct(), families);
+  public static CombinedRecord create(
+      Schema schema, Integer[][] families, boolean reuseContainers) {
+    return new CombinedRecord(schema.asStruct(), families, reuseContainers);
   }
 
   public static CombinedRecord clone(CombinedRecord toClone) {
@@ -77,21 +78,36 @@ public class CombinedRecord implements Record, StructLike {
   private final int size;
   private final PositionMapping mapping;
   private final Record[] values;
+  private final boolean reuseContainers;
 
   private CombinedRecord(CombinedRecord toClone) {
     this.struct = toClone.struct;
     this.families = toClone.families;
     this.size = toClone.size;
     this.mapping = toClone.mapping;
+    this.reuseContainers = toClone.reuseContainers;
     this.values = new Record[families.length];
+    if (reuseContainers) {
+      for (int i = 0; i < families.length; i++) {
+        this.values[i] = GenericRecord.create(toClone.values[i].struct());
+      }
+    }
   }
 
-  private CombinedRecord(StructType struct, Integer[][] families) {
+  private CombinedRecord(StructType struct, Integer[][] families, boolean reuseContainers) {
     this.struct = struct;
     this.families = families;
     this.size = struct.fields().size();
     this.mapping = CACHE.get(Pair.of(struct, families));
+    this.reuseContainers = reuseContainers;
     this.values = new Record[families.length];
+    if (reuseContainers) {
+      for (int i = 0; i < families.length; i++) {
+        this.values[i] =
+            GenericRecord.create(
+                Types.StructType.of(Arrays.stream(families[i]).map(struct::field).toList()));
+      }
+    }
   }
 
   public void setFamily(int recordPos, Record value) {
@@ -106,7 +122,20 @@ public class CombinedRecord implements Record, StructLike {
         value.struct(),
         recordPos,
         families[recordPos].length);
-    values[recordPos] = value;
+
+    if (reuseContainers && value instanceof GenericRecord source) {
+      // Fast path: single native memcpy of the values array into our pre-allocated record.
+      // This avoids storing a reference to a potentially reused container.
+      System.arraycopy(
+          source.values(),
+          0,
+          ((GenericRecord) values[recordPos]).values(),
+          0,
+          families[recordPos].length);
+    } else {
+      // No reuse: the underlying reader returns fresh objects, so storing the reference is safe.
+      values[recordPos] = value;
+    }
   }
 
   @Override
@@ -216,13 +245,5 @@ public class CombinedRecord implements Record, StructLike {
     return Objects.hashCode((Object[]) values);
   }
 
-  private static class PositionMapping {
-    final int[] familyIndex;
-    final int[] posInFamily;
-
-    PositionMapping(int[] familyIndex, int[] posInFamily) {
-      this.familyIndex = familyIndex;
-      this.posInFamily = posInFamily;
-    }
-  }
+  private record PositionMapping(int[] familyIndex, int[] posInFamily) {}
 }
