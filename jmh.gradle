@@ -62,6 +62,17 @@ configure(jmhProjects) {
   apply plugin: 'me.champeau.jmh'
   apply plugin: 'io.morethan.jmhreport'
 
+  // Make S3 / ADLS FileIO implementations available on iceberg-data's JMH classpath so
+  // benchmarks like InvertedIndexParquetBenchmark can target LOCAL / S3 / ADLS at runtime.
+  if (project.path == ':iceberg-data') {
+    dependencies {
+      jmhImplementation project(':iceberg-aws')
+      jmhImplementation project(':iceberg-aws-bundle')
+      jmhImplementation project(':iceberg-azure')
+      jmhImplementation project(':iceberg-azure-bundle')
+    }
+  }
+
   def jmhReportDir = project.property("jmhJsonOutputPath").toString().replace(".json", "")
   mkdir(file(jmhReportDir))
 
