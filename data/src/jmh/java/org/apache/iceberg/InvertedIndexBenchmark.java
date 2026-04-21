@@ -601,6 +601,10 @@ public class InvertedIndexBenchmark {
             .set(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, "1")
             .set(TableProperties.PARQUET_ROW_GROUP_CHECK_MIN_RECORD_COUNT, rgRows)
             .set(TableProperties.PARQUET_ROW_GROUP_CHECK_MAX_RECORD_COUNT, rgRows)
+            // Skip min/max stats for the payload columns -- they are never used for predicate
+            // push-down (only the key column is filtered on) so writing them just bloats the file.
+            .set(TableProperties.PARQUET_COLUMN_STATS_ENABLED_PREFIX + "file_path", "false")
+            .set(TableProperties.PARQUET_COLUMN_STATS_ENABLED_PREFIX + "pos", "false")
             .overwrite();
 
     return builder.build();
