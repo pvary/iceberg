@@ -20,11 +20,8 @@ package org.apache.iceberg;
 
 import static org.apache.iceberg.types.Types.NestedField.required;
 
-import it.unimi.dsi.fastutil.ints.IntArrays;
 import java.io.File;
 import java.io.IOException;
-import java.nio.ByteBuffer;
-import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -34,19 +31,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.data.parquet.GenericParquetReaders;
-import org.apache.iceberg.data.parquet.GenericParquetWriter;
-import org.apache.iceberg.expressions.Expression;
-import org.apache.iceberg.expressions.Expressions;
-import org.apache.iceberg.io.CloseableIterable;
-import org.apache.iceberg.io.FileAppender;
+import org.apache.iceberg.index.IndexHandler;
+import org.apache.iceberg.index.MinimalPerfectHashFunctionIndexHandler;
+import org.apache.iceberg.index.ParquetIndexHandler;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.PositionOutputStream;
 import org.apache.iceberg.io.SeekableInputStream;
-import org.apache.iceberg.mphf.MinimalPerfectHashFunctionIndexFile;
-import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
@@ -102,8 +94,6 @@ import org.slf4j.LoggerFactory;
  */
 @Fork(1)
 @State(Scope.Benchmark)
-@Warmup(iterations = 3)
-@Measurement(iterations = 20)
 @BenchmarkMode(Mode.SingleShotTime)
 @OutputTimeUnit(TimeUnit.MICROSECONDS)
 public class InvertedIndexBenchmark {
@@ -113,7 +103,7 @@ public class InvertedIndexBenchmark {
   private static final int NUM_SOURCE_FILES = 1024 * 1024;
 
   /** Number of pre-generated lookup keys to rotate through during measurement. */
-  private static final int NUM_LOOKUP_KEYS = 1024;
+  private static final int NUM_LOOKUP_KEYS = 1024 * 1024;
 
   private static final long SEED = 42L;
 
@@ -151,13 +141,21 @@ public class InvertedIndexBenchmark {
 
   private FileIO io;
   private String fileLocation;
-  private Schema schema;
+  private Schema keySchema; // key-only schema, used to drive the index handler
+
+  /**
+   * The index handler chosen for this run, instantiated once in {@link #setupBenchmark()} based on
+   * {@link #indexType}. Both {@link #lookup} and {@link #write} go through this single instance so
+   * the in-process reader picks up any state the writer published (e.g. {@code
+   * ParquetIndexHandler#filePathPrefix}).
+   */
+  private IndexHandler indexHandler;
 
   // Pre-generated lookup keys. For COMPOSITE: longKeys[i] + stringKeys[i] form the composite key.
   private long[] longKeys;
   private String[] stringKeys; // used for STRING and COMPOSITE types
   private UUID[] uuidKeys; // used for UUID type
-  private byte[][] lookupKeyBytes; // used by the MPHF index
+  private Record[] lookupKeyRecords; // one Record per lookup key, matching keySchema
 
   /** The row index the sampled lookup key came from. Used to validate {@code lookup()} hits. */
   private long[] expectedPositions;
@@ -175,10 +173,14 @@ public class InvertedIndexBenchmark {
   private int writeCursor;
 
   @Setup
-  public void setupBenchmark() throws IOException {
+  public void setupBenchmark() throws Exception {
     parseIndexType();
     this.io = new CountingFileIO(createFileIO());
-    this.schema = isMphf ? null : buildSchema(keyType);
+    this.keySchema = buildKeySchema(keyType);
+    this.indexHandler =
+        isMphf
+            ? new MinimalPerfectHashFunctionIndexHandler(keySchema)
+            : new ParquetIndexHandler(keySchema, rowGroupRows);
 
     String fileName =
         isMphf
@@ -229,16 +231,15 @@ public class InvertedIndexBenchmark {
     stringKeys = new String[NUM_LOOKUP_KEYS];
     uuidKeys = new UUID[NUM_LOOKUP_KEYS];
     expectedPositions = new long[NUM_LOOKUP_KEYS];
-    lookupKeyBytes = isMphf ? new byte[NUM_LOOKUP_KEYS][] : null;
+    lookupKeyRecords = new Record[NUM_LOOKUP_KEYS];
     for (int i = 0; i < NUM_LOOKUP_KEYS; i++) {
       int row = rand.nextInt(numRows);
       longKeys[i] = allLongs[row];
       stringKeys[i] = allStrings == null ? null : allStrings[row];
       uuidKeys[i] = allUuids == null ? null : allUuids[row];
       expectedPositions[i] = row;
-      if (isMphf) {
-        lookupKeyBytes[i] = encodeKey(keyType, longKeys[i], uuidKeys[i], stringKeys[i]);
-      }
+      lookupKeyRecords[i] =
+          buildKeyRecord(keySchema, keyType, longKeys[i], uuidKeys[i], stringKeys[i]);
     }
 
     shuffleLookups(new Random(SEED + 1));
@@ -247,11 +248,7 @@ public class InvertedIndexBenchmark {
 
     long writeStart = System.nanoTime();
     if (!reuseExisting) {
-      if (isMphf) {
-        writeMphfIndex(allLongs, allUuids, allStrings);
-      } else {
-        writeParquetIndex(allLongs, allUuids, allStrings);
-      }
+      writeIndex();
     }
 
     long writeMs = (System.nanoTime() - writeStart) / 1_000_000;
@@ -310,66 +307,51 @@ public class InvertedIndexBenchmark {
 
   @Benchmark
   @Threads(1)
-  public void lookup(Blackhole bh, ReadCounter ioCounter) throws IOException {
+  @Warmup(iterations = 1000)
+  @Measurement(iterations = 10000)
+  public void lookup(Blackhole bh, ReadCounter ioCounter) throws Exception {
     int idx = lookupCursor++ & (NUM_LOOKUP_KEYS - 1);
     long expectedPos = expectedPositions[idx];
     String expectedFilePath =
         "s3://bucket/warehouse/db/tbl/data/file-" + (expectedPos % NUM_SOURCE_FILES) + ".parquet";
 
-    if (isMphf) {
-      try (MinimalPerfectHashFunctionIndexFile.Reader reader =
-          new MinimalPerfectHashFunctionIndexFile.Reader(io.newInputFile(fileLocation))) {
-        MinimalPerfectHashFunctionIndexFile.Reader.Hit hit = reader.lookup(lookupKeyBytes[idx]);
-        if (hit == null) {
-          throw new AssertionError("MPHF lookup returned null for idx=" + idx);
-        }
-
-        if (hit.pos != expectedPos) {
-          throw new AssertionError(
-              "MPHF pos mismatch for idx=" + idx + ": expected " + expectedPos + " got " + hit.pos);
-        }
-
-        if (!expectedFilePath.equals(hit.filePath)) {
-          throw new AssertionError(
-              "MPHF filePath mismatch for idx="
-                  + idx
-                  + ": expected "
-                  + expectedFilePath
-                  + " got "
-                  + hit.filePath);
-        }
-
-        // Found the expected match
-      }
-    } else {
-      Expression filter = buildFilter(keyType, idx);
-      try (CloseableIterable<Record> reader =
-          Parquet.read(io.newInputFile(fileLocation))
-              .project(schema)
-              .filter(filter)
-              .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(schema, fileSchema))
-              .build()) {
-        for (Record record : reader) {
-          long pos = (long) record.getField("pos");
-          String path = (String) record.getField("file_path");
-          // Parquet's predicate push-down may yield false positives (row-group / page boundary
-          // candidates that don't actually match). Skip them and keep scanning until we either
-          // find the exact match or exhaust the iterator.
-          if (pos == expectedPos && expectedFilePath.equals(path)) {
-            bh.consume(record);
-            // Found the expected match
-            return;
-          }
-        }
-
-        throw new AssertionError(
-            "Parquet expected match (pos="
+    try (IndexHandler.Reader reader = indexHandler.reader(io.newInputFile(fileLocation))) {
+      IndexHandler.Hit hit = reader.lookup(lookupKeyRecords[idx]);
+      if (hit == null) {
+        throw new RuntimeException(
+            indexType
+                + " lookup returned null for idx="
+                + idx
+                + " (expected pos="
                 + expectedPos
                 + ", filePath="
                 + expectedFilePath
-                + ") not found for idx="
-                + idx);
+                + ")");
       }
+
+      if (hit.pos() != expectedPos) {
+        throw new RuntimeException(
+            indexType
+                + " pos mismatch for idx="
+                + idx
+                + ": expected "
+                + expectedPos
+                + " got "
+                + hit.pos());
+      }
+
+      if (!expectedFilePath.equals(hit.filePath())) {
+        throw new RuntimeException(
+            indexType
+                + " filePath mismatch for idx="
+                + idx
+                + ": expected "
+                + expectedFilePath
+                + " got "
+                + hit.filePath());
+      }
+
+      bh.consume(hit);
     }
   }
 
@@ -383,16 +365,12 @@ public class InvertedIndexBenchmark {
   @Threads(1)
   @Warmup(iterations = 1)
   @Measurement(iterations = 3)
-  public void write(Blackhole bh, WriteCounter ioCounter) throws IOException {
+  public void write(Blackhole bh, WriteCounter ioCounter) throws Exception {
     String originalLocation = fileLocation;
     String writeLocation = joinPath(baseLocation(), uniqueWriteFileName());
     fileLocation = writeLocation;
     try {
-      if (isMphf) {
-        writeMphfIndex(allLongs, allUuids, allStrings);
-      } else {
-        writeParquetIndex(allLongs, allUuids, allStrings);
-      }
+      writeIndex();
 
       // Report the resulting file size via the IoCounter aux metric so it shows up as
       // `write:indexFileBytes` in the JMH results table.
@@ -434,74 +412,23 @@ public class InvertedIndexBenchmark {
   // --------------------------------------------------------------------------
 
   /**
-   * Writes the MPHF inverted-index file. Entries are added in row order; the MPHF is built and the
-   * file is written when the writer is closed.
+   * Materializes the inverted-index file via {@link #indexHandler}. Each row is encoded into a key
+   * {@link Record} (matching {@link #keySchema}) plus the synthetic source-file path the row
+   * "originated" from; the handler decides how to lay that out on disk.
    */
-  private void writeMphfIndex(long[] allLongs, UUID[] allUuids, String[] allStrings)
-      throws IOException {
-    try (MinimalPerfectHashFunctionIndexFile.Writer writer =
-        new MinimalPerfectHashFunctionIndexFile.Writer(io.newOutputFile(fileLocation))) {
+  private void writeIndex() throws Exception {
+    try (IndexHandler.Writer writer = indexHandler.writer(io.newOutputFile(fileLocation))) {
       for (int row = 0; row < numRows; row++) {
-        byte[] keyBytes =
-            encodeKey(
+        Record keyRecord =
+            buildKeyRecord(
+                keySchema,
                 keyType,
                 allLongs[row],
                 allUuids == null ? null : allUuids[row],
                 allStrings == null ? null : allStrings[row]);
         String filePath =
             "s3://bucket/warehouse/db/tbl/data/file-" + (row % NUM_SOURCE_FILES) + ".parquet";
-        writer.add(keyBytes, filePath, row);
-      }
-    }
-  }
-
-  /**
-   * Writes the Parquet inverted-index file with rows sorted by the primary key so a point lookup
-   * touches a single row group (statistics-based skipping).
-   */
-  private void writeParquetIndex(long[] allLongs, UUID[] allUuids, String[] allStrings)
-      throws IOException {
-    // Primitive int[] order keeps the sorting workspace at 4 bytes/row (~40 MB at 10M rows)
-    // instead of the ~240 MB an Integer[] would need (boxed Integer + reference per slot).
-    int[] order = new int[numRows];
-    for (int i = 0; i < numRows; i++) {
-      order[i] = i;
-    }
-
-    switch (keyType) {
-      case LONG -> IntArrays.quickSort(order, (a, b) -> Long.compare(allLongs[a], allLongs[b]));
-      case UUID -> IntArrays.quickSort(order, (a, b) -> allUuids[a].compareTo(allUuids[b]));
-      case STRING -> IntArrays.quickSort(order, (a, b) -> allStrings[a].compareTo(allStrings[b]));
-      case COMPOSITE ->
-          IntArrays.quickSort(
-              order,
-              (a, b) -> {
-                int c = Long.compare(allLongs[a], allLongs[b]);
-                return c != 0 ? c : allStrings[a].compareTo(allStrings[b]);
-              });
-    }
-
-    try (FileAppender<Record> writer = newWriter(io.newOutputFile(fileLocation), schema)) {
-      GenericRecord template = GenericRecord.create(schema);
-      for (int sortedRow = 0; sortedRow < numRows; sortedRow++) {
-        int origRow = order[sortedRow];
-        Record record = template.copy();
-        int pos = 0;
-        switch (keyType) {
-          case LONG -> record.set(pos++, allLongs[origRow]);
-          case UUID -> record.set(pos++, allUuids[origRow]);
-          case STRING -> record.set(pos++, allStrings[origRow]);
-          case COMPOSITE -> {
-            record.set(pos++, allLongs[origRow]);
-            record.set(pos++, allStrings[origRow]);
-          }
-        }
-
-        record.set(
-            pos++,
-            "s3://bucket/warehouse/db/tbl/data/file-" + (origRow % NUM_SOURCE_FILES) + ".parquet");
-        record.set(pos, (long) origRow);
-        writer.add(record);
+        writer.add(keyRecord, filePath, row);
       }
     }
   }
@@ -510,7 +437,8 @@ public class InvertedIndexBenchmark {
   // helpers
   // --------------------------------------------------------------------------
 
-  private static Schema buildSchema(KeyType type) {
+  /** Builds the key-only schema (no payload columns). Used to configure the index handler. */
+  private static Schema buildKeySchema(KeyType type) {
     List<Types.NestedField> fields = Lists.newArrayList();
     int id = 1;
     switch (type) {
@@ -519,13 +447,28 @@ public class InvertedIndexBenchmark {
       case STRING -> fields.add(required(id++, "key", Types.StringType.get()));
       case COMPOSITE -> {
         fields.add(required(id++, "key_long", Types.LongType.get()));
-        fields.add(required(id++, "key_str", Types.StringType.get()));
+        fields.add(required(id, "key_str", Types.StringType.get()));
       }
     }
 
-    fields.add(required(id++, "file_path", Types.StringType.get()));
-    fields.add(required(id, "pos", Types.LongType.get()));
     return new Schema(fields);
+  }
+
+  /** Materializes a {@link Record} matching {@link #buildKeySchema(KeyType)} for the given key. */
+  private static Record buildKeyRecord(
+      Schema keySchema, KeyType type, long longVal, UUID uuidVal, String stringVal) {
+    Record record = GenericRecord.create(keySchema);
+    switch (type) {
+      case LONG -> record.set(0, longVal);
+      case UUID -> record.set(0, uuidVal);
+      case STRING -> record.set(0, stringVal);
+      case COMPOSITE -> {
+        record.set(0, longVal);
+        record.set(1, stringVal);
+      }
+    }
+
+    return record;
   }
 
   private static Object[] generateKey(KeyType type, int row, Random rand) {
@@ -537,36 +480,6 @@ public class InvertedIndexBenchmark {
     };
   }
 
-  /**
-   * Encodes a typed primary key as a stable {@code byte[]} for the MPHF index. Layouts:
-   *
-   * <ul>
-   *   <li>{@code LONG}: 8-byte big-endian
-   *   <li>{@code UUID}: 16 bytes (most-sig first)
-   *   <li>{@code STRING}: UTF-8 bytes of the string
-   *   <li>{@code COMPOSITE}: 8-byte big-endian long, followed by UTF-8 bytes of the string
-   * </ul>
-   */
-  private static byte[] encodeKey(KeyType type, long longVal, UUID uuidVal, String stringVal) {
-    return switch (type) {
-      case LONG -> ByteBuffer.allocate(8).putLong(longVal).array();
-      case UUID -> {
-        ByteBuffer b = ByteBuffer.allocate(16);
-        b.putLong(uuidVal.getMostSignificantBits());
-        b.putLong(uuidVal.getLeastSignificantBits());
-        yield b.array();
-      }
-      case STRING -> stringVal.getBytes(StandardCharsets.UTF_8);
-      case COMPOSITE -> {
-        byte[] s = stringVal.getBytes(StandardCharsets.UTF_8);
-        ByteBuffer b = ByteBuffer.allocate(8 + s.length);
-        b.putLong(longVal);
-        b.put(s);
-        yield b.array();
-      }
-    };
-  }
-
   private static String randomString(Random rand, int len) {
     char[] buf = new char[len];
     for (int i = 0; i < len; i++) {
@@ -574,40 +487,6 @@ public class InvertedIndexBenchmark {
     }
 
     return new String(buf);
-  }
-
-  private Expression buildFilter(KeyType type, int idx) {
-    return switch (type) {
-      case LONG -> Expressions.equal("key", longKeys[idx]);
-      case UUID -> Expressions.equal("key", uuidKeys[idx]);
-      case STRING -> Expressions.equal("key", stringKeys[idx]);
-      case COMPOSITE ->
-          Expressions.and(
-              Expressions.equal("key_long", longKeys[idx]),
-              Expressions.equal("key_str", stringKeys[idx]));
-    };
-  }
-
-  private FileAppender<Record> newWriter(OutputFile outputFile, Schema fileSchema)
-      throws IOException {
-    // Force exactly `rowGroupRows` rows per row group: set the size target to a value the writer
-    // is guaranteed to exceed in any single record (1 byte) and force the size check to fire on
-    // every Nth record by pinning min == max == rowGroupRows.
-    String rgRows = Integer.toString(rowGroupRows);
-    Parquet.WriteBuilder builder =
-        Parquet.write(outputFile)
-            .schema(fileSchema)
-            .createWriterFunc(GenericParquetWriter::create)
-            .set(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, "1")
-            .set(TableProperties.PARQUET_ROW_GROUP_CHECK_MIN_RECORD_COUNT, rgRows)
-            .set(TableProperties.PARQUET_ROW_GROUP_CHECK_MAX_RECORD_COUNT, rgRows)
-            // Skip min/max stats for the payload columns -- they are never used for predicate
-            // push-down (only the key column is filtered on) so writing them just bloats the file.
-            .set(TableProperties.PARQUET_COLUMN_STATS_ENABLED_PREFIX + "file_path", "false")
-            .set(TableProperties.PARQUET_COLUMN_STATS_ENABLED_PREFIX + "pos", "false")
-            .overwrite();
-
-    return builder.build();
   }
 
   // --------------------------------------------------------------------------
@@ -638,7 +517,7 @@ public class InvertedIndexBenchmark {
 
     Storage storage = selectedStorage();
     if (storage == Storage.LOCAL) {
-      File benchDir = new File("data/benchmark/inverted-index");
+      File benchDir = new File("data/benchmark/inverted-index2");
       if (!benchDir.exists() && !benchDir.mkdirs()) {
         throw new IllegalStateException(
             "Could not create benchmark dir: " + benchDir.getAbsolutePath());
@@ -704,10 +583,10 @@ public class InvertedIndexBenchmark {
       long tp = expectedPositions[i];
       expectedPositions[i] = expectedPositions[j];
       expectedPositions[j] = tp;
-      if (lookupKeyBytes != null) {
-        byte[] tb = lookupKeyBytes[i];
-        lookupKeyBytes[i] = lookupKeyBytes[j];
-        lookupKeyBytes[j] = tb;
+      if (lookupKeyRecords != null) {
+        Record tr = lookupKeyRecords[i];
+        lookupKeyRecords[i] = lookupKeyRecords[j];
+        lookupKeyRecords[j] = tr;
       }
     }
   }
@@ -808,12 +687,7 @@ public class InvertedIndexBenchmark {
     }
   }
 
-  private static final class CountingInputFile implements InputFile {
-    private final InputFile delegate;
-
-    CountingInputFile(InputFile delegate) {
-      this.delegate = delegate;
-    }
+  private record CountingInputFile(InputFile delegate) implements InputFile {
 
     @Override
     public long getLength() {
@@ -902,12 +776,7 @@ public class InvertedIndexBenchmark {
     }
   }
 
-  private static final class CountingOutputFile implements OutputFile {
-    private final OutputFile delegate;
-
-    CountingOutputFile(OutputFile delegate) {
-      this.delegate = delegate;
-    }
+  private record CountingOutputFile(OutputFile delegate) implements OutputFile {
 
     @Override
     public PositionOutputStream create() {
