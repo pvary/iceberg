@@ -307,8 +307,8 @@ public class InvertedIndexBenchmark {
 
   @Benchmark
   @Threads(1)
-  @Warmup(iterations = 1000)
-  @Measurement(iterations = 10000)
+  @Warmup(iterations = 10)
+  @Measurement(iterations = 100)
   public void lookup(Blackhole bh, ReadCounter ioCounter) throws Exception {
     int idx = lookupCursor++ & (NUM_LOOKUP_KEYS - 1);
     long expectedPos = expectedPositions[idx];
@@ -517,7 +517,7 @@ public class InvertedIndexBenchmark {
 
     Storage storage = selectedStorage();
     if (storage == Storage.LOCAL) {
-      File benchDir = new File("data/benchmark/inverted-index2");
+      File benchDir = new File("data/benchmark/inverted-index");
       if (!benchDir.exists() && !benchDir.mkdirs()) {
         throw new IllegalStateException(
             "Could not create benchmark dir: " + benchDir.getAbsolutePath());

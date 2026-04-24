@@ -87,7 +87,13 @@ configure(jmhProjects) {
     forceGC = true
     includeTests = true
     humanOutputFile = file(jmhOutputPath)
-    jvmArgs = ['-Xmx32g']
+    // Forward any -Dindex.bench.* system properties from the Gradle invocation to the
+    // forked JMH JVM so benchmarks like InvertedIndexBenchmark can pick up their
+    // storage/credentials configuration.
+    def forwarded = System.properties.findAll { k, v ->
+      k.toString().startsWith('index.bench.')
+    }.collect { k, v -> "-D${k}=${v}".toString() }
+    jvmArgs = ['-Xmx32g'] + forwarded
     resultsFile = file(jmhJsonOutputPath)
     resultFormat = 'JSON'
     includes = [jmhIncludeRegex]
