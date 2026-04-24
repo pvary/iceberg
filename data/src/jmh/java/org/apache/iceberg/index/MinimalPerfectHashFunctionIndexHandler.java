@@ -123,15 +123,15 @@ public class MinimalPerfectHashFunctionIndexHandler implements IndexHandler {
   private final Function<Record, byte[]> keyEncoder;
 
   /**
-   * Caller-supplied estimate of the number of keys this handler will be asked to index / read.
-   * Used purely as a sizing hint:
+   * Caller-supplied estimate of the number of keys this handler will be asked to index / read. Used
+   * purely as a sizing hint:
    *
    * <ul>
    *   <li>{@link Writer} pre-sizes its key / path / position buffers so they don't grow-and-copy
    *       through O(log n) doublings as entries are appended.
-   *   <li>{@link Reader} uses it to size the speculative open-time prefetch precisely so the
-   *       fixed header + prefix + hash-function blob are typically fetched in a single underlying
-   *       {@code read()} call.
+   *   <li>{@link Reader} uses it to size the speculative open-time prefetch precisely so the fixed
+   *       header + prefix + hash-function blob are typically fetched in a single underlying {@code
+   *       read()} call.
    * </ul>
    *
    * <p>Must be {@code > 0}. Under-estimates cost at most one extra {@code read()} call at Reader
@@ -141,17 +141,17 @@ public class MinimalPerfectHashFunctionIndexHandler implements IndexHandler {
 
   /**
    * Creates a handler bound to a key {@link Schema} and an estimated key count. The schema must
-   * contain at least one field and every field must be one of the supported primitive types
-   * ({@code long}, {@code int}, {@code string}, {@code uuid}); the fields can appear in any order
-   * and any combination.
+   * contain at least one field and every field must be one of the supported primitive types ({@code
+   * long}, {@code int}, {@code string}, {@code uuid}); the fields can appear in any order and any
+   * combination.
    *
    * <p>The schema is compiled once into a per-record encoder that produces the canonical {@code
    * byte[]} representation used by the MPHF (see {@link #keyEncoder(Schema)}).
    *
    * <p>{@code expectedKeyCount} is used as a sizing hint for both the writer (pre-sized buffers)
    * and the reader (speculative prefetch). It does not need to be exact: under-estimating costs at
-   * most one extra {@code read()} call at Reader open; over-estimating wastes some transient
-   * memory at Writer time.
+   * most one extra {@code read()} call at Reader open; over-estimating wastes some transient memory
+   * at Writer time.
    */
   public MinimalPerfectHashFunctionIndexHandler(Schema schema, long expectedKeyCount) {
     if (expectedKeyCount <= 0L) {
@@ -602,13 +602,9 @@ public class MinimalPerfectHashFunctionIndexHandler implements IndexHandler {
         // Slow path: need to read the tail.  Allocate the full metadata region up front and
         // copy what we already have.
         metadataRegion = new byte[metadataRegionLength];
-        System.arraycopy(
-            prefetched, HEADER_FIXED_LENGTH, metadataRegion, 0, prefetchedMetadata);
+        System.arraycopy(prefetched, HEADER_FIXED_LENGTH, metadataRegion, 0, prefetchedMetadata);
         readFully(
-            stream,
-            metadataRegion,
-            prefetchedMetadata,
-            metadataRegionLength - prefetchedMetadata);
+            stream, metadataRegion, prefetchedMetadata, metadataRegionLength - prefetchedMetadata);
       }
 
       byte[] prefix = Arrays.copyOfRange(metadataRegion, 0, prefixLength);
@@ -620,8 +616,7 @@ public class MinimalPerfectHashFunctionIndexHandler implements IndexHandler {
       // 3) Deserialize the hash function from the in-memory slice (no further IO).
       try (ObjectInputStream ois =
           new ObjectInputStream(
-              new ByteArrayInputStream(
-                  metadataRegion, prefixLength, hashFunctionLengthInt))) {
+              new ByteArrayInputStream(metadataRegion, prefixLength, hashFunctionLengthInt))) {
         this.hashFunction = (GOVMinimalPerfectHashFunction<byte[]>) ois.readObject();
       } catch (ClassNotFoundException e) {
         throw new IOException("Failed to deserialize hash function", e);
