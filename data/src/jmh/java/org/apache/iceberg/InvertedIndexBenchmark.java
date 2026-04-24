@@ -601,6 +601,10 @@ public class InvertedIndexBenchmark {
   private static final AtomicLong BYTES_READ = new AtomicLong();
   private static final AtomicLong SEEKS = new AtomicLong();
   private static final AtomicLong OPEN_INPUT_STREAMS = new AtomicLong();
+  // Cumulative wall-clock nanoseconds spent inside the corresponding IO call.
+  private static final AtomicLong OPEN_NANOS = new AtomicLong();
+  private static final AtomicLong SEEK_NANOS = new AtomicLong();
+  private static final AtomicLong READ_NANOS = new AtomicLong();
 
   /**
    * Read-side IO counters surfaced by the {@link #lookup} benchmark. Only fields that can be
@@ -612,16 +616,28 @@ public class InvertedIndexBenchmark {
     public long bytesRead;
     public long seeks;
     public long openStreams;
+    /** Total wall-clock microseconds spent inside {@code InputFile#newStream()}. */
+    public long openMicros;
+    /** Total wall-clock microseconds spent inside {@code SeekableInputStream#seek()}. */
+    public long seekMicros;
+    /** Total wall-clock microseconds spent inside {@code SeekableInputStream#read*()}. */
+    public long readMicros;
 
     private long startBytesRead;
     private long startSeeks;
     private long startOpenStreams;
+    private long startOpenNanos;
+    private long startSeekNanos;
+    private long startReadNanos;
 
     @Setup(Level.Invocation)
     public void beforeInvocation() {
       startBytesRead = BYTES_READ.get();
       startSeeks = SEEKS.get();
       startOpenStreams = OPEN_INPUT_STREAMS.get();
+      startOpenNanos = OPEN_NANOS.get();
+      startSeekNanos = SEEK_NANOS.get();
+      startReadNanos = READ_NANOS.get();
     }
 
     @TearDown(Level.Invocation)
@@ -629,6 +645,9 @@ public class InvertedIndexBenchmark {
       bytesRead = BYTES_READ.get() - startBytesRead;
       seeks = SEEKS.get() - startSeeks;
       openStreams = OPEN_INPUT_STREAMS.get() - startOpenStreams;
+      openMicros = (OPEN_NANOS.get() - startOpenNanos) / 1_000L;
+      seekMicros = (SEEK_NANOS.get() - startSeekNanos) / 1_000L;
+      readMicros = (READ_NANOS.get() - startReadNanos) / 1_000L;
     }
   }
 
@@ -697,7 +716,10 @@ public class InvertedIndexBenchmark {
     @Override
     public SeekableInputStream newStream() {
       OPEN_INPUT_STREAMS.incrementAndGet();
-      return new CountingSeekableInputStream(delegate.newStream());
+      long t0 = System.nanoTime();
+      SeekableInputStream s = delegate.newStream();
+      OPEN_NANOS.addAndGet(System.nanoTime() - t0);
+      return new CountingSeekableInputStream(s);
     }
 
     @Override
@@ -726,12 +748,23 @@ public class InvertedIndexBenchmark {
     @Override
     public void seek(long newPos) throws IOException {
       SEEKS.incrementAndGet();
-      delegate.seek(newPos);
+      long t0 = System.nanoTime();
+      try {
+        delegate.seek(newPos);
+      } finally {
+        SEEK_NANOS.addAndGet(System.nanoTime() - t0);
+      }
     }
 
     @Override
     public int read() throws IOException {
-      int b = delegate.read();
+      long t0 = System.nanoTime();
+      int b;
+      try {
+        b = delegate.read();
+      } finally {
+        READ_NANOS.addAndGet(System.nanoTime() - t0);
+      }
       if (b >= 0) {
         BYTES_READ.incrementAndGet();
       }
@@ -740,7 +773,13 @@ public class InvertedIndexBenchmark {
 
     @Override
     public int read(byte[] b) throws IOException {
-      int n = delegate.read(b);
+      long t0 = System.nanoTime();
+      int n;
+      try {
+        n = delegate.read(b);
+      } finally {
+        READ_NANOS.addAndGet(System.nanoTime() - t0);
+      }
       if (n > 0) {
         BYTES_READ.addAndGet(n);
       }
@@ -749,7 +788,13 @@ public class InvertedIndexBenchmark {
 
     @Override
     public int read(byte[] b, int off, int len) throws IOException {
-      int n = delegate.read(b, off, len);
+      long t0 = System.nanoTime();
+      int n;
+      try {
+        n = delegate.read(b, off, len);
+      } finally {
+        READ_NANOS.addAndGet(System.nanoTime() - t0);
+      }
       if (n > 0) {
         BYTES_READ.addAndGet(n);
       }
@@ -758,7 +803,13 @@ public class InvertedIndexBenchmark {
 
     @Override
     public long skip(long n) throws IOException {
-      long skipped = delegate.skip(n);
+      long t0 = System.nanoTime();
+      long skipped;
+      try {
+        skipped = delegate.skip(n);
+      } finally {
+        READ_NANOS.addAndGet(System.nanoTime() - t0);
+      }
       if (skipped > 0) {
         BYTES_READ.addAndGet(skipped);
       }
