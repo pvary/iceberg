@@ -26,6 +26,8 @@ public class VortexAzureProperties implements ObjectStoreProperties {
   private static final String ACCOUNT_KEY = "azure_storage_account_key";
   private static final String SAS_KEY = "azure_storage_sas_key";
   private static final String SKIP_SIGNATURE = "azure_skip_signature";
+  private static final String USE_AZURE_CLI = "azure_storage_use_azure_cli";
+  private static final String BEARER_TOKEN = "azure_storage_token";
 
   private final Map<String, String> properties = Maps.newHashMap();
 

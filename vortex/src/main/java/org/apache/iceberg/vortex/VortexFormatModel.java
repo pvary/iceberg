@@ -214,6 +214,9 @@ public class VortexFormatModel<D, S, R>
         case POSITION_DELETES ->
             throw new UnsupportedOperationException(
                 "Position deletes are not yet supported for Vortex format");
+        case DATA_MANIFEST, DELETE_MANIFEST ->
+            throw new UnsupportedOperationException(
+                "Manifest content is not supported for Vortex format: " + content);
       };
     }
 

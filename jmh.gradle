@@ -70,6 +70,16 @@ configure(jmhProjects) {
       jmhImplementation project(':iceberg-aws-bundle')
       jmhImplementation project(':iceberg-azure')
       jmhImplementation project(':iceberg-azure-bundle')
+      // Hadoop's Azure connector (abfss://) - HadoopFileIO uses this for ADLS so VortexFileUtil
+      // can extract the SAS token / account key from the wrapped HadoopOutputFile.
+      jmhImplementation libs.hadoop3.azure
+      // Vortex provides an alternative columnar file format used by VortexIndexHandler.
+      jmhImplementation project(':iceberg-vortex')
+      // Vortex's filter conversion (ConvertFilterToVortex) calls into vortex-jni which uses
+      // protobuf-java. The iceberg-data project excludes protobuf-java from vortex-jni, so we
+      // bring it back onto the JMH classpath explicitly.
+      jmhRuntimeOnly 'com.google.protobuf:protobuf-java:4.33.5'
+      // Sux4J provides GOV3-based minimal perfect hashing (~2.24 bits/key) used by
       // MphfIndexBenchmark / MphfIndexFile. Pulls in fastutil + dsiutils transitively.
       jmhImplementation ('it.unimi.dsi:sux4j:5.4.1') {
           exclude group: 'ch.qos.logback'
@@ -96,7 +106,12 @@ configure(jmhProjects) {
       def key = k.toString()
       forwardedPrefixes.any { key.startsWith(it) }
     }.collect { k, v -> "-D${k}=${v}".toString() }
-    jvmArgs = ['-Xmx32g'] + forwarded
+    jvmArgs = [
+        '-Xmx32g',
+        // Arrow (used by Vortex) requires direct access to java.nio internals on JDK 17+.
+        '--add-opens=java.base/java.nio=ALL-UNNAMED',
+        '--add-opens=java.base/sun.nio.ch=ALL-UNNAMED'
+    ] + forwarded
     resultsFile = file(jmhJsonOutputPath)
     resultFormat = 'JSON'
     includes = [jmhIncludeRegex]
