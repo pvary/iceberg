@@ -102,6 +102,14 @@ public class MinimalPerfectHashFunctionIndexHandler implements IndexHandler {
   private static final int HEADER_FIXED_LENGTH = 6 + 4 + 8 + 4 + 4 + 4 + 8;
 
   /**
+   * Approximate serialised size, in bits per key, of a {@link GOVMinimalPerfectHashFunction}.
+   * Sux4J's GOV3 construction is theoretically ~2.24 bits/key; we round up to 2.4 to leave headroom
+   * for object-stream framing and small constant-size overheads (class descriptors, instance
+   * fields, etc.) that are amortised across the keys.
+   */
+  private static final double MPHF_BITS_PER_KEY = 2.4;
+
+  /**
    * Big-endian byte-array view handles used by the reader hot path to decode the per-entry header
    * fields directly out of a {@code byte[]} without allocating a {@link ByteBuffer} per lookup.
    * Both lower to JVM intrinsics on x86 / aarch64.
@@ -115,25 +123,53 @@ public class MinimalPerfectHashFunctionIndexHandler implements IndexHandler {
   private final Function<Record, byte[]> keyEncoder;
 
   /**
-   * Creates a handler bound to a key {@link Schema}. The schema must contain at least one field and
-   * every field must be one of the supported primitive types ({@code long}, {@code int}, {@code
-   * string}, {@code uuid}); the fields can appear in any order and any combination.
+   * Caller-supplied estimate of the number of keys this handler will be asked to index / read.
+   * Used purely as a sizing hint:
+   *
+   * <ul>
+   *   <li>{@link Writer} pre-sizes its key / path / position buffers so they don't grow-and-copy
+   *       through O(log n) doublings as entries are appended.
+   *   <li>{@link Reader} uses it to size the speculative open-time prefetch precisely so the
+   *       fixed header + prefix + hash-function blob are typically fetched in a single underlying
+   *       {@code read()} call.
+   * </ul>
+   *
+   * <p>Must be {@code > 0}. Under-estimates cost at most one extra {@code read()} call at Reader
+   * open; over-estimates waste some transient memory at Writer time.
+   */
+  private final long expectedKeyCount;
+
+  /**
+   * Creates a handler bound to a key {@link Schema} and an estimated key count. The schema must
+   * contain at least one field and every field must be one of the supported primitive types
+   * ({@code long}, {@code int}, {@code string}, {@code uuid}); the fields can appear in any order
+   * and any combination.
    *
    * <p>The schema is compiled once into a per-record encoder that produces the canonical {@code
    * byte[]} representation used by the MPHF (see {@link #keyEncoder(Schema)}).
+   *
+   * <p>{@code expectedKeyCount} is used as a sizing hint for both the writer (pre-sized buffers)
+   * and the reader (speculative prefetch). It does not need to be exact: under-estimating costs at
+   * most one extra {@code read()} call at Reader open; over-estimating wastes some transient
+   * memory at Writer time.
    */
-  public MinimalPerfectHashFunctionIndexHandler(Schema schema) {
+  public MinimalPerfectHashFunctionIndexHandler(Schema schema, long expectedKeyCount) {
+    if (expectedKeyCount <= 0L) {
+      throw new IllegalArgumentException("expectedKeyCount must be > 0: " + expectedKeyCount);
+    }
+
     this.keyEncoder = keyEncoder(schema);
+    this.expectedKeyCount = expectedKeyCount;
   }
 
   @Override
   public IndexHandler.Writer writer(OutputFile output) {
-    return new Writer(output, keyEncoder);
+    return new Writer(output, keyEncoder, expectedKeyCount);
   }
 
   @Override
   public IndexHandler.Reader reader(InputFile input) throws IOException {
-    return new Reader(input, keyEncoder);
+    return new Reader(input, keyEncoder, expectedKeyCount);
   }
 
   /**
@@ -289,14 +325,22 @@ public class MinimalPerfectHashFunctionIndexHandler implements IndexHandler {
   private static class Writer implements IndexHandler.Writer {
     private final OutputFile output;
     private final Function<Record, byte[]> keyEncoder;
-    private final List<byte[]> keys = Lists.newArrayList();
-    private final List<String> filePaths = Lists.newArrayList();
-    private final LongArrayList positions = new LongArrayList();
+    private final List<byte[]> keys;
+    private final List<String> filePaths;
+    private final LongArrayList positions;
     private boolean closed;
 
-    Writer(OutputFile output, Function<Record, byte[]> keyEncoder) {
+    Writer(OutputFile output, Function<Record, byte[]> keyEncoder, long expectedKeyCount) {
       this.output = output;
       this.keyEncoder = keyEncoder;
+      // Pre-size the input buffers from the caller-supplied hint so add() doesn't pay through
+      // O(log n) ArrayList grow-and-copy doublings (each of which copies all live byte[] /
+      // String / long refs). Cap at Integer.MAX_VALUE - 16 to stay within array-size limits;
+      // under-estimates are harmless (the lists fall back to their normal grow strategy).
+      int initialCapacity = (int) Math.min(Integer.MAX_VALUE - 16L, expectedKeyCount);
+      this.keys = Lists.newArrayListWithCapacity(initialCapacity);
+      this.filePaths = Lists.newArrayListWithCapacity(initialCapacity);
+      this.positions = new LongArrayList(initialCapacity);
     }
 
     /**
@@ -418,9 +462,15 @@ public class MinimalPerfectHashFunctionIndexHandler implements IndexHandler {
       keys.clear();
       positions.clear();
 
-      // Serialise the hash function to memory so we know its length up front.
+      // Serialise the hash function to memory so we know its length up front. Pre-size the
+      // buffer using the GOV3 ~2.4 bits/key estimate (plus a small fixed slack for object-stream
+      // framing) so we typically avoid any internal grow-and-copy in ByteArrayOutputStream for
+      // large key sets.
+      int hashFunctionSizeEstimate =
+          (int) Math.min(Integer.MAX_VALUE - 16L, (long) Math.ceil(n * MPHF_BITS_PER_KEY / 8.0));
       byte[] hashFunctionBlob;
-      try (ByteArrayOutputStream baos = new ByteArrayOutputStream(1 << 20);
+      try (ByteArrayOutputStream baos =
+              new ByteArrayOutputStream(Math.max(1024, hashFunctionSizeEstimate + 1024));
           ObjectOutputStream oos = new ObjectOutputStream(baos)) {
         oos.writeObject(hashFunction);
         oos.flush();
@@ -475,13 +525,48 @@ public class MinimalPerfectHashFunctionIndexHandler implements IndexHandler {
     private final int suffixOffset;
 
     @SuppressWarnings({"unchecked", "DangerousJavaDeserialization"})
-    Reader(InputFile input, Function<Record, byte[]> keyEncoder) throws IOException {
+    Reader(InputFile input, Function<Record, byte[]> keyEncoder, long expectedKeyCount)
+        throws IOException {
       this.stream = input.newStream();
       this.keyEncoder = keyEncoder;
 
-      // 1) Fixed header: MAGIC + version + numKeys + all length fields.
-      byte[] fixed = readFully(stream, HEADER_FIXED_LENGTH);
-      DataInputStream hd = new DataInputStream(new ByteArrayInputStream(fixed));
+      // 1) One speculative bulk read covering the fixed header + (most of) the metadata region.
+      //    The total metadata size (prefix + hash-function blob) can only be known after parsing
+      //    the fixed header, but it's almost always under a few hundred KB even for million-key
+      //    indexes.  Issuing one large read up front -- rather than a 38 B header read followed
+      //    by a separate metadata read -- collapses the Reader-open cost into a single
+      //    underlying read() call and lets the OS / object store stream the whole metadata
+      //    region in one shot.  If the prefetch turns out to be too small we fall back to a
+      //    second read for the remainder; if it's too large the extra bytes are simply unused.
+      long fileLength;
+      try {
+        fileLength = input.getLength();
+      } catch (RuntimeException e) {
+        // InputFile.getLength() may be expensive or unsupported on some implementations; fall
+        // back to "no upper bound known".
+        fileLength = Long.MAX_VALUE;
+      }
+
+      // Derive the prefetch from the caller-supplied key-count hint (with a small slack for the
+      // prefix and object-stream framing). Under-estimates cost at most one extra read() for the
+      // metadata tail; over-estimates simply waste a few KB of transient buffer.
+      int targetMetadataPrefetch =
+          (int)
+              Math.min(
+                  Integer.MAX_VALUE - (long) HEADER_FIXED_LENGTH,
+                  (long) Math.ceil(expectedKeyCount * MPHF_BITS_PER_KEY / 8.0) + 4096L);
+
+      int prefetch =
+          (int) Math.min((long) HEADER_FIXED_LENGTH + targetMetadataPrefetch, fileLength);
+      if (prefetch < HEADER_FIXED_LENGTH) {
+        throw new IOException(
+            "File too short to contain MinimalPerfectHashFunctionIndexFile header: " + fileLength);
+      }
+
+      byte[] prefetched = readFully(stream, prefetch);
+
+      // Parse the fixed header out of the prefetched buffer.
+      DataInputStream hd = new DataInputStream(new ByteArrayInputStream(prefetched));
       byte[] magic = new byte[MAGIC.length];
       hd.readFully(magic);
       if (!checkMagic(magic)) {
@@ -500,17 +585,43 @@ public class MinimalPerfectHashFunctionIndexHandler implements IndexHandler {
       int maxSuffixLength = hd.readInt();
       long hashFunctionLength = hd.readLong();
 
-      // 2) Variable-length prefix bytes.
-      byte[] prefix = readFully(stream, prefixLength);
+      // 2) Materialise the metadata region (prefix + hash-function blob).  In the common case
+      //    it's already entirely inside `prefetched`; otherwise we read just the missing tail.
+      int hashFunctionLengthInt = Math.toIntExact(hashFunctionLength);
+      int metadataRegionLength = Math.addExact(prefixLength, hashFunctionLengthInt);
+      int prefetchedMetadata = prefetched.length - HEADER_FIXED_LENGTH;
+
+      byte[] metadataRegion;
+      if (prefetchedMetadata >= metadataRegionLength) {
+        // Fast path: metadata region fits in the prefetch.  Slice it out -- one allocation, no
+        // further IO.
+        metadataRegion =
+            Arrays.copyOfRange(
+                prefetched, HEADER_FIXED_LENGTH, HEADER_FIXED_LENGTH + metadataRegionLength);
+      } else {
+        // Slow path: need to read the tail.  Allocate the full metadata region up front and
+        // copy what we already have.
+        metadataRegion = new byte[metadataRegionLength];
+        System.arraycopy(
+            prefetched, HEADER_FIXED_LENGTH, metadataRegion, 0, prefetchedMetadata);
+        readFully(
+            stream,
+            metadataRegion,
+            prefetchedMetadata,
+            metadataRegionLength - prefetchedMetadata);
+      }
+
+      byte[] prefix = Arrays.copyOfRange(metadataRegion, 0, prefixLength);
 
       this.header =
           new Header(
               formatVersion, numKeys, hashFunctionLength, maxKeyLength, maxSuffixLength, prefix);
 
-      // 3) Hash function blob.
-      byte[] hashFunctionBlob = readFully(stream, Math.toIntExact(hashFunctionLength));
+      // 3) Deserialize the hash function from the in-memory slice (no further IO).
       try (ObjectInputStream ois =
-          new ObjectInputStream(new ByteArrayInputStream(hashFunctionBlob))) {
+          new ObjectInputStream(
+              new ByteArrayInputStream(
+                  metadataRegion, prefixLength, hashFunctionLengthInt))) {
         this.hashFunction = (GOVMinimalPerfectHashFunction<byte[]>) ois.readObject();
       } catch (ClassNotFoundException e) {
         throw new IOException("Failed to deserialize hash function", e);
@@ -602,9 +713,15 @@ public class MinimalPerfectHashFunctionIndexHandler implements IndexHandler {
    * with a per-Reader scratch buffer to keep {@link Reader#lookup(Record)} allocation-free.
    */
   private static void readFully(InputStream in, byte[] buf, int len) throws IOException {
+    readFully(in, buf, 0, len);
+  }
+
+  /** Fills {@code buf[offset..offset+len)} from {@code in}. */
+  private static void readFully(InputStream in, byte[] buf, int offset, int len)
+      throws IOException {
     int read = 0;
     while (read < len) {
-      int n = in.read(buf, read, len - read);
+      int n = in.read(buf, offset + read, len - read);
       if (n < 0) {
         throw new EOFException("Unexpected EOF after " + read + " of " + len + " bytes");
       }

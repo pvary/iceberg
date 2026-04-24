@@ -179,7 +179,7 @@ public class InvertedIndexBenchmark {
     this.keySchema = buildKeySchema(keyType);
     this.indexHandler =
         isMphf
-            ? new MinimalPerfectHashFunctionIndexHandler(keySchema)
+            ? new MinimalPerfectHashFunctionIndexHandler(keySchema, numRows)
             : new ParquetIndexHandler(keySchema, rowGroupRows);
 
     String fileName =
@@ -733,6 +733,7 @@ public class InvertedIndexBenchmark {
     }
   }
 
+  /** Thin counting passthrough: records bytes/seek/read timings without altering IO patterns. */
   private static final class CountingSeekableInputStream extends SeekableInputStream {
     private final SeekableInputStream delegate;
 
@@ -773,17 +774,7 @@ public class InvertedIndexBenchmark {
 
     @Override
     public int read(byte[] b) throws IOException {
-      long t0 = System.nanoTime();
-      int n;
-      try {
-        n = delegate.read(b);
-      } finally {
-        READ_NANOS.addAndGet(System.nanoTime() - t0);
-      }
-      if (n > 0) {
-        BYTES_READ.addAndGet(n);
-      }
-      return n;
+      return read(b, 0, b.length);
     }
 
     @Override
