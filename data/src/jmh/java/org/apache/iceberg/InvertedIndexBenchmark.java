@@ -29,11 +29,14 @@ import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import org.apache.hadoop.conf.Configuration;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.apache.iceberg.index.IndexHandler;
 import org.apache.iceberg.index.MinimalPerfectHashFunctionIndexHandler;
 import org.apache.iceberg.index.ParquetIndexHandler;
+import org.apache.iceberg.index.VortexIndexHandler;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
@@ -123,14 +126,16 @@ public class InvertedIndexBenchmark {
   private int numRows;
 
   /**
-   * Index format and (for Parquet) row group size, encoded as {@code "PARQUET_<rows>"} or {@code
-   * "MPHF"}. {@link #setupBenchmark()} parses it into {@link #isMphf} and {@link #rowGroupRows}.
+   * Index format and (for Parquet) row group size, encoded as {@code "PARQUET_<rows>"}, {@code
+   * "VORTEX"} or {@code "MPHF"}. {@link #setupBenchmark()} parses it into {@link #isMphf}, {@link
+   * #isVortex} and {@link #rowGroupRows}.
    */
-  @Param({"PARQUET_1000", "PARQUET_5000", "PARQUET_10000", "PARQUET_50000", "MPHF"})
+  @Param({"VORTEX", "MPHF", "PARQUET_10000"})
   private String indexType;
 
   // Parsed from indexType in setupBenchmark.
   private boolean isMphf;
+  private boolean isVortex;
   private int rowGroupRows;
 
   // Storage-related configuration. Controlled via JVM system properties so secrets stay outside
@@ -138,8 +143,20 @@ public class InvertedIndexBenchmark {
   private static final String STORAGE_PROP = "index.bench.storage";
   private static final String LOCATION_PROP = "index.bench.location";
   private static final String IO_PROP_PREFIX = "index.bench.io.";
+  // Properties forwarded to the Hadoop Configuration used by HadoopFileIO. Required for ADLS so
+  // VortexFileUtil can extract the SAS token / account key from the wrapped HadoopOutputFile,
+  // e.g.:
+  //   -Dindex.bench.hadoop.fs.azure.sas.fixed.token.<acct>.dfs.core.windows.net=<sas>
+  //   -Dindex.bench.hadoop.fs.azure.account.auth.type.<acct>.dfs.core.windows.net=SAS
+  //   -Dindex.bench.hadoop.fs.azure.sas.token.provider.type.<acct>.dfs.core.windows.net=
+  //         org.apache.hadoop.fs.azurebfs.sas.FixedSASTokenProvider
+  private static final String HADOOP_PROP_PREFIX = "index.bench.hadoop.";
 
   private FileIO io;
+  // Raw, uncounted FileIO. Vortex bypasses Java IO and talks to object storage natively, so the
+  // CountingFileIO wrapper would (a) never see those bytes and (b) hide the underlying
+  // HadoopOutputFile / HadoopInputFile from VortexFileUtil's credential resolution.
+  private FileIO rawIo;
   private String fileLocation;
   private Schema keySchema; // key-only schema, used to drive the index handler
 
@@ -175,22 +192,30 @@ public class InvertedIndexBenchmark {
   @Setup
   public void setupBenchmark() throws Exception {
     parseIndexType();
-    this.io = new CountingFileIO(createFileIO());
+    this.rawIo = createFileIO();
+    this.io = new CountingFileIO(rawIo);
     this.keySchema = buildKeySchema(keyType);
     this.indexHandler =
         isMphf
             ? new MinimalPerfectHashFunctionIndexHandler(keySchema, numRows)
-            : new ParquetIndexHandler(keySchema, rowGroupRows);
+            : isVortex
+                ? new VortexIndexHandler(keySchema)
+                : new ParquetIndexHandler(keySchema, rowGroupRows);
 
-    String fileName =
-        isMphf
-            ? String.format(Locale.ROOT, "idx-%s-rows%d-mphf.bin", keyType, numRows)
-            : String.format(
-                Locale.ROOT,
-                "idx-%s-rows%d-parquet-rg%drows.parquet",
-                keyType,
-                numRows,
-                rowGroupRows);
+    String fileName;
+    if (isMphf) {
+      fileName = String.format(Locale.ROOT, "idx-%s-rows%d-mphf.bin", keyType, numRows);
+    } else if (isVortex) {
+      fileName = String.format(Locale.ROOT, "idx-%s-rows%d-vortex.vortex", keyType, numRows);
+    } else {
+      fileName =
+          String.format(
+              Locale.ROOT,
+              "idx-%s-rows%d-parquet-rg%drows.parquet",
+              keyType,
+              numRows,
+              rowGroupRows);
+    }
     this.fileLocation = joinPath(baseLocation(), fileName);
     InputFile existing = io.newInputFile(fileLocation);
     boolean reuseExisting;
@@ -272,18 +297,27 @@ public class InvertedIndexBenchmark {
   private void parseIndexType() {
     if ("MPHF".equalsIgnoreCase(indexType)) {
       this.isMphf = true;
+      this.isVortex = false;
+      this.rowGroupRows = -1;
+      return;
+    }
+
+    if ("VORTEX".equalsIgnoreCase(indexType)) {
+      this.isMphf = false;
+      this.isVortex = true;
       this.rowGroupRows = -1;
       return;
     }
 
     if (indexType.regionMatches(true, 0, "PARQUET_", 0, "PARQUET_".length())) {
       this.isMphf = false;
+      this.isVortex = false;
       this.rowGroupRows = Integer.parseInt(indexType.substring("PARQUET_".length()));
       return;
     }
 
     throw new IllegalArgumentException(
-        "Unknown indexType: " + indexType + " (expected MPHF or PARQUET_<rows>)");
+        "Unknown indexType: " + indexType + " (expected MPHF, VORTEX or PARQUET_<rows>)");
   }
 
   @TearDown
@@ -307,15 +341,16 @@ public class InvertedIndexBenchmark {
 
   @Benchmark
   @Threads(1)
-  @Warmup(iterations = 10)
-  @Measurement(iterations = 100)
+  @Warmup(iterations = 100)
+  @Measurement(iterations = 3000)
   public void lookup(Blackhole bh, ReadCounter ioCounter) throws Exception {
     int idx = lookupCursor++ & (NUM_LOOKUP_KEYS - 1);
     long expectedPos = expectedPositions[idx];
     String expectedFilePath =
         "s3://bucket/warehouse/db/tbl/data/file-" + (expectedPos % NUM_SOURCE_FILES) + ".parquet";
 
-    try (IndexHandler.Reader reader = indexHandler.reader(io.newInputFile(fileLocation))) {
+    try (IndexHandler.Reader reader =
+        indexHandler.reader(ioForIndex().newInputFile(fileLocation))) {
       IndexHandler.Hit hit = reader.lookup(lookupKeyRecords[idx]);
       if (hit == null) {
         throw new RuntimeException(
@@ -385,17 +420,36 @@ public class InvertedIndexBenchmark {
     } finally {
       fileLocation = originalLocation;
       try {
-        io.deleteFile(writeLocation);
+        ioForIndex().deleteFile(writeLocation);
       } catch (Exception e) {
         LOG.warn("Failed to delete benchmark write output {}", writeLocation, e);
       }
     }
   }
 
+  /**
+   * Returns the {@link FileIO} used to open the index file.
+   *
+   * <p>Vortex bypasses Java IO and accesses object storage natively via JNI; the {@link
+   * CountingFileIO} wrapper would (a) never observe those bytes (so the counters add no value) and
+   * (b) hide the underlying {@code HadoopInputFile} / {@code HadoopOutputFile} from {@code
+   * VortexFileUtil}'s credential resolution, causing it to fall back to default cloud auth (e.g.
+   * Azure IMDS). For all other index handlers we keep the counting wrapper so the JMH IO counters
+   * remain accurate.
+   */
+  private FileIO ioForIndex() {
+    return isVortex ? rawIo : io;
+  }
+
   private String uniqueWriteFileName() {
     int seq = writeCursor++;
     if (isMphf) {
       return String.format(Locale.ROOT, "write-idx-%s-rows%d-mphf-%d.bin", keyType, numRows, seq);
+    }
+
+    if (isVortex) {
+      return String.format(
+          Locale.ROOT, "write-idx-%s-rows%d-vortex-%d.vortex", keyType, numRows, seq);
     }
 
     return String.format(
@@ -417,7 +471,8 @@ public class InvertedIndexBenchmark {
    * "originated" from; the handler decides how to lay that out on disk.
    */
   private void writeIndex() throws Exception {
-    try (IndexHandler.Writer writer = indexHandler.writer(io.newOutputFile(fileLocation))) {
+    try (IndexHandler.Writer writer =
+        indexHandler.writer(ioForIndex().newOutputFile(fileLocation))) {
       for (int row = 0; row < numRows; row++) {
         Record keyRecord =
             buildKeyRecord(
@@ -517,7 +572,7 @@ public class InvertedIndexBenchmark {
 
     Storage storage = selectedStorage();
     if (storage == Storage.LOCAL) {
-      File benchDir = new File("data/benchmark/inverted-index");
+      File benchDir = new File("data/benchmark/inverted-index6");
       if (!benchDir.exists() && !benchDir.mkdirs()) {
         throw new IllegalStateException(
             "Could not create benchmark dir: " + benchDir.getAbsolutePath());
@@ -545,6 +600,32 @@ public class InvertedIndexBenchmark {
   private static FileIO createFileIO() {
     Storage storage = selectedStorage();
     Map<String, String> props = collectIoProps();
+    Map<String, String> hadoopProps = collectHadoopProps();
+
+    // Vortex bypasses Java IO and authenticates against object storage natively. To make az-login
+    // credentials available to it, set:
+    //   -Dvortex.storage.azure_storage_use_azure_cli=true
+    // (Honoured by VortexFileUtil regardless of the FileIO impl below.) For ADLS we additionally
+    // default the FileIO impl to ADLSFileIO, whose own credential chain (DefaultAzureCredential)
+    // also picks up the Azure CLI session.
+    if (storage == Storage.ADLS
+        && System.getProperty("vortex.storage.azure_storage_use_azure_cli") == null
+        && hadoopProps.keySet().stream()
+            .noneMatch(k -> k.startsWith("fs.azure.account.") || k.startsWith("fs.azure.sas."))) {
+      System.setProperty("vortex.storage.azure_storage_use_azure_cli", "true");
+      LOG.info(
+          "No explicit Azure credentials supplied; defaulting "
+              + "vortex.storage.azure_storage_use_azure_cli=true so Vortex uses `az login`.");
+    }
+
+    if (storage == Storage.LOCAL && !hadoopProps.isEmpty()) {
+      Configuration conf = new Configuration();
+      hadoopProps.forEach(conf::set);
+      HadoopFileIO io = new HadoopFileIO(conf);
+      io.initialize(props);
+      return io;
+    }
+
     String impl =
         switch (storage) {
           case LOCAL ->
@@ -562,6 +643,17 @@ public class InvertedIndexBenchmark {
     for (String name : System.getProperties().stringPropertyNames()) {
       if (name.startsWith(IO_PROP_PREFIX)) {
         props.put(name.substring(IO_PROP_PREFIX.length()), System.getProperty(name));
+      }
+    }
+
+    return props;
+  }
+
+  private static Map<String, String> collectHadoopProps() {
+    Map<String, String> props = Maps.newHashMap();
+    for (String name : System.getProperties().stringPropertyNames()) {
+      if (name.startsWith(HADOOP_PROP_PREFIX)) {
+        props.put(name.substring(HADOOP_PROP_PREFIX.length()), System.getProperty(name));
       }
     }
 
@@ -616,10 +708,13 @@ public class InvertedIndexBenchmark {
     public long bytesRead;
     public long seeks;
     public long openStreams;
+
     /** Total wall-clock microseconds spent inside {@code InputFile#newStream()}. */
     public long openMicros;
+
     /** Total wall-clock microseconds spent inside {@code SeekableInputStream#seek()}. */
     public long seekMicros;
+
     /** Total wall-clock microseconds spent inside {@code SeekableInputStream#read*()}. */
     public long readMicros;
 

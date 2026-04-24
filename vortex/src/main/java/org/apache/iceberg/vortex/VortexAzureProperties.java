@@ -26,6 +26,8 @@ public class VortexAzureProperties implements ObjectStoreProperties {
   private static final String ACCOUNT_KEY = "azure_storage_account_key";
   private static final String SAS_KEY = "azure_storage_sas_key";
   private static final String SKIP_SIGNATURE = "azure_skip_signature";
+  private static final String USE_AZURE_CLI = "azure_storage_use_azure_cli";
+  private static final String BEARER_TOKEN = "azure_storage_token";
 
   private final Map<String, String> properties = Maps.newHashMap();
 
@@ -41,6 +43,22 @@ public class VortexAzureProperties implements ObjectStoreProperties {
 
   public VortexAzureProperties setSkipSignature(boolean skipSignature) {
     properties.put(SKIP_SIGNATURE, String.valueOf(skipSignature));
+    return this;
+  }
+
+  /**
+   * Tells the underlying Rust object_store backend to obtain credentials from a logged-in Azure
+   * CLI session ({@code az login}). Useful for local development / benchmarking against ADLS
+   * without provisioning a SAS token or account key.
+   */
+  public VortexAzureProperties setUseAzureCli(boolean useAzureCli) {
+    properties.put(USE_AZURE_CLI, String.valueOf(useAzureCli));
+    return this;
+  }
+
+  /** Sets a pre-acquired OAuth bearer token (e.g. from {@code az account get-access-token}). */
+  public VortexAzureProperties setBearerToken(String bearerToken) {
+    properties.put(BEARER_TOKEN, bearerToken);
     return this;
   }
 
