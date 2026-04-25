@@ -34,6 +34,7 @@ import org.apache.iceberg.data.Record;
 import org.apache.iceberg.index.IndexHandler;
 import org.apache.iceberg.index.MinimalPerfectHashFunctionIndexHandler;
 import org.apache.iceberg.index.ParquetIndexHandler;
+import org.apache.iceberg.index.UltraCompactHasherIndexHandler;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
@@ -123,15 +124,18 @@ public class InvertedIndexBenchmark {
   private int numRows;
 
   /**
-   * Index format and (for Parquet) row group size, encoded as {@code "PARQUET_<rows>"} or {@code
-   * "MPHF"}. {@link #setupBenchmark()} parses it into {@link #isMphf} and {@link #rowGroupRows}.
+   * Index format and (for Parquet) row group size, encoded as {@code "PARQUET_<rows>"}, {@code
+   * "UCH_<kLimit>"} or {@code "MPHF"}. {@link #setupBenchmark()} parses it into {@link #isMphf} /
+   * {@link #isUch} and {@link #rowGroupRows} / {@link #kLimit}.
    */
-  @Param({"PARQUET_1000", "PARQUET_5000", "PARQUET_10000", "PARQUET_50000", "MPHF"})
+  @Param({"PARQUET_10000", "MPHF", "UCH_50", "UCH_500", "UCH_1000"})
   private String indexType;
 
   // Parsed from indexType in setupBenchmark.
   private boolean isMphf;
+  private boolean isUch;
   private int rowGroupRows;
+  private int kLimit;
 
   // Storage-related configuration. Controlled via JVM system properties so secrets stay outside
   // the source tree -- see the class javadoc for the full list.
@@ -177,20 +181,28 @@ public class InvertedIndexBenchmark {
     parseIndexType();
     this.io = new CountingFileIO(createFileIO());
     this.keySchema = buildKeySchema(keyType);
-    this.indexHandler =
-        isMphf
-            ? new MinimalPerfectHashFunctionIndexHandler(keySchema, numRows)
-            : new ParquetIndexHandler(keySchema, rowGroupRows);
+    if (isMphf) {
+      this.indexHandler = new MinimalPerfectHashFunctionIndexHandler(keySchema, numRows);
+    } else if (isUch) {
+      this.indexHandler = new UltraCompactHasherIndexHandler(keySchema, numRows, kLimit);
+    } else {
+      this.indexHandler = new ParquetIndexHandler(keySchema, rowGroupRows);
+    }
 
-    String fileName =
-        isMphf
-            ? String.format(Locale.ROOT, "idx-%s-rows%d-mphf.bin", keyType, numRows)
-            : String.format(
-                Locale.ROOT,
-                "idx-%s-rows%d-parquet-rg%drows.parquet",
-                keyType,
-                numRows,
-                rowGroupRows);
+    String fileName;
+    if (isMphf) {
+      fileName = String.format(Locale.ROOT, "idx-%s-rows%d-mphf.bin", keyType, numRows);
+    } else if (isUch) {
+      fileName = String.format(Locale.ROOT, "idx-%s-rows%d-uch-k%d.bin", keyType, numRows, kLimit);
+    } else {
+      fileName =
+          String.format(
+              Locale.ROOT,
+              "idx-%s-rows%d-parquet-rg%drows.parquet",
+              keyType,
+              numRows,
+              rowGroupRows);
+    }
     this.fileLocation = joinPath(baseLocation(), fileName);
     InputFile existing = io.newInputFile(fileLocation);
     boolean reuseExisting;
@@ -272,18 +284,30 @@ public class InvertedIndexBenchmark {
   private void parseIndexType() {
     if ("MPHF".equalsIgnoreCase(indexType)) {
       this.isMphf = true;
+      this.isUch = false;
       this.rowGroupRows = -1;
+      this.kLimit = -1;
+      return;
+    }
+
+    if (indexType.regionMatches(true, 0, "UCH_", 0, "UCH_".length())) {
+      this.isMphf = false;
+      this.isUch = true;
+      this.rowGroupRows = -1;
+      this.kLimit = Integer.parseInt(indexType.substring("UCH_".length()));
       return;
     }
 
     if (indexType.regionMatches(true, 0, "PARQUET_", 0, "PARQUET_".length())) {
       this.isMphf = false;
+      this.isUch = false;
+      this.kLimit = -1;
       this.rowGroupRows = Integer.parseInt(indexType.substring("PARQUET_".length()));
       return;
     }
 
     throw new IllegalArgumentException(
-        "Unknown indexType: " + indexType + " (expected MPHF or PARQUET_<rows>)");
+        "Unknown indexType: " + indexType + " (expected MPHF, UCH_<kLimit> or PARQUET_<rows>)");
   }
 
   @TearDown
@@ -396,6 +420,11 @@ public class InvertedIndexBenchmark {
     int seq = writeCursor++;
     if (isMphf) {
       return String.format(Locale.ROOT, "write-idx-%s-rows%d-mphf-%d.bin", keyType, numRows, seq);
+    }
+
+    if (isUch) {
+      return String.format(
+          Locale.ROOT, "write-idx-%s-rows%d-uch-k%d-%d.bin", keyType, numRows, kLimit, seq);
     }
 
     return String.format(
@@ -616,10 +645,13 @@ public class InvertedIndexBenchmark {
     public long bytesRead;
     public long seeks;
     public long openStreams;
+
     /** Total wall-clock microseconds spent inside {@code InputFile#newStream()}. */
     public long openMicros;
+
     /** Total wall-clock microseconds spent inside {@code SeekableInputStream#seek()}. */
     public long seekMicros;
+
     /** Total wall-clock microseconds spent inside {@code SeekableInputStream#read*()}. */
     public long readMicros;
 

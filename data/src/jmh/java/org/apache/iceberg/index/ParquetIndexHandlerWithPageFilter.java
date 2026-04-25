@@ -26,7 +26,6 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.UUID;
-import org.apache.iceberg.InvertedIndexBenchmark;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.data.GenericRecord;
@@ -73,36 +72,35 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Iceberg's high-level {@code Parquet.read(...)} pipeline does <em>not</em> use the Parquet
  * column index for page-level pruning today: it implements its own row-group filtering against
- * Iceberg expressions and then reads each surviving row group in full via
- * {@code ParquetFileReader.readNextRowGroup()}. To actually exploit the column index, this
- * handler bypasses {@code Parquet.read(...)} on the read path and drives parquet-mr's
- * {@link ParquetFileReader} directly:
+ * Iceberg expressions and then reads each surviving row group in full via {@code
+ * ParquetFileReader.readNextRowGroup()}. To actually exploit the column index, this handler
+ * bypasses {@code Parquet.read(...)} on the read path and drives parquet-mr's {@link
+ * ParquetFileReader} directly:
  *
  * <ul>
- *   <li>The lookup builds a parquet-mr {@link FilterPredicate} (only equality + AND are needed)
- *       and installs it on {@link ParquetReadOptions} via
- *       {@link ParquetReadOptions.Builder#withRecordFilter(FilterCompat.Filter)}.
- *   <li>Page-level pruning is enabled via
- *       {@link ParquetReadOptions.Builder#useColumnIndexFilter(boolean)}.
- *   <li>Each iteration calls {@link ParquetFileReader#readNextFilteredRowGroup()}, which
- *       returns a {@link PageReadStore} pruned to the row ranges that can match the predicate
- *       (using both the row-group statistics and the column index).
- *   <li>The pruned store is decoded with parquet-mr's own {@link RecordReader} +
- *       {@link GroupRecordConverter}; we reach into the resulting {@link Group} positionally
- *       since the schema layout is fixed (key columns first, then {@code file_path}, then
- *       {@code pos}).
+ *   <li>The lookup builds a parquet-mr {@link FilterPredicate} (only equality + AND are needed) and
+ *       installs it on {@link ParquetReadOptions} via {@link
+ *       ParquetReadOptions.Builder#withRecordFilter(FilterCompat.Filter)}.
+ *   <li>Page-level pruning is enabled via {@link
+ *       ParquetReadOptions.Builder#useColumnIndexFilter(boolean)}.
+ *   <li>Each iteration calls {@link ParquetFileReader#readNextFilteredRowGroup()}, which returns a
+ *       {@link PageReadStore} pruned to the row ranges that can match the predicate (using both the
+ *       row-group statistics and the column index).
+ *   <li>The pruned store is decoded with parquet-mr's own {@link RecordReader} + {@link
+ *       GroupRecordConverter}; we reach into the resulting {@link Group} positionally since the
+ *       schema layout is fixed (key columns first, then {@code file_path}, then {@code pos}).
  * </ul>
  *
- * <p>The writer caps the per-data-page row count via {@code parquet.page.row.count.limit} so
- * the column index has multiple per-page min/max entries within each row group; without this
- * cap each row group would be a single ~1&nbsp;MB page and the column index would have nothing
- * to bite into.
+ * <p>The writer caps the per-data-page row count via {@code parquet.page.row.count.limit} so the
+ * column index has multiple per-page min/max entries within each row group; without this cap each
+ * row group would be a single ~1&nbsp;MB page and the column index would have nothing to bite into.
  *
  * <p>Each handler instance is bound to both a key {@link Schema} and a {@code rowGroupRows} value
  * that controls how many rows are packed into a single Parquet row group at write time.
  */
 public class ParquetIndexHandlerWithPageFilter implements IndexHandler {
-    private static final Logger LOG = LoggerFactory.getLogger(ParquetIndexHandlerWithPageFilter.class);
+  private static final Logger LOG =
+      LoggerFactory.getLogger(ParquetIndexHandlerWithPageFilter.class);
 
   /** Field name of the source-file path column. */
   public static final String FILE_PATH_COLUMN = "file_path";
@@ -111,10 +109,10 @@ public class ParquetIndexHandlerWithPageFilter implements IndexHandler {
   public static final String POS_COLUMN = "pos";
 
   /**
-   * Target maximum number of rows per Parquet data page. Each page produces one entry in the
-   * column index (min/max), so we want enough pages per row group for page-level pruning to be
-   * meaningful. With 1 024 rows/page, a 50 000-row row group ends up with ~49 pages and a point
-   * lookup can be pruned to a single page.
+   * Target maximum number of rows per Parquet data page. Each page produces one entry in the column
+   * index (min/max), so we want enough pages per row group for page-level pruning to be meaningful.
+   * With 1 024 rows/page, a 50 000-row row group ends up with ~49 pages and a point lookup can be
+   * pruned to a single page.
    *
    * <p>Capped at {@link #rowGroupRows} so we do not force a tinier-than-needed page size for
    * already-small row groups.
@@ -337,23 +335,25 @@ public class ParquetIndexHandlerWithPageFilter implements IndexHandler {
 
   /**
    * Lookup reader that drives parquet-mr's {@link ParquetFileReader} directly so it can use the
-   * column index for page-level pruning. Each {@link #lookup(Record)} call opens a fresh
-   * {@code ParquetFileReader} configured with a {@link FilterPredicate} translated from the
-   * key {@link Record}; parquet-mr applies that predicate against both the row-group statistics
-   * and the column index, returning a {@link PageReadStore} pruned to the matching row ranges.
+   * column index for page-level pruning. Each {@link #lookup(Record)} call opens a fresh {@code
+   * ParquetFileReader} configured with a {@link FilterPredicate} translated from the key {@link
+   * Record}; parquet-mr applies that predicate against both the row-group statistics and the column
+   * index, returning a {@link PageReadStore} pruned to the matching row ranges.
    *
    * <p>Decoding goes through parquet-mr's own {@link RecordReader} + {@link GroupRecordConverter}
-   * because Iceberg's {@code ParquetValueReader} pipeline does not honour the per-row skip
-   * protocol that {@code FilteredPageReadStore} relies on. Since the on-disk schema is fixed
-   * ({@code [key columns..., file_path, pos]}) we reach into the resulting {@link Group}
-   * positionally; no general-purpose {@code Group} → Iceberg {@code Record} adapter is needed.
+   * because Iceberg's {@code ParquetValueReader} pipeline does not honour the per-row skip protocol
+   * that {@code FilteredPageReadStore} relies on. Since the on-disk schema is fixed ({@code [key
+   * columns..., file_path, pos]}) we reach into the resulting {@link Group} positionally; no
+   * general-purpose {@code Group} → Iceberg {@code Record} adapter is needed.
    */
   private static final class Reader implements IndexHandler.Reader {
     private final InputFile input;
     private final int keyFieldCount;
     private final List<Types.NestedField> keyFields;
+
     /** Field ordinal of {@code file_path} in the on-disk schema. */
     private final int filePathOrd;
+
     /** Field ordinal of {@code pos} in the on-disk schema. */
     private final int posOrd;
 
@@ -394,8 +394,8 @@ public class ParquetIndexHandlerWithPageFilter implements IndexHandler {
       ParquetReadOptions options =
           ParquetReadOptions.builder(new PlainParquetConfiguration())
               .withRecordFilter(filterCompat)
-              .useStatsFilter(true)         // row-group level min/max pruning
-              .useColumnIndexFilter(true)   // page level pruning via column index
+              .useStatsFilter(true) // row-group level min/max pruning
+              .useColumnIndexFilter(true) // page level pruning via column index
               .useDictionaryFilter(true)
               .useBloomFilter(true)
               .build();
@@ -403,8 +403,7 @@ public class ParquetIndexHandlerWithPageFilter implements IndexHandler {
       try (ParquetFileReader pfr =
           ParquetFileReader.open(new IcebergParquetInputFile(input), options)) {
         MessageType fileSchema = pfr.getFileMetaData().getSchema();
-        ColumnIOFactory colIOFactory =
-            new ColumnIOFactory(pfr.getFileMetaData().getCreatedBy());
+        ColumnIOFactory colIOFactory = new ColumnIOFactory(pfr.getFileMetaData().getCreatedBy());
         MessageColumnIO columnIO = colIOFactory.getColumnIO(fileSchema);
         GroupRecordConverter converter = new GroupRecordConverter(fileSchema);
 
@@ -454,7 +453,8 @@ public class ParquetIndexHandlerWithPageFilter implements IndexHandler {
 
     private static void dumpPageLayout(ParquetFileReader pfr) {
       try {
-        java.util.List<org.apache.parquet.hadoop.metadata.BlockMetaData> blocks = pfr.getRowGroups();
+        java.util.List<org.apache.parquet.hadoop.metadata.BlockMetaData> blocks =
+            pfr.getRowGroups();
         LOG.warn("Parquet file has {} row group(s)", blocks.size());
         for (int b = 0; b < blocks.size(); b++) {
           org.apache.parquet.hadoop.metadata.BlockMetaData block = blocks.get(b);
@@ -465,8 +465,7 @@ public class ParquetIndexHandlerWithPageFilter implements IndexHandler {
               block.getTotalByteSize(),
               block.getCompressedSize());
           for (org.apache.parquet.hadoop.metadata.ColumnChunkMetaData c : block.getColumns()) {
-            org.apache.parquet.internal.column.columnindex.OffsetIndex oi =
-                pfr.readOffsetIndex(c);
+            org.apache.parquet.internal.column.columnindex.OffsetIndex oi = pfr.readOffsetIndex(c);
             org.apache.parquet.internal.column.columnindex.ColumnIndex ci = pfr.readColumnIndex(c);
             LOG.warn(
                 "    col {} encodings={} pageCount(offsetIndex)={} columnIndexPresent={} totalSize={}",
@@ -483,11 +482,11 @@ public class ParquetIndexHandlerWithPageFilter implements IndexHandler {
     }
 
     /**
-     * Translates the lookup key into a parquet-mr {@link FilterPredicate} of equalities,
-     * combined via {@link FilterApi#and}. Type dispatch mirrors the on-disk encoding:
-     * {@code long}/{@code int} → typed numeric column, {@code string} → {@code binaryColumn} with
-     * UTF-8 bytes, {@code uuid} → {@code binaryColumn} with the 16-byte big-endian
-     * {@code msb || lsb} layout used by Iceberg's Parquet writer for {@code FIXED_LEN_BYTE_ARRAY(16)}.
+     * Translates the lookup key into a parquet-mr {@link FilterPredicate} of equalities, combined
+     * via {@link FilterApi#and}. Type dispatch mirrors the on-disk encoding: {@code long}/{@code
+     * int} → typed numeric column, {@code string} → {@code binaryColumn} with UTF-8 bytes, {@code
+     * uuid} → {@code binaryColumn} with the 16-byte big-endian {@code msb || lsb} layout used by
+     * Iceberg's Parquet writer for {@code FIXED_LEN_BYTE_ARRAY(16)}.
      */
     private FilterPredicate buildPredicate(Object[] keyVals) {
       FilterPredicate combined = null;
@@ -498,8 +497,8 @@ public class ParquetIndexHandlerWithPageFilter implements IndexHandler {
         switch (f.type().typeId()) {
           case LONG -> eq = FilterApi.eq(FilterApi.longColumn(f.name()), (Long) v);
           case INTEGER -> eq = FilterApi.eq(FilterApi.intColumn(f.name()), (Integer) v);
-          case STRING -> eq =
-              FilterApi.eq(FilterApi.binaryColumn(f.name()), Binary.fromString(v.toString()));
+          case STRING ->
+              eq = FilterApi.eq(FilterApi.binaryColumn(f.name()), Binary.fromString(v.toString()));
           case UUID -> {
             UUID u = (UUID) v;
             byte[] bytes = new byte[16];
@@ -507,8 +506,7 @@ public class ParquetIndexHandlerWithPageFilter implements IndexHandler {
                 .putLong(u.getMostSignificantBits())
                 .putLong(u.getLeastSignificantBits());
             eq =
-                FilterApi.eq(
-                    FilterApi.binaryColumn(f.name()), Binary.fromConstantByteArray(bytes));
+                FilterApi.eq(FilterApi.binaryColumn(f.name()), Binary.fromConstantByteArray(bytes));
           }
           default ->
               throw new IllegalStateException(
@@ -555,11 +553,11 @@ public class ParquetIndexHandlerWithPageFilter implements IndexHandler {
   }
 
   /**
-   * Wraps an Iceberg {@link org.apache.iceberg.io.SeekableInputStream} as a parquet-mr
-   * {@link org.apache.parquet.io.SeekableInputStream}. Read methods are inherited from
-   * {@link DelegatingSeekableInputStream}; only {@code getPos} / {@code seek} need to be
-   * forwarded to the underlying Iceberg stream (the {@code java.io.InputStream} contract is
-   * satisfied because {@link org.apache.iceberg.io.SeekableInputStream} extends it).
+   * Wraps an Iceberg {@link org.apache.iceberg.io.SeekableInputStream} as a parquet-mr {@link
+   * org.apache.parquet.io.SeekableInputStream}. Read methods are inherited from {@link
+   * DelegatingSeekableInputStream}; only {@code getPos} / {@code seek} need to be forwarded to the
+   * underlying Iceberg stream (the {@code java.io.InputStream} contract is satisfied because {@link
+   * org.apache.iceberg.io.SeekableInputStream} extends it).
    */
   private static final class IcebergParquetSeekableInputStream
       extends DelegatingSeekableInputStream {
