@@ -24,6 +24,7 @@ import it.unimi.dsi.fastutil.ints.IntArrays;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.data.GenericRecord;
@@ -37,6 +38,7 @@ import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.parquet.Parquet;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
 
@@ -67,6 +69,57 @@ public class ParquetIndexHandler implements IndexHandler {
   private final Schema schema;
   private final int keyFieldCount;
   private final int rowGroupRows;
+  private final long expectedKeyCount;
+
+  /**
+   * Empirically-measured recommended read block sizes (bytes) keyed by {@code (rowGroupRows,
+   * expectedKeyCount)}. Values come from probing the benchmark Parquet files in {@code
+   * data/data/benchmark/inverted-index/}: each entry equals {@code max(actualMaxRowGroupBytes,
+   * actualFooterBytes)} rounded up to the next power of two. For combinations not in this map the
+   * {@link #recommendedReadBlockSize()} method falls back to a linear estimate using {@link
+   * #ESTIMATED_ROW_BYTES} / {@link #ESTIMATED_FOOTER_BYTES_PER_ROW_GROUP}.
+   */
+  private static final Map<Long, Integer> EMPIRICAL_BLOCK_SIZES =
+      ImmutableMap.of(
+          // numRows = 1,000,000 (rg payload dominates)
+          //   rg=5000  -> max  74 KB -> 128 KB
+          //   rg=10000 -> max 145 KB -> 256 KB
+          //   rg=20000 -> max 289 KB -> 512 KB
+          //   rg=50000 -> max 720 KB -> 1024 KB
+          workloadKey(5_000, 1_000_000L), 128 * 1024,
+          workloadKey(10_000, 1_000_000L), 256 * 1024,
+          workloadKey(20_000, 1_000_000L), 512 * 1024,
+          workloadKey(50_000, 1_000_000L), 1024 * 1024,
+          // numRows = 10,000,000 (footer dominates for small rg)
+          //   rg=5000  -> max 481 KB (footer) -> 512 KB
+          //   rg=10000 -> max 245 KB (footer) -> 256 KB
+          //   rg=20000 -> max 281 KB (rg)     -> 512 KB
+          //   rg=50000 -> max 702 KB (rg)     -> 1024 KB
+          workloadKey(5_000, 10_000_000L), 512 * 1024,
+          workloadKey(10_000, 10_000_000L), 256 * 1024,
+          workloadKey(20_000, 10_000_000L), 512 * 1024,
+          workloadKey(50_000, 10_000_000L), 1024 * 1024);
+
+  /**
+   * Calibration constants for the fallback path of {@link #recommendedReadBlockSize()}, derived
+   * empirically from the same benchmark files: ~14.5 B / row of compressed row-group payload
+   * (rounded up to 16) and ~250 B / row group of footer (Iceberg writes per-column
+   * min/max/null-count stats per row group), plus the 8 B {@code [int32 footerLen][PAR1]} trailer.
+   */
+  private static final long ESTIMATED_ROW_BYTES = 16L;
+
+  private static final long ESTIMATED_FOOTER_BYTES_PER_ROW_GROUP = 256L;
+
+  private static final int FOOTER_TRAILER_BYTES = 8;
+
+  private static final int MIN_RECOMMENDED_BLOCK_BYTES = 4096;
+
+  private static final long MAX_RECOMMENDED_BLOCK_BYTES = 64L * 1024 * 1024;
+
+  /** Packs {@code (rowGroupRows, expectedKeyCount)} into a single long key for the lookup map. */
+  private static long workloadKey(int rowGroupRows, long expectedKeyCount) {
+    return (((long) rowGroupRows) << 40) ^ expectedKeyCount;
+  }
 
   /**
    * Creates a handler for the given key {@link Schema}. Every {@link Record} supplied to {@link
@@ -75,10 +128,19 @@ public class ParquetIndexHandler implements IndexHandler {
    * @param keySchema the schema of the key columns (must contain at least one field and must not
    *     contain fields named {@code file_path} or {@code pos})
    * @param rowGroupRows number of rows packed into each Parquet row group at write time
+   * @param expectedKeyCount sizing hint used by {@link #recommendedReadBlockSize()} to pick a
+   *     storage adapter block size that fits one row-group read in a single wire GET; must be
+   *     {@code > 0}
    */
-  public ParquetIndexHandler(Schema keySchema, int rowGroupRows) {
+  public ParquetIndexHandler(Schema keySchema, int rowGroupRows, long expectedKeyCount) {
     if (keySchema == null || keySchema.columns().isEmpty()) {
       throw new IllegalArgumentException("Key schema must contain at least one field");
+    }
+    if (rowGroupRows <= 0) {
+      throw new IllegalArgumentException("rowGroupRows must be > 0: " + rowGroupRows);
+    }
+    if (expectedKeyCount <= 0L) {
+      throw new IllegalArgumentException("expectedKeyCount must be > 0: " + expectedKeyCount);
     }
 
     for (Types.NestedField f : keySchema.columns()) {
@@ -92,6 +154,7 @@ public class ParquetIndexHandler implements IndexHandler {
 
     this.keyFieldCount = keySchema.columns().size();
     this.rowGroupRows = rowGroupRows;
+    this.expectedKeyCount = expectedKeyCount;
 
     // Build the on-disk schema: key columns (renumbered from 1) followed by file_path and pos.
     List<Types.NestedField> fields = Lists.newArrayListWithCapacity(keyFieldCount + 2);
@@ -113,6 +176,45 @@ public class ParquetIndexHandler implements IndexHandler {
   @Override
   public IndexHandler.Reader reader(InputFile input) {
     return new Reader(input, schema, keyFieldCount);
+  }
+
+  /**
+   * Estimates the larger of the two reads a {@link Reader#lookup(Record)} issues -- the footer (one
+   * read of the entire {@code ParquetMetadata} block via parquet-mr's {@code
+   * ParquetFileReader.open}) and the targeted row-group payload (one bounded range read of the
+   * compressed column data) -- and rounds it up to the next power of two so the storage adapter can
+   * serve each in one wire GET.
+   *
+   * <p>Both estimates are linear in the row-group structure of the file, calibrated empirically
+   * (see the constants' Javadoc):
+   *
+   * <ul>
+   *   <li>row-group bytes &asymp; {@code rowGroupRows * ESTIMATED_ROW_BYTES}
+   *   <li>footer bytes &asymp; {@code numRowGroups * ESTIMATED_FOOTER_BYTES_PER_ROW_GROUP +
+   *       FOOTER_TRAILER_BYTES}, where {@code numRowGroups = ceil(expectedKeyCount / rowGroupRows)}
+   * </ul>
+   *
+   * <p>Floored at {@link #MIN_RECOMMENDED_BLOCK_BYTES}, capped at {@link
+   * #MAX_RECOMMENDED_BLOCK_BYTES}.
+   */
+  @Override
+  public Integer recommendedReadBlockSize() {
+    Integer measured = EMPIRICAL_BLOCK_SIZES.get(workloadKey(rowGroupRows, expectedKeyCount));
+    if (measured != null) {
+      return measured;
+    }
+
+    long estimatedRowGroupBytes = (long) rowGroupRows * ESTIMATED_ROW_BYTES;
+    long numRowGroups = (expectedKeyCount + rowGroupRows - 1L) / rowGroupRows;
+    long estimatedFooterBytes =
+        numRowGroups * ESTIMATED_FOOTER_BYTES_PER_ROW_GROUP + FOOTER_TRAILER_BYTES;
+    long candidate = Math.max(estimatedRowGroupBytes, estimatedFooterBytes);
+    long capped =
+        Math.min(Math.max(candidate, MIN_RECOMMENDED_BLOCK_BYTES), MAX_RECOMMENDED_BLOCK_BYTES);
+    // Round up to the next power of two so the recommendation always lands on a "nice" size
+    // (4 KB, 8 KB, 16 KB, 32 KB, ...).
+    int rounded = Integer.highestOneBit(Math.toIntExact(capped - 1)) << 1;
+    return Math.max(rounded, MIN_RECOMMENDED_BLOCK_BYTES);
   }
 
   // -----------------------------------------------------------------------

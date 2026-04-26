@@ -202,7 +202,7 @@ public class InvertedIndexBenchmark {
     } else if (isHash) {
       this.indexHandler = new HashIndexHandler(keySchema, numRows, numHashBuckets);
     } else {
-      this.indexHandler = new ParquetIndexHandler(keySchema, rowGroupRows);
+      this.indexHandler = new ParquetIndexHandler(keySchema, rowGroupRows, numRows);
     }
     // FileIO construction must come AFTER the handler is built so createFileIO() can ask the
     // handler for its recommendedReadBlockSize() hint.
