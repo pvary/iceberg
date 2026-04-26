@@ -70,7 +70,6 @@ configure(jmhProjects) {
       jmhImplementation project(':iceberg-aws-bundle')
       jmhImplementation project(':iceberg-azure')
       jmhImplementation project(':iceberg-azure-bundle')
-      // Sux4J provides GOV3-based minimal perfect hashing (~2.24 bits/key) used by
       // MphfIndexBenchmark / MphfIndexFile. Pulls in fastutil + dsiutils transitively.
       jmhImplementation ('it.unimi.dsi:sux4j:5.4.1') {
           exclude group: 'ch.qos.logback'

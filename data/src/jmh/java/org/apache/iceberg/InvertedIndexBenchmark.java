@@ -32,6 +32,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.index.IndexHandler;
+import org.apache.iceberg.index.HashIndexHandler;
 import org.apache.iceberg.index.MinimalPerfectHashFunctionIndexHandler;
 import org.apache.iceberg.index.ParquetIndexHandler;
 import org.apache.iceberg.index.UltraCompactHasherIndexHandler;
@@ -125,17 +126,19 @@ public class InvertedIndexBenchmark {
 
   /**
    * Index format and (for Parquet) row group size, encoded as {@code "PARQUET_<rows>"}, {@code
-   * "UCH_<kLimit>"} or {@code "MPHF"}. {@link #setupBenchmark()} parses it into {@link #isMphf} /
-   * {@link #isUch} and {@link #rowGroupRows} / {@link #kLimit}.
+   * "UCH_<kLimit>"}, {@code "HASH_<numBuckets>"} or {@code "MPHF"}. {@link #setupBenchmark()}
+   * parses it into the {@code is*} flags and the corresponding numeric parameter.
    */
-  @Param({"PARQUET_10000", "MPHF", "UCH_50", "UCH_500", "UCH_1000"})
+  @Param({"PARQUET_10000", "MPHF", "UCH_50", "UCH_500", "UCH_1000", "HASH_50", "HASH_500", "HASH_1000"})
   private String indexType;
 
   // Parsed from indexType in setupBenchmark.
   private boolean isMphf;
   private boolean isUch;
+  private boolean isHash;
   private int rowGroupRows;
   private int kLimit;
+  private int numHashBuckets;
 
   // Storage-related configuration. Controlled via JVM system properties so secrets stay outside
   // the source tree -- see the class javadoc for the full list.
@@ -185,6 +188,8 @@ public class InvertedIndexBenchmark {
       this.indexHandler = new MinimalPerfectHashFunctionIndexHandler(keySchema, numRows);
     } else if (isUch) {
       this.indexHandler = new UltraCompactHasherIndexHandler(keySchema, numRows, kLimit);
+    } else if (isHash) {
+      this.indexHandler = new HashIndexHandler(keySchema, numRows, numHashBuckets);
     } else {
       this.indexHandler = new ParquetIndexHandler(keySchema, rowGroupRows);
     }
@@ -194,6 +199,10 @@ public class InvertedIndexBenchmark {
       fileName = String.format(Locale.ROOT, "idx-%s-rows%d-mphf.bin", keyType, numRows);
     } else if (isUch) {
       fileName = String.format(Locale.ROOT, "idx-%s-rows%d-uch-k%d.bin", keyType, numRows, kLimit);
+    } else if (isHash) {
+      fileName =
+          String.format(
+              Locale.ROOT, "idx-%s-rows%d-hash-b%d.bin", keyType, numRows, numHashBuckets);
     } else {
       fileName =
           String.format(
@@ -285,29 +294,47 @@ public class InvertedIndexBenchmark {
     if ("MPHF".equalsIgnoreCase(indexType)) {
       this.isMphf = true;
       this.isUch = false;
+      this.isHash = false;
       this.rowGroupRows = -1;
       this.kLimit = -1;
+      this.numHashBuckets = -1;
       return;
     }
 
     if (indexType.regionMatches(true, 0, "UCH_", 0, "UCH_".length())) {
       this.isMphf = false;
       this.isUch = true;
+      this.isHash = false;
       this.rowGroupRows = -1;
       this.kLimit = Integer.parseInt(indexType.substring("UCH_".length()));
+      this.numHashBuckets = -1;
+      return;
+    }
+
+    if (indexType.regionMatches(true, 0, "HASH_", 0, "HASH_".length())) {
+      this.isMphf = false;
+      this.isUch = false;
+      this.isHash = true;
+      this.rowGroupRows = -1;
+      this.kLimit = -1;
+      this.numHashBuckets = Integer.parseInt(indexType.substring("HASH_".length()));
       return;
     }
 
     if (indexType.regionMatches(true, 0, "PARQUET_", 0, "PARQUET_".length())) {
       this.isMphf = false;
       this.isUch = false;
+      this.isHash = false;
       this.kLimit = -1;
+      this.numHashBuckets = -1;
       this.rowGroupRows = Integer.parseInt(indexType.substring("PARQUET_".length()));
       return;
     }
 
     throw new IllegalArgumentException(
-        "Unknown indexType: " + indexType + " (expected MPHF, UCH_<kLimit> or PARQUET_<rows>)");
+        "Unknown indexType: "
+            + indexType
+            + " (expected MPHF, UCH_<kLimit>, HASH_<numBuckets> or PARQUET_<rows>)");
   }
 
   @TearDown
@@ -425,6 +452,16 @@ public class InvertedIndexBenchmark {
     if (isUch) {
       return String.format(
           Locale.ROOT, "write-idx-%s-rows%d-uch-k%d-%d.bin", keyType, numRows, kLimit, seq);
+    }
+
+    if (isHash) {
+      return String.format(
+          Locale.ROOT,
+          "write-idx-%s-rows%d-hash-b%d-%d.bin",
+          keyType,
+          numRows,
+          numHashBuckets,
+          seq);
     }
 
     return String.format(
