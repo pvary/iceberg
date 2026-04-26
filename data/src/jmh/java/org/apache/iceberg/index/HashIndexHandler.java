@@ -20,7 +20,7 @@
  */
 package org.apache.iceberg.index;
 
-import java.io.DataInputStream;
+import it.unimi.dsi.fastutil.longs.LongArrayList;
 import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
@@ -32,12 +32,15 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.List;
 import java.util.function.Function;
+import org.apache.hadoop.util.Lists;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.SeekableInputStream;
+import org.apache.iceberg.relocated.com.google.common.hash.Hashing;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -140,20 +143,13 @@ public class HashIndexHandler implements IndexHandler {
   // Hashing
   // --------------------------------------------------------------------------
 
-  /** MurmurHash3-style finalizer over {@link Arrays#hashCode(byte[])}. */
-  static int hash(byte[] key) {
-    int h = Arrays.hashCode(key);
-    h ^= (h >>> 16);
-    h *= 0x85ebca6b;
-    h ^= (h >>> 13);
-    h *= 0xc2b2ae35;
-    h ^= (h >>> 16);
-    return h;
-  }
-
-  /** Lemire fastrange: maps a 32-bit hash to {@code [0, numBuckets)} without modulo. */
+  /**
+   * Maps {@code key} to {@code [0, numBuckets)} via MurmurHash3 (Guava's {@link
+   * Hashing#murmur3_32_fixed()}, the same hash Iceberg uses for the {@code bucket} partition
+   * transform) and Lemire fastrange (one 64-bit multiply + shift, no modulo).
+   */
   static int bucketOf(byte[] key, int numBuckets) {
-    long h = hash(key) & 0xFFFFFFFFL;
+    long h = Hashing.murmur3_32_fixed().hashBytes(key).asInt() & 0xFFFFFFFFL;
     return (int) ((h * numBuckets) >>> 32);
   }
 
@@ -165,9 +161,9 @@ public class HashIndexHandler implements IndexHandler {
     private final OutputFile output;
     private final Function<Record, byte[]> keyEncoder;
     private final int numBuckets;
-    private final java.util.ArrayList<byte[]> keys;
-    private final java.util.ArrayList<String> filePaths;
-    private final it.unimi.dsi.fastutil.longs.LongArrayList positions;
+    private final List<byte[]> keys;
+    private final List<String> filePaths;
+    private final LongArrayList positions;
     private boolean closed;
 
     Writer(
@@ -179,9 +175,9 @@ public class HashIndexHandler implements IndexHandler {
       this.keyEncoder = keyEncoder;
       this.numBuckets = numBuckets;
       int initialCapacity = (int) Math.min(Integer.MAX_VALUE - 16L, expectedKeyCount);
-      this.keys = new java.util.ArrayList<>(initialCapacity);
-      this.filePaths = new java.util.ArrayList<>(initialCapacity);
-      this.positions = new it.unimi.dsi.fastutil.longs.LongArrayList(initialCapacity);
+      this.keys = Lists.newArrayListWithCapacity(initialCapacity);
+      this.filePaths = Lists.newArrayListWithCapacity(initialCapacity);
+      this.positions = new LongArrayList(initialCapacity);
     }
 
     @Override
@@ -385,26 +381,58 @@ public class HashIndexHandler implements IndexHandler {
       this.stream = input.newStream();
       this.keyEncoder = keyEncoder;
 
-      DataInputStream hd = new DataInputStream(stream);
+      // 1) Speculative bulk read covering the fixed header + (most of) the prefix bytes. The
+      //    exact prefix length is recorded in the header, but in practice it's a single path
+      //    prefix that comfortably fits in a few KB. Issuing one large read up front, rather
+      //    than 7 tiny reads via DataInputStream, collapses Reader-open into a single
+      //    underlying read() on object stores. Under-estimates fall back to one extra tail
+      //    read; over-estimates waste a few KB of transient buffer.
+      long fileLength;
+      try {
+        fileLength = input.getLength();
+      } catch (RuntimeException e) {
+        fileLength = Long.MAX_VALUE;
+      }
+
+      // 4 KB slack covers the longest-common path prefix in virtually all real workloads.
+      int prefetch =
+          (int) Math.min((long) HEADER_FIXED_LENGTH + 4096L, Math.min(Integer.MAX_VALUE - 16L, fileLength));
+      if (prefetch < HEADER_FIXED_LENGTH) {
+        throw new IOException(
+            "File too short to contain HashIndexHandler header: " + fileLength);
+      }
+
+      byte[] prefetched = readFully(stream, prefetch);
+
+      // Parse fixed header out of the prefetched buffer.
+      ByteBuffer hd = ByteBuffer.wrap(prefetched).order(ByteOrder.BIG_ENDIAN);
       byte[] magic = new byte[MAGIC.length];
-      hd.readFully(magic);
+      hd.get(magic);
       if (!Arrays.equals(magic, MAGIC)) {
         throw new IOException("Not a HashIndexHandler file (bad magic)");
       }
 
-      int formatVersion = hd.readInt();
+      int formatVersion = hd.getInt();
       if (formatVersion != FORMAT_VERSION) {
         throw new IOException("Unsupported HashIndexHandler file version: " + formatVersion);
       }
 
-      this.numBuckets = hd.readInt();
-      this.maxBucketSize = hd.readInt();
-      int prefixLength = hd.readInt();
-      this.maxKeyLength = hd.readInt();
-      int maxSuffixLength = hd.readInt();
+      this.numBuckets = hd.getInt();
+      this.maxBucketSize = hd.getInt();
+      int prefixLength = hd.getInt();
+      this.maxKeyLength = hd.getInt();
+      int maxSuffixLength = hd.getInt();
 
+      // 2) Materialise the prefix bytes. In the common case they already sit inside
+      //    `prefetched`; otherwise read just the missing tail.
+      int prefetchedPrefix = prefetched.length - HEADER_FIXED_LENGTH;
       byte[] prefix = new byte[prefixLength];
-      hd.readFully(prefix);
+      if (prefetchedPrefix >= prefixLength) {
+        System.arraycopy(prefetched, HEADER_FIXED_LENGTH, prefix, 0, prefixLength);
+      } else {
+        System.arraycopy(prefetched, HEADER_FIXED_LENGTH, prefix, 0, prefetchedPrefix);
+        readFully(stream, prefix, prefetchedPrefix, prefixLength - prefetchedPrefix);
+      }
 
       this.entrySize = ENTRY_HEADER_BYTES + maxKeyLength + maxSuffixLength;
       this.bucketBytes = (long) maxBucketSize * entrySize;
@@ -480,10 +508,21 @@ public class HashIndexHandler implements IndexHandler {
   // helpers
   // --------------------------------------------------------------------------
 
+  private static byte[] readFully(InputStream in, int len) throws IOException {
+    byte[] buf = new byte[len];
+    readFully(in, buf, 0, len);
+    return buf;
+  }
+
   private static void readFully(InputStream in, byte[] buf, int len) throws IOException {
+    readFully(in, buf, 0, len);
+  }
+
+  private static void readFully(InputStream in, byte[] buf, int offset, int len)
+      throws IOException {
     int read = 0;
     while (read < len) {
-      int n = in.read(buf, read, len - read);
+      int n = in.read(buf, offset + read, len - read);
       if (n < 0) {
         throw new EOFException("Unexpected EOF after " + read + " of " + len + " bytes");
       }
