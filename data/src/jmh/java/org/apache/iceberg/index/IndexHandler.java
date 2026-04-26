@@ -42,6 +42,20 @@ public interface IndexHandler {
   Reader reader(InputFile input) throws IOException;
 
   /**
+   * Hint, in bytes, for the storage adapter's first wire read size (e.g. ADLS {@code
+   * adls.read.block-size-bytes}). When non-{@code null}, callers should configure their {@link
+   * org.apache.iceberg.io.FileIO FileIO} so a single bounded {@code RangeReadable.readFully} issued
+   * by this handler's {@link Reader} fits in one HTTP round-trip without dragging in the adapter's
+   * much larger default block (4 MB on ADLS).
+   *
+   * <p>Returning {@code null} (the default) means the implementation has no opinion and the
+   * adapter's defaults should be used.
+   */
+  default Integer recommendedReadBlockSize() {
+    return null;
+  }
+
+  /**
    * Buffers entries and writes them as an index file when {@link #close()} is called. Each {@code
    * key} added must be unique within a single writer instance.
    */

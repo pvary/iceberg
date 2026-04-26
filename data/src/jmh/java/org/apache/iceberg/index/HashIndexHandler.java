@@ -1,22 +1,20 @@
 /*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
- *  * Licensed to the Apache Software Foundation (ASF) under one
- *  * or more contributor license agreements.  See the NOTICE file
- *  * distributed with this work for additional information
- *  * regarding copyright ownership.  The ASF licenses this file
- *  * to you under the Apache License, Version 2.0 (the
- *  * "License"); you may not use this file except in compliance
- *  * with the License.  You may obtain a copy of the License at
- *  *
- *  *   http://www.apache.org/licenses/LICENSE-2.0
- *  *
- *  * Unless required by applicable law or agreed to in writing,
- *  * software distributed under the License is distributed on an
- *  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- *  * KIND, either express or implied.  See the License for the
- *  * specific language governing permissions and limitations
- *  * under the License.
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
 package org.apache.iceberg.index;
 
@@ -39,6 +37,7 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.io.RangeReadable;
 import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.relocated.com.google.common.hash.Hashing;
 import org.slf4j.Logger;
@@ -99,6 +98,25 @@ public class HashIndexHandler implements IndexHandler {
   /** Fixed-size header up to (but not including) the prefix bytes. */
   private static final int HEADER_FIXED_LENGTH = 6 + 4 + 4 + 4 + 4 + 4 + 4;
 
+  /**
+   * Inputs to {@link #recommendedReadBlockSize(long, int)}. Calibrated so that for typical
+   * workloads (LONG / UUID / short STRING keys with a shared path prefix) the estimated per-bucket
+   * size is close to the actual {@code bucketBytes} the {@link Reader} computes from the on-disk
+   * header, keeping the under/over-shoot warnings silent.
+   *
+   * <p>{@code BUCKET_LOAD_FACTOR}: multiplier applied to the average bucket occupancy to model
+   * writer-side hash collisions. {@code ESTIMATED_ENTRY_BYTES}: conservative per-entry on-disk size
+   * in bytes. {@code MIN_RECOMMENDED_BLOCK_BYTES}: lower bound; also covers the open-time header
+   * prefetch. {@code MAX_RECOMMENDED_BLOCK_BYTES}: upper bound to keep outlier configs in check.
+   */
+  private static final double BUCKET_LOAD_FACTOR = 1.2;
+
+  private static final long ESTIMATED_ENTRY_BYTES = 40L;
+
+  private static final int MIN_RECOMMENDED_BLOCK_BYTES = 4096;
+
+  private static final long MAX_RECOMMENDED_BLOCK_BYTES = 64L * 1024 * 1024;
+
   private static final VarHandle SHORT_BE =
       MethodHandles.byteArrayViewVarHandle(short[].class, ByteOrder.BIG_ENDIAN);
 
@@ -136,7 +154,37 @@ public class HashIndexHandler implements IndexHandler {
 
   @Override
   public IndexHandler.Reader reader(InputFile input) throws IOException {
-    return new Reader(input, keyEncoder);
+    return new Reader(input, keyEncoder, expectedKeyCount);
+  }
+
+  /**
+   * Estimates the largest bounded read this handler's {@link Reader} will issue (a single bucket)
+   * and rounds it up to the next power of two so the storage adapter can serve it in one wire GET.
+   * {@link #MIN_RECOMMENDED_BLOCK_BYTES} sets a hard floor (also covering the open-time header
+   * prefetch) and {@link #MAX_RECOMMENDED_BLOCK_BYTES} caps outlier configurations.
+   *
+   * <p>The estimate uses {@link #BUCKET_LOAD_FACTOR} times the average bucket occupancy ({@code
+   * expectedKeyCount / numBuckets}) to approximate the writer's hash collisions, and {@link
+   * #ESTIMATED_ENTRY_BYTES} for the per-entry header + key + path-suffix slot. This is
+   * intentionally conservative: under-estimating would fragment the per-lookup GET into multiple
+   * round-trips (very expensive on cloud storage), while over-estimating only wastes a few KB of
+   * wire bandwidth on the rare end-of-bucket fetch.
+   */
+  @Override
+  public Integer recommendedReadBlockSize() {
+    return recommendedReadBlockSize(expectedKeyCount, numBuckets);
+  }
+
+  /** Pure helper so {@link Reader} can self-check the estimate without an enclosing instance. */
+  private static int recommendedReadBlockSize(long expectedKeyCount, int numBuckets) {
+    long avgBucket = Math.max(1L, expectedKeyCount / numBuckets);
+    long estimatedBucketBytes =
+        Math.max(
+            MIN_RECOMMENDED_BLOCK_BYTES,
+            (long) Math.ceil(avgBucket * BUCKET_LOAD_FACTOR) * ESTIMATED_ENTRY_BYTES);
+    long capped = Math.min(estimatedBucketBytes, MAX_RECOMMENDED_BLOCK_BYTES);
+    int blockSize = Integer.highestOneBit(Math.toIntExact(capped - 1)) << 1;
+    return Math.max(blockSize, MIN_RECOMMENDED_BLOCK_BYTES);
   }
 
   // --------------------------------------------------------------------------
@@ -357,6 +405,7 @@ public class HashIndexHandler implements IndexHandler {
 
   private static class Reader implements IndexHandler.Reader {
     private final SeekableInputStream stream;
+    private final boolean rangeReadable;
     private final Function<Record, byte[]> keyEncoder;
     private final int numBuckets;
     private final int maxBucketSize;
@@ -377,16 +426,17 @@ public class HashIndexHandler implements IndexHandler {
      */
     private final byte[] paddedKey;
 
-    Reader(InputFile input, Function<Record, byte[]> keyEncoder) throws IOException {
+    Reader(InputFile input, Function<Record, byte[]> keyEncoder, long expectedKeyCount)
+        throws IOException {
       this.stream = input.newStream();
       this.keyEncoder = keyEncoder;
+      this.rangeReadable = stream instanceof RangeReadable;
 
       // 1) Speculative bulk read covering the fixed header + (most of) the prefix bytes. The
       //    exact prefix length is recorded in the header, but in practice it's a single path
       //    prefix that comfortably fits in a few KB. Issuing one large read up front, rather
       //    than 7 tiny reads via DataInputStream, collapses Reader-open into a single
-      //    underlying read() on object stores. Under-estimates fall back to one extra tail
-      //    read; over-estimates waste a few KB of transient buffer.
+      //    underlying read() on object stores.
       long fileLength;
       try {
         fileLength = input.getLength();
@@ -396,13 +446,19 @@ public class HashIndexHandler implements IndexHandler {
 
       // 4 KB slack covers the longest-common path prefix in virtually all real workloads.
       int prefetch =
-          (int) Math.min((long) HEADER_FIXED_LENGTH + 4096L, Math.min(Integer.MAX_VALUE - 16L, fileLength));
+          (int)
+              Math.min(
+                  (long) HEADER_FIXED_LENGTH + 4096L,
+                  Math.min(Integer.MAX_VALUE - 16L, fileLength));
       if (prefetch < HEADER_FIXED_LENGTH) {
-        throw new IOException(
-            "File too short to contain HashIndexHandler header: " + fileLength);
+        throw new IOException("File too short to contain HashIndexHandler header: " + fileLength);
       }
 
-      byte[] prefetched = readFully(stream, prefetch);
+      // Bounded positional read. RangeReadable.readFully passes an explicit (start, end) to
+      // the storage adapter so e.g. ADLS issues exactly one GET sized to `prefetch`, instead
+      // of pulling a blockSize-aligned chunk via the buffered stream.
+      byte[] prefetched = new byte[prefetch];
+      readRange(0L, prefetched, 0, prefetch);
 
       // Parse fixed header out of the prefetched buffer.
       ByteBuffer hd = ByteBuffer.wrap(prefetched).order(ByteOrder.BIG_ENDIAN);
@@ -431,7 +487,8 @@ public class HashIndexHandler implements IndexHandler {
         System.arraycopy(prefetched, HEADER_FIXED_LENGTH, prefix, 0, prefixLength);
       } else {
         System.arraycopy(prefetched, HEADER_FIXED_LENGTH, prefix, 0, prefetchedPrefix);
-        readFully(stream, prefix, prefetchedPrefix, prefixLength - prefetchedPrefix);
+        int missing = prefixLength - prefetchedPrefix;
+        readRange((long) HEADER_FIXED_LENGTH + prefetchedPrefix, prefix, prefetchedPrefix, missing);
       }
 
       this.entrySize = ENTRY_HEADER_BYTES + maxKeyLength + maxSuffixLength;
@@ -442,6 +499,50 @@ public class HashIndexHandler implements IndexHandler {
       this.prefixEmpty = prefixStr.isEmpty();
       this.bucketBuf = new byte[Math.toIntExact(bucketBytes)];
       this.paddedKey = new byte[maxKeyLength];
+
+      // Sanity-check the recommendedReadBlockSize() estimate against the actual bucket size,
+      // so handler tuning shows up at runtime instead of silently misconfiguring the storage
+      // adapter. Under-shoot fragments every per-lookup readFully into multiple wire GETs (very
+      // expensive on cloud storage); significant over-shoot wastes bandwidth on each GET. Both
+      // are logged at WARN so a benchmark / catalog operator can tighten the estimate without
+      // digging through HTTP traces.
+      int recommended = recommendedReadBlockSize(expectedKeyCount, numBuckets);
+      if (bucketBytes > recommended) {
+        LOG.warn(
+            "HashIndexHandler Reader bucket exceeds recommendedReadBlockSize: bucketBytes={} B"
+                + " > recommended={} B (numBuckets={}, maxBucketSize={}, entrySize={},"
+                + " expectedKeyCount={}). Per-lookup GETs will fragment; consider raising the"
+                + " per-entry size estimate or lowering numBuckets.",
+            bucketBytes,
+            recommended,
+            numBuckets,
+            maxBucketSize,
+            entrySize,
+            expectedKeyCount);
+      } else if (bucketBytes * 2 < recommended) {
+        LOG.warn(
+            "HashIndexHandler Reader bucket far below recommendedReadBlockSize: bucketBytes={} B"
+                + " vs recommended={} B (>2x; numBuckets={}, maxBucketSize={}, entrySize={},"
+                + " expectedKeyCount={}). Wire bandwidth wasted; consider lowering the per-entry"
+                + " size estimate or raising numBuckets.",
+            bucketBytes,
+            recommended,
+            numBuckets,
+            maxBucketSize,
+            entrySize,
+            expectedKeyCount);
+      }
+    }
+
+    /** Bounded positional read that prefers a single tight GET via RangeReadable. */
+    private void readRange(long position, byte[] buffer, int offset, int length)
+        throws IOException {
+      if (rangeReadable) {
+        ((RangeReadable) stream).readFully(position, buffer, offset, length);
+      } else {
+        stream.seek(position);
+        readFully(stream, buffer, offset, length);
+      }
     }
 
     @Override
@@ -459,8 +560,8 @@ public class HashIndexHandler implements IndexHandler {
       }
 
       int bucket = bucketOf(encoded, numBuckets);
-      stream.seek(dataBlockOffset + (long) bucket * bucketBytes);
-      readFully(stream, bucketBuf, bucketBuf.length);
+      long bucketOffset = dataBlockOffset + (long) bucket * bucketBytes;
+      readRange(bucketOffset, bucketBuf, 0, bucketBuf.length);
 
       for (int i = 0; i < maxBucketSize; i++) {
         int off = i * entrySize;
@@ -508,16 +609,6 @@ public class HashIndexHandler implements IndexHandler {
   // helpers
   // --------------------------------------------------------------------------
 
-  private static byte[] readFully(InputStream in, int len) throws IOException {
-    byte[] buf = new byte[len];
-    readFully(in, buf, 0, len);
-    return buf;
-  }
-
-  private static void readFully(InputStream in, byte[] buf, int len) throws IOException {
-    readFully(in, buf, 0, len);
-  }
-
   private static void readFully(InputStream in, byte[] buf, int offset, int len)
       throws IOException {
     int read = 0;
@@ -554,4 +645,3 @@ public class HashIndexHandler implements IndexHandler {
     return out;
   }
 }
-

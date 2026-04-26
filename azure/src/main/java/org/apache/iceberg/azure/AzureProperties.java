@@ -46,6 +46,24 @@ public class AzureProperties implements Serializable {
   public static final String ADLS_CONNECTION_STRING_PREFIX = "adls.connection-string.";
   public static final String ADLS_READ_BLOCK_SIZE = "adls.read.block-size-bytes";
   public static final String ADLS_WRITE_BLOCK_SIZE = "adls.write.block-size-bytes";
+
+  /**
+   * When {@code true}, defer opening the underlying Azure SDK input stream until the first
+   * sequential {@code read()}. The default ({@code false}) preserves backwards-compatible behavior
+   * in which {@link org.apache.iceberg.io.InputFile#newStream()} eagerly issues an unbounded {@code
+   * openRange(new FileRange(0))} which the SDK serves with a single GET sized to {@code blockSize}
+   * (default 4 MB). Lazy opening is desirable when callers only ever use {@link
+   * org.apache.iceberg.io.RangeReadable#readFully RangeReadable.readFully} or {@link
+   * org.apache.iceberg.io.RangeReadable#readTail readTail} (both already open their own bounded
+   * ranges and never touch the persistent buffered stream), avoiding a wasted GET on every {@code
+   * newStream()} call.
+   *
+   * <p>Note: enabling this changes when {@link org.apache.iceberg.exceptions.NotFoundException} is
+   * thrown for missing files -- from {@code newStream()} to the first {@code read()} -- which
+   * matches the behavior of S3FileIO and HadoopFileIO.
+   */
+  public static final String ADLS_LAZY_OPEN = "adls.read.lazy-open";
+
   public static final String ADLS_SHARED_KEY_ACCOUNT_NAME = "adls.auth.shared-key.account.name";
   public static final String ADLS_SHARED_KEY_ACCOUNT_KEY = "adls.auth.shared-key.account.key";
   public static final String ADLS_TOKEN = "adls.token";
@@ -91,6 +109,7 @@ public class AzureProperties implements Serializable {
   private Map.Entry<String, String> namedKeyCreds;
   private Integer adlsReadBlockSize;
   private Long adlsWriteBlockSize;
+  private boolean adlsLazyOpen;
   private String adlsRefreshCredentialsEndpoint;
   private boolean adlsRefreshCredentialsEnabled;
   private String token;
@@ -122,6 +141,7 @@ public class AzureProperties implements Serializable {
     if (properties.containsKey(ADLS_WRITE_BLOCK_SIZE)) {
       this.adlsWriteBlockSize = Long.parseLong(properties.get(ADLS_WRITE_BLOCK_SIZE));
     }
+    this.adlsLazyOpen = PropertyUtil.propertyAsBoolean(properties, ADLS_LAZY_OPEN, false);
     this.adlsRefreshCredentialsEndpoint =
         RESTUtil.resolveEndpoint(
             properties.get(CatalogProperties.URI),
@@ -146,6 +166,11 @@ public class AzureProperties implements Serializable {
 
   public Optional<Long> adlsWriteBlockSize() {
     return Optional.ofNullable(adlsWriteBlockSize);
+  }
+
+  /** See {@link #ADLS_LAZY_OPEN}. */
+  public boolean adlsLazyOpen() {
+    return adlsLazyOpen;
   }
 
   public Optional<VendedAdlsCredentialProvider> vendedAdlsCredentialProvider() {

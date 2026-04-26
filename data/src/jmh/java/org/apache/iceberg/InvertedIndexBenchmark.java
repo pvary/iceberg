@@ -18,6 +18,8 @@
  */
 package org.apache.iceberg;
 
+import static org.apache.iceberg.azure.AzureProperties.ADLS_LAZY_OPEN;
+import static org.apache.iceberg.azure.AzureProperties.ADLS_READ_BLOCK_SIZE;
 import static org.apache.iceberg.types.Types.NestedField.required;
 
 import java.io.File;
@@ -31,8 +33,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
-import org.apache.iceberg.index.IndexHandler;
 import org.apache.iceberg.index.HashIndexHandler;
+import org.apache.iceberg.index.IndexHandler;
 import org.apache.iceberg.index.MinimalPerfectHashFunctionIndexHandler;
 import org.apache.iceberg.index.ParquetIndexHandler;
 import org.apache.iceberg.index.UltraCompactHasherIndexHandler;
@@ -129,7 +131,17 @@ public class InvertedIndexBenchmark {
    * "UCH_<kLimit>"}, {@code "HASH_<numBuckets>"} or {@code "MPHF"}. {@link #setupBenchmark()}
    * parses it into the {@code is*} flags and the corresponding numeric parameter.
    */
-  @Param({"PARQUET_10000", "MPHF", "UCH_50", "UCH_500", "UCH_1000", "HASH_50", "HASH_500", "HASH_1000"})
+  @Param({
+    "PARQUET_10000",
+    "PARQUET_5000",
+    "PARQUET_20000",
+    "PARQUET_50000",
+    "MPHF",
+    "HASH_2000",
+    "HASH_5000",
+    "HASH_10000",
+    "HASH_20000"
+  })
   private String indexType;
 
   // Parsed from indexType in setupBenchmark.
@@ -182,7 +194,6 @@ public class InvertedIndexBenchmark {
   @Setup
   public void setupBenchmark() throws Exception {
     parseIndexType();
-    this.io = new CountingFileIO(createFileIO());
     this.keySchema = buildKeySchema(keyType);
     if (isMphf) {
       this.indexHandler = new MinimalPerfectHashFunctionIndexHandler(keySchema, numRows);
@@ -193,6 +204,9 @@ public class InvertedIndexBenchmark {
     } else {
       this.indexHandler = new ParquetIndexHandler(keySchema, rowGroupRows);
     }
+    // FileIO construction must come AFTER the handler is built so createFileIO() can ask the
+    // handler for its recommendedReadBlockSize() hint.
+    this.io = new CountingFileIO(createFileIO());
 
     String fileName;
     if (isMphf) {
@@ -608,7 +622,7 @@ public class InvertedIndexBenchmark {
     return s.endsWith("/") ? s.substring(0, s.length() - 1) : s;
   }
 
-  private static FileIO createFileIO() {
+  private FileIO createFileIO() {
     Storage storage = selectedStorage();
     Map<String, String> props = collectIoProps();
     String impl =
@@ -619,6 +633,26 @@ public class InvertedIndexBenchmark {
           case S3 -> "org.apache.iceberg.aws.s3.S3FileIO";
           case ADLS -> "org.apache.iceberg.azure.adlsv2.ADLSFileIO";
         };
+
+    // Programmatic ADLS tuning, sourced from the IndexHandler itself. The handler knows its
+    // access pattern (HashIndexHandler issues one bounded RangeReadable.readFully per
+    // header + per bucket) and reports the smallest first-GET size that fits a single read,
+    // avoiding the SDK's 4 MB default. Pair with lazy-open so the constructor doesn't issue
+    // an unbounded eager open. Both honor any user-supplied -Dindex.bench.io.adls.* override.
+    if (storage == Storage.ADLS && indexHandler != null) {
+      Integer size = indexHandler.recommendedReadBlockSize();
+      if (size != null) {
+        props.putIfAbsent(ADLS_READ_BLOCK_SIZE, Integer.toString(size));
+        props.putIfAbsent(ADLS_LAZY_OPEN, "true");
+        LOG.info(
+            "ADLS tuning from {}: {}={} {}=true",
+            indexHandler.getClass().getSimpleName(),
+            ADLS_READ_BLOCK_SIZE,
+            size,
+            ADLS_LAZY_OPEN);
+      }
+    }
+
     LOG.info("Using FileIO impl={} props={}", impl, props.keySet());
     return CatalogUtil.loadFileIO(impl, props, null);
   }
@@ -667,6 +701,14 @@ public class InvertedIndexBenchmark {
   private static final AtomicLong BYTES_READ = new AtomicLong();
   private static final AtomicLong SEEKS = new AtomicLong();
   private static final AtomicLong OPEN_INPUT_STREAMS = new AtomicLong();
+
+  /**
+   * Number of {@code read*()} calls on the underlying {@link SeekableInputStream}. Counts every
+   * invocation that returned at least one byte (so partial-read loops still surface as multiple
+   * reads), regardless of how many bytes each call transferred.
+   */
+  private static final AtomicLong READS = new AtomicLong();
+
   // Cumulative wall-clock nanoseconds spent inside the corresponding IO call.
   private static final AtomicLong OPEN_NANOS = new AtomicLong();
   private static final AtomicLong SEEK_NANOS = new AtomicLong();
@@ -683,6 +725,9 @@ public class InvertedIndexBenchmark {
     public long seeks;
     public long openStreams;
 
+    /** Number of {@code read*()} calls issued against the underlying input stream. */
+    public long reads;
+
     /** Total wall-clock microseconds spent inside {@code InputFile#newStream()}. */
     public long openMicros;
 
@@ -695,6 +740,7 @@ public class InvertedIndexBenchmark {
     private long startBytesRead;
     private long startSeeks;
     private long startOpenStreams;
+    private long startReads;
     private long startOpenNanos;
     private long startSeekNanos;
     private long startReadNanos;
@@ -704,6 +750,7 @@ public class InvertedIndexBenchmark {
       startBytesRead = BYTES_READ.get();
       startSeeks = SEEKS.get();
       startOpenStreams = OPEN_INPUT_STREAMS.get();
+      startReads = READS.get();
       startOpenNanos = OPEN_NANOS.get();
       startSeekNanos = SEEK_NANOS.get();
       startReadNanos = READ_NANOS.get();
@@ -714,6 +761,7 @@ public class InvertedIndexBenchmark {
       bytesRead = BYTES_READ.get() - startBytesRead;
       seeks = SEEKS.get() - startSeeks;
       openStreams = OPEN_INPUT_STREAMS.get() - startOpenStreams;
+      reads = READS.get() - startReads;
       openMicros = (OPEN_NANOS.get() - startOpenNanos) / 1_000L;
       seekMicros = (SEEK_NANOS.get() - startSeekNanos) / 1_000L;
       readMicros = (READ_NANOS.get() - startReadNanos) / 1_000L;
@@ -836,6 +884,7 @@ public class InvertedIndexBenchmark {
         READ_NANOS.addAndGet(System.nanoTime() - t0);
       }
       if (b >= 0) {
+        READS.incrementAndGet();
         BYTES_READ.incrementAndGet();
       }
       return b;
@@ -856,6 +905,7 @@ public class InvertedIndexBenchmark {
         READ_NANOS.addAndGet(System.nanoTime() - t0);
       }
       if (n > 0) {
+        READS.incrementAndGet();
         BYTES_READ.addAndGet(n);
       }
       return n;

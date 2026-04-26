@@ -547,7 +547,7 @@ public class ParquetIndexHandlerWithPageFilter implements IndexHandler {
     }
 
     @Override
-    public org.apache.parquet.io.SeekableInputStream newStream() throws IOException {
+    public org.apache.parquet.io.SeekableInputStream newStream() {
       return new IcebergParquetSeekableInputStream(delegate.newStream());
     }
   }
@@ -578,7 +578,4 @@ public class ParquetIndexHandlerWithPageFilter implements IndexHandler {
       src.seek(newPos);
     }
   }
-
-  /** Minimal value-object implementation of {@link IndexHandler.Hit}. */
-  private record HitImpl(String filePath, long pos) implements IndexHandler.Hit {}
 }

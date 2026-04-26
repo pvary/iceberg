@@ -356,7 +356,4 @@ public class ParquetIndexHandler implements IndexHandler {
       // Nothing to close: each lookup opens and closes its own Parquet reader.
     }
   }
-
-  /** Minimal value-object implementation of {@link IndexHandler.Hit}. */
-  private record HitImpl(String filePath, long pos) implements IndexHandler.Hit {}
 }

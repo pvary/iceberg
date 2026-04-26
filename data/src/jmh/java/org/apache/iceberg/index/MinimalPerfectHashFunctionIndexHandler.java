@@ -48,6 +48,8 @@ import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Iceberg-specific MPHF-based inverted-index file format, backed by Sux4J's {@link
@@ -89,6 +91,9 @@ import org.apache.iceberg.types.Types;
  * </pre>
  */
 public class MinimalPerfectHashFunctionIndexHandler implements IndexHandler {
+
+  private static final Logger LOG =
+      LoggerFactory.getLogger(MinimalPerfectHashFunctionIndexHandler.class);
 
   private static final byte[] MAGIC = "MPHFI1".getBytes(StandardCharsets.US_ASCII);
   private static final int FORMAT_VERSION = 1;
@@ -170,6 +175,32 @@ public class MinimalPerfectHashFunctionIndexHandler implements IndexHandler {
   @Override
   public IndexHandler.Reader reader(InputFile input) throws IOException {
     return new Reader(input, keyEncoder, expectedKeyCount);
+  }
+
+  /**
+   * Estimates the largest single read this handler's {@link Reader} will issue (the open-time
+   * metadata prefetch: fixed header + path prefix + serialised hash-function blob) and rounds it up
+   * to the next power of two so the storage adapter can serve it in one wire GET.
+   *
+   * <p>The MPHF blob dominates the metadata region; we use the same {@code MPHF_BITS_PER_KEY}
+   * estimate the {@link Reader} uses to size its prefetch, plus 4 KB slack for the prefix bytes and
+   * object-stream framing. Per-lookup entry reads are tiny ({@code entrySize}, typically tens of
+   * bytes) and fit under any reasonable block size, so they don't need separate sizing.
+   *
+   * <p>Floored at 4 KB and capped at 16 MB to keep the result within sensible bounds.
+   */
+  @Override
+  public Integer recommendedReadBlockSize() {
+    return recommendedReadBlockSize(expectedKeyCount);
+  }
+
+  /** Pure helper so {@link Reader} can self-check the estimate without an enclosing instance. */
+  private static int recommendedReadBlockSize(long expectedKeyCount) {
+    long metadataBytes =
+        HEADER_FIXED_LENGTH + (long) Math.ceil(expectedKeyCount * MPHF_BITS_PER_KEY / 8.0) + 4096L;
+    long capped = Math.min(Math.max(4096L, metadataBytes), 64L * 1024 * 1024);
+    int blockSize = Integer.highestOneBit(Math.toIntExact(capped - 1)) << 1;
+    return Math.max(blockSize, 4096);
   }
 
   /**
@@ -605,6 +636,33 @@ public class MinimalPerfectHashFunctionIndexHandler implements IndexHandler {
         System.arraycopy(prefetched, HEADER_FIXED_LENGTH, metadataRegion, 0, prefetchedMetadata);
         readFully(
             stream, metadataRegion, prefetchedMetadata, metadataRegionLength - prefetchedMetadata);
+      }
+
+      // Sanity-check the recommendedReadBlockSize() estimate against the actual metadata size,
+      // so handler tuning shows up at runtime instead of silently misconfiguring the storage
+      // adapter. Under-shoot triggers an extra tail read above; significant over-shoot wastes
+      // wire bandwidth on the very first GET. Both are logged at WARN so a benchmark / catalog
+      // operator can tighten the estimate without digging through HTTP traces.
+      long actualMetadataBytes = (long) HEADER_FIXED_LENGTH + metadataRegionLength;
+      int recommended = recommendedReadBlockSize(expectedKeyCount);
+      if (actualMetadataBytes > recommended) {
+        LOG.warn(
+            "MPHF Reader prefetch under-shot: actual metadata {} B > recommendedReadBlockSize {} B"
+                + " (numKeys={}, expectedKeyCount={}). Tail read was needed; consider raising the"
+                + " MPHF_BITS_PER_KEY estimate.",
+            actualMetadataBytes,
+            recommended,
+            numKeys,
+            expectedKeyCount);
+      } else if (actualMetadataBytes * 2 < recommended) {
+        LOG.warn(
+            "MPHF Reader prefetch over-shot: actual metadata {} B vs recommendedReadBlockSize {} B"
+                + " (>2x; numKeys={}, expectedKeyCount={}). Consider lowering the MPHF_BITS_PER_KEY"
+                + " estimate or the per-handler expectedKeyCount.",
+            actualMetadataBytes,
+            recommended,
+            numKeys,
+            expectedKeyCount);
       }
 
       byte[] prefix = Arrays.copyOfRange(metadataRegion, 0, prefixLength);

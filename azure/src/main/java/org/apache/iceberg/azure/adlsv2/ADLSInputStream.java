@@ -79,7 +79,14 @@ class ADLSInputStream extends SeekableInputStream implements RangeReadable {
 
     this.createStack = Thread.currentThread().getStackTrace();
 
-    openStream();
+    if (!azureProperties.adlsLazyOpen()) {
+      // Backwards-compatible path: eagerly open the buffered SDK stream so that the very first
+      // read() (or a missing-file probe via newStream()) doesn't pay the latency of an HTTP
+      // round-trip mid-stream. Skipped when adls.read.lazy-open=true to avoid an unbounded
+      // openRange(new FileRange(0)) for callers that only ever invoke RangeReadable.readFully
+      // or readTail (both already open their own bounded ranges).
+      openStream();
+    }
   }
 
   private void openStream() {
