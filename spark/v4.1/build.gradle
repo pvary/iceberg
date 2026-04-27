@@ -49,14 +49,6 @@ project(":iceberg-spark:iceberg-spark-${sparkMajorVersion}_${scalaVersion}") {
     }
   }
 
-  configurations {
-    parquetTestArtifactsRuntime {
-      canBeConsumed = false
-      canBeResolved = true
-      transitive = false
-    }
-  }
-
   dependencies {
     implementation project(path: ':iceberg-bundled-guava', configuration: 'shadow')
     api project(':iceberg-api')
@@ -118,7 +110,12 @@ project(":iceberg-spark:iceberg-spark-${sparkMajorVersion}_${scalaVersion}") {
     testImplementation libs.awaitility
     testImplementation(testFixtures(project(':iceberg-parquet')))
 
-    parquetTestArtifactsRuntime project(path: ':iceberg-parquet', configuration: 'testArtifacts')
+    // Provide iceberg-parquet test classes (e.g. ParquetWritingTestUtils) at test runtime
+    // without dragging in their transitive dependencies, which would conflict with the Spark
+    // test classpath (Parquet/Hadoop/Avro versions).
+    testRuntimeOnly(project(path: ':iceberg-parquet', configuration: 'testArtifacts')) {
+      transitive = false
+    }
   }
 
   test {
@@ -128,7 +125,6 @@ project(":iceberg-spark:iceberg-spark-${sparkMajorVersion}_${scalaVersion}") {
   tasks.withType(Test) {
     // Vectorized reads need more memory
     maxHeapSize '3160m'
-    classpath += configurations.parquetTestArtifactsRuntime
   }
 }
 
