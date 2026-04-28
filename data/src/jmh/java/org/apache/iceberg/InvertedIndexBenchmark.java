@@ -62,6 +62,8 @@ import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Threads;
 import org.openjdk.jmh.annotations.Warmup;
 import org.openjdk.jmh.infra.Blackhole;
+import org.openjdk.jmh.infra.IterationParams;
+import org.openjdk.jmh.runner.IterationType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -193,6 +195,11 @@ public class InvertedIndexBenchmark {
 
   @Setup
   public void setupBenchmark() throws Exception {
+    LOG.info(
+        "InvertedIndexBenchmark setup: -D{}={} (os.name={})",
+        PURGE_CACHE_PROP,
+        System.getProperty(PURGE_CACHE_PROP),
+        System.getProperty("os.name"));
     parseIndexType();
     this.keySchema = buildKeySchema(keyType);
     if (isMphf) {
@@ -372,8 +379,8 @@ public class InvertedIndexBenchmark {
 
   @Benchmark
   @Threads(1)
-  @Warmup(iterations = 10)
-  @Measurement(iterations = 100)
+  @Warmup(iterations = 100)
+  @Measurement(iterations = 10)
   public void lookup(Blackhole bh, ReadCounter ioCounter) throws Exception {
     int idx = lookupCursor++ & (NUM_LOOKUP_KEYS - 1);
     long expectedPos = expectedPositions[idx];
@@ -715,9 +722,53 @@ public class InvertedIndexBenchmark {
   private static final AtomicLong READ_NANOS = new AtomicLong();
 
   /**
-   * Read-side IO counters surfaced by the {@link #lookup} benchmark. Only fields that can be
-   * non-zero for a lookup are exposed so the JMH results table stays compact.
+   * If {@code -Dindex.bench.purgeCache=true} is set, drops the OS page cache before every measured
+   * lookup invocation by shelling out to {@code sudo -n purge} (macOS) or writing {@code 3} to
+   * {@code /proc/sys/vm/drop_caches} (Linux). Both paths require passwordless privilege escalation.
+   * The purge runs inside {@code @Setup(Level.Invocation)} so its cost is excluded from the
+   * measured region.
    */
+  private static final String PURGE_CACHE_PROP = "index.bench.purgeCache";
+
+  private static void dropOsPageCache() {
+    String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+    try {
+      ProcessBuilder pb;
+      if (os.contains("mac") || os.contains("darwin")) {
+        // macOS: `sudo -n purge` requires a NOPASSWD sudoers entry for /usr/sbin/purge.
+        pb = new ProcessBuilder("sudo", "-n", "/usr/sbin/purge");
+        System.err.println("Trying to purge OS page cache");
+      } else if (os.contains("linux")) {
+        pb =
+            new ProcessBuilder(
+                "sh", "-c", "sync && sudo -n sh -c 'echo 3 > /proc/sys/vm/drop_caches'");
+      } else {
+        throw new IllegalStateException("Cache purge not supported on OS: " + os);
+      }
+      Process p = pb.redirectErrorStream(true).start();
+
+      if (!p.waitFor(60, TimeUnit.SECONDS)) {
+        p.destroyForcibly();
+        throw new IllegalStateException("OS page cache purge timed out after 60s");
+      }
+
+      if (p.exitValue() != 0) {
+        throw new IllegalStateException(
+            "OS page cache purge failed with exit code "
+                + p.exitValue()
+                + " (need passwordless sudo for purge / drop_caches?)");
+      }
+
+      LOG.info("Purging OS page  cache (set -D" + PURGE_CACHE_PROP + "=false to disable)");
+    } catch (IOException | InterruptedException e) {
+      if (e instanceof InterruptedException) {
+        Thread.currentThread().interrupt();
+      }
+
+      throw new IllegalStateException("Failed to purge OS page cache", e);
+    }
+  }
+
   @State(Scope.Thread)
   @AuxCounters(AuxCounters.Type.EVENTS)
   public static class ReadCounter {
@@ -745,8 +796,25 @@ public class InvertedIndexBenchmark {
     private long startSeekNanos;
     private long startReadNanos;
 
+    /**
+     * Set by {@link #beforeIteration(IterationParams)} so {@link #beforeInvocation()} can skip the
+     * (expensive) page-cache purge during warmup iterations and only run it for measurement.
+     */
+    private boolean measuring;
+
+    @Setup(Level.Iteration)
+    public void beforeIteration(IterationParams params) {
+      this.measuring = params.getType() == IterationType.MEASUREMENT;
+    }
+
     @Setup(Level.Invocation)
     public void beforeInvocation() {
+      // Drop OS page cache (if enabled) BEFORE we snapshot the IO counters so the purge's own
+      // syscalls don't pollute the per-invocation deltas reported to JMH. Skipped during warmup
+      // iterations -- warmup is meant to be cheap and just primes the JIT.
+      if (measuring && Boolean.getBoolean(PURGE_CACHE_PROP)) {
+        dropOsPageCache();
+      }
       startBytesRead = BYTES_READ.get();
       startSeeks = SEEKS.get();
       startOpenStreams = OPEN_INPUT_STREAMS.get();
