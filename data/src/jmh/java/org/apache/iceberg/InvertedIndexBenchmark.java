@@ -37,6 +37,8 @@ import org.apache.iceberg.index.HashIndexHandler;
 import org.apache.iceberg.index.IndexHandler;
 import org.apache.iceberg.index.MinimalPerfectHashFunctionIndexHandler;
 import org.apache.iceberg.index.ParquetIndexHandler;
+import org.apache.iceberg.index.ParquetIndexHandlerWithEmbeddedMetadata;
+import org.apache.iceberg.index.ParquetIndexHandlerWithHashedRowGroups;
 import org.apache.iceberg.index.UltraCompactHasherIndexHandler;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
@@ -130,8 +132,9 @@ public class InvertedIndexBenchmark {
 
   /**
    * Index format and (for Parquet) row group size, encoded as {@code "PARQUET_<rows>"}, {@code
-   * "UCH_<kLimit>"}, {@code "HASH_<numBuckets>"} or {@code "MPHF"}. {@link #setupBenchmark()}
-   * parses it into the {@code is*} flags and the corresponding numeric parameter.
+   * "UCH_<kLimit>"}, {@code "HASH_<rows>"}, {@code "PHASH_<rows>"} or {@code "MPHF"}. {@link
+   * #setupBenchmark()} parses it into the {@code is*} flags and the corresponding numeric
+   * parameter.
    */
   @Param({
     "PARQUET_10000",
@@ -142,7 +145,12 @@ public class InvertedIndexBenchmark {
     "HASH_2000",
     "HASH_5000",
     "HASH_10000",
-    "HASH_20000"
+    "HASH_20000",
+    "EPHASH_2000",
+    "EPHASH_5000",
+    "EPHASH_10000",
+    "EPHASH_20000",
+    "EPHASH_50000"
   })
   private String indexType;
 
@@ -150,9 +158,10 @@ public class InvertedIndexBenchmark {
   private boolean isMphf;
   private boolean isUch;
   private boolean isHash;
-  private int rowGroupRows;
+  private boolean isPhash;
+  private boolean isEphash;
+  private int bucketRows;
   private int kLimit;
-  private int numHashBuckets;
 
   // Storage-related configuration. Controlled via JVM system properties so secrets stay outside
   // the source tree -- see the class javadoc for the full list.
@@ -207,33 +216,21 @@ public class InvertedIndexBenchmark {
     } else if (isUch) {
       this.indexHandler = new UltraCompactHasherIndexHandler(keySchema, numRows, kLimit);
     } else if (isHash) {
-      this.indexHandler = new HashIndexHandler(keySchema, numRows, numHashBuckets);
+      this.indexHandler = new HashIndexHandler(keySchema, numRows, bucketRows);
+    } else if (isPhash) {
+      this.indexHandler =
+          new ParquetIndexHandlerWithHashedRowGroups(keySchema, bucketRows, numRows);
+    } else if (isEphash) {
+      this.indexHandler =
+          new ParquetIndexHandlerWithEmbeddedMetadata(keySchema, bucketRows, numRows);
     } else {
-      this.indexHandler = new ParquetIndexHandler(keySchema, rowGroupRows, numRows);
+      this.indexHandler = new ParquetIndexHandler(keySchema, bucketRows, numRows);
     }
     // FileIO construction must come AFTER the handler is built so createFileIO() can ask the
     // handler for its recommendedReadBlockSize() hint.
     this.io = new CountingFileIO(createFileIO());
 
-    String fileName;
-    if (isMphf) {
-      fileName = String.format(Locale.ROOT, "idx-%s-rows%d-mphf.bin", keyType, numRows);
-    } else if (isUch) {
-      fileName = String.format(Locale.ROOT, "idx-%s-rows%d-uch-k%d.bin", keyType, numRows, kLimit);
-    } else if (isHash) {
-      fileName =
-          String.format(
-              Locale.ROOT, "idx-%s-rows%d-hash-b%d.bin", keyType, numRows, numHashBuckets);
-    } else {
-      fileName =
-          String.format(
-              Locale.ROOT,
-              "idx-%s-rows%d-parquet-rg%drows.parquet",
-              keyType,
-              numRows,
-              rowGroupRows);
-    }
-    this.fileLocation = joinPath(baseLocation(), fileName);
+    this.fileLocation = joinPath(baseLocation(), filename());
     InputFile existing = io.newInputFile(fileLocation);
     boolean reuseExisting;
     try {
@@ -311,51 +308,81 @@ public class InvertedIndexBenchmark {
         writeMs);
   }
 
+  private String filename() {
+    String fileName;
+    if (isMphf) {
+      fileName = String.format(Locale.ROOT, "idx-%s-rows%d-mphf.bin", keyType, numRows);
+    } else if (isUch) {
+      fileName = String.format(Locale.ROOT, "idx-%s-rows%d-uch-k%d.bin", keyType, numRows, kLimit);
+    } else if (isHash) {
+      fileName =
+          String.format(
+              Locale.ROOT, "idx-%s-rows%d-hash-rg%drows.bin", keyType, numRows, bucketRows);
+    } else if (isPhash) {
+      fileName =
+          String.format(
+              Locale.ROOT, "idx-%s-rows%d-phash-rg%drows.parquet", keyType, numRows, bucketRows);
+    } else if (isEphash) {
+      fileName =
+          String.format(
+              Locale.ROOT, "idx-%s-rows%d-ephash-rg%drows.bin", keyType, numRows, bucketRows);
+    } else {
+      fileName =
+          String.format(
+              Locale.ROOT, "idx-%s-rows%d-parquet-rg%drows.parquet", keyType, numRows, bucketRows);
+    }
+    return fileName;
+  }
+
   private void parseIndexType() {
+    // Default-reset all flags / numeric params; the matched branch overwrites the relevant ones.
+    this.isMphf = false;
+    this.isUch = false;
+    this.isHash = false;
+    this.isPhash = false;
+    this.isEphash = false;
+    this.bucketRows = -1;
+    this.kLimit = -1;
+
     if ("MPHF".equalsIgnoreCase(indexType)) {
       this.isMphf = true;
-      this.isUch = false;
-      this.isHash = false;
-      this.rowGroupRows = -1;
-      this.kLimit = -1;
-      this.numHashBuckets = -1;
       return;
     }
 
     if (indexType.regionMatches(true, 0, "UCH_", 0, "UCH_".length())) {
-      this.isMphf = false;
       this.isUch = true;
-      this.isHash = false;
-      this.rowGroupRows = -1;
       this.kLimit = Integer.parseInt(indexType.substring("UCH_".length()));
-      this.numHashBuckets = -1;
       return;
     }
 
     if (indexType.regionMatches(true, 0, "HASH_", 0, "HASH_".length())) {
-      this.isMphf = false;
-      this.isUch = false;
       this.isHash = true;
-      this.rowGroupRows = -1;
-      this.kLimit = -1;
-      this.numHashBuckets = Integer.parseInt(indexType.substring("HASH_".length()));
+      this.bucketRows = Integer.parseInt(indexType.substring("HASH_".length()));
+      return;
+    }
+
+    if (indexType.regionMatches(true, 0, "PHASH_", 0, "PHASH_".length())) {
+      this.isPhash = true;
+      this.bucketRows = Integer.parseInt(indexType.substring("PHASH_".length()));
+      return;
+    }
+
+    if (indexType.regionMatches(true, 0, "EPHASH_", 0, "EPHASH_".length())) {
+      this.isEphash = true;
+      this.bucketRows = Integer.parseInt(indexType.substring("EPHASH_".length()));
       return;
     }
 
     if (indexType.regionMatches(true, 0, "PARQUET_", 0, "PARQUET_".length())) {
-      this.isMphf = false;
-      this.isUch = false;
-      this.isHash = false;
-      this.kLimit = -1;
-      this.numHashBuckets = -1;
-      this.rowGroupRows = Integer.parseInt(indexType.substring("PARQUET_".length()));
+      this.bucketRows = Integer.parseInt(indexType.substring("PARQUET_".length()));
       return;
     }
 
     throw new IllegalArgumentException(
         "Unknown indexType: "
             + indexType
-            + " (expected MPHF, UCH_<kLimit>, HASH_<numBuckets> or PARQUET_<rows>)");
+            + " (expected MPHF, UCH_<kLimit>, HASH_<rows>, PHASH_<rows>,"
+            + " EPHASH_<rows> or PARQUET_<rows>)");
   }
 
   @TearDown
@@ -379,8 +406,8 @@ public class InvertedIndexBenchmark {
 
   @Benchmark
   @Threads(1)
-  @Warmup(iterations = 100)
-  @Measurement(iterations = 10)
+  @Warmup(iterations = 10)
+  @Measurement(iterations = 100)
   public void lookup(Blackhole bh, ReadCounter ioCounter) throws Exception {
     int idx = lookupCursor++ & (NUM_LOOKUP_KEYS - 1);
     long expectedPos = expectedPositions[idx];
@@ -478,10 +505,10 @@ public class InvertedIndexBenchmark {
     if (isHash) {
       return String.format(
           Locale.ROOT,
-          "write-idx-%s-rows%d-hash-b%d-%d.bin",
+          "write-idx-%s-rows%d-hash-rg%drows-%d.bin",
           keyType,
           numRows,
-          numHashBuckets,
+          bucketRows,
           seq);
     }
 
@@ -490,7 +517,7 @@ public class InvertedIndexBenchmark {
         "write-idx-%s-rows%d-parquet-rg%drows-%d.parquet",
         keyType,
         numRows,
-        rowGroupRows,
+        bucketRows,
         seq);
   }
 
@@ -529,9 +556,9 @@ public class InvertedIndexBenchmark {
     List<Types.NestedField> fields = Lists.newArrayList();
     int id = 1;
     switch (type) {
-      case LONG -> fields.add(required(id++, "key", Types.LongType.get()));
-      case UUID -> fields.add(required(id++, "key", Types.UUIDType.get()));
-      case STRING -> fields.add(required(id++, "key", Types.StringType.get()));
+      case LONG -> fields.add(required(id, "key", Types.LongType.get()));
+      case UUID -> fields.add(required(id, "key", Types.UUIDType.get()));
+      case STRING -> fields.add(required(id, "key", Types.StringType.get()));
       case COMPOSITE -> {
         fields.add(required(id++, "key_long", Types.LongType.get()));
         fields.add(required(id, "key_str", Types.StringType.get()));
@@ -848,12 +875,7 @@ public class InvertedIndexBenchmark {
   }
 
   /** Decorator that funnels every input/output through the global counters. */
-  private static final class CountingFileIO implements FileIO {
-    private final FileIO delegate;
-
-    CountingFileIO(FileIO delegate) {
-      this.delegate = delegate;
-    }
+  private record CountingFileIO(FileIO delegate) implements FileIO {
 
     @Override
     public InputFile newInputFile(String path) {

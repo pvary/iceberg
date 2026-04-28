@@ -302,6 +302,7 @@ public class ParquetIndexHandler implements IndexHandler {
       return Parquet.write(output)
           .schema(schema)
           .createWriterFunc(GenericParquetWriter::create)
+          .set(TableProperties.PARQUET_COMPRESSION, "zstd")
           .set(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, "1")
           .set(TableProperties.PARQUET_ROW_GROUP_CHECK_MIN_RECORD_COUNT, rgRows)
           .set(TableProperties.PARQUET_ROW_GROUP_CHECK_MAX_RECORD_COUNT, rgRows)

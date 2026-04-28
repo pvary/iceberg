@@ -131,20 +131,33 @@ public class HashIndexHandler implements IndexHandler {
    * @param schema key schema (same supported types as {@link
    *     MinimalPerfectHashFunctionIndexHandler})
    * @param expectedKeyCount sizing hint for writer / reader buffers; must be {@code > 0}
-   * @param numBuckets fixed number of hash buckets; must be {@code > 0}
+   * @param bucketRows target average number of rows per hash bucket; must be {@code > 0}. The
+   *     actual number of buckets is derived as {@code ceil(expectedKeyCount / bucketRows)}.
    */
-  public HashIndexHandler(Schema schema, long expectedKeyCount, int numBuckets) {
+  public HashIndexHandler(Schema schema, long expectedKeyCount, int bucketRows) {
     if (expectedKeyCount <= 0L) {
       throw new IllegalArgumentException("expectedKeyCount must be > 0: " + expectedKeyCount);
     }
 
-    if (numBuckets <= 0) {
-      throw new IllegalArgumentException("numBuckets must be > 0: " + numBuckets);
+    if (bucketRows <= 0) {
+      throw new IllegalArgumentException("bucketRows must be > 0: " + bucketRows);
+    }
+
+    long buckets = (expectedKeyCount + bucketRows - 1L) / bucketRows;
+    if (buckets <= 0L || buckets > Integer.MAX_VALUE) {
+      throw new IllegalArgumentException(
+          "Derived numBuckets out of range: "
+              + buckets
+              + " (expectedKeyCount="
+              + expectedKeyCount
+              + ", bucketRows="
+              + bucketRows
+              + ")");
     }
 
     this.keyEncoder = MinimalPerfectHashFunctionIndexHandler.keyEncoder(schema);
     this.expectedKeyCount = expectedKeyCount;
-    this.numBuckets = numBuckets;
+    this.numBuckets = (int) buckets;
   }
 
   @Override
