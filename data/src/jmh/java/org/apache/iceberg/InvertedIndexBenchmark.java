@@ -138,19 +138,19 @@ public class InvertedIndexBenchmark {
    * parameter.
    */
   @Param({
-    "PARQUET_10000",
-    "PARQUET_5000",
-    "PARQUET_20000",
-    "PARQUET_50000",
-    "MPHF",
-    "HASH_2000",
-    "HASH_5000",
-    "HASH_10000",
-    "HASH_20000",
-    "EPHASH_2000",
-    "EPHASH_5000",
-    "EPHASH_10000",
-    "EPHASH_20000",
+//    "PARQUET_10000",
+//    "PARQUET_5000",
+//    "PARQUET_20000",
+//    "PARQUET_50000",
+//    "MPHF",
+//    "HASH_2000",
+//    "HASH_5000",
+//    "HASH_10000",
+//    "HASH_20000",
+//    "EPHASH_2000",
+//    "EPHASH_5000",
+//    "EPHASH_10000",
+//    "EPHASH_20000",
     "EPHASH_50000"
   })
   private String indexType;
