@@ -28,6 +28,7 @@ import com.azure.storage.file.datalake.options.DataLakeFileInputStreamOptions;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicLong;
 import org.apache.iceberg.azure.AzureProperties;
 import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.io.FileIOMetricsContext;
@@ -194,7 +195,19 @@ class ADLSInputStream extends SeekableInputStream implements RangeReadable {
     }
   }
 
+  /**
+   * Total number of {@code openInputStream} calls (i.e. actual ADLS HTTP GETs) issued by all {@link
+   * ADLSInputStream} instances in the JVM. Incremented unconditionally inside {@link
+   * #openRange(FileRange)} -- the single chokepoint through which every wire request flows
+   * (constructor eager-open, lazy reopen on seek, {@link #readFully}, {@link #readTail}). Exposed
+   * via package access (and read reflectively from benchmark code) so callers can distinguish the
+   * number of user-level {@code read*()} calls from the underlying wire request count without
+   * relying on the SDK's own logging.
+   */
+  static final AtomicLong WIRE_REQUESTS = new AtomicLong();
+
   private DataLakeFileOpenInputStreamResult openRange(FileRange range) {
+    WIRE_REQUESTS.incrementAndGet();
     try {
       return fileClient.openInputStream(getInputOptions(range));
     } catch (RuntimeException e) {

@@ -24,6 +24,7 @@ import static org.apache.iceberg.types.Types.NestedField.required;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -137,18 +138,18 @@ public class InvertedIndexBenchmark {
    * parameter.
    */
   @Param({
-    "PARQUET_10000",
-    "PARQUET_5000",
-    "PARQUET_20000",
-    "PARQUET_50000",
-    "MPHF",
-    "HASH_2000",
-    "HASH_5000",
-    "HASH_10000",
-    "HASH_20000",
-    "EPHASH_2000",
-    "EPHASH_5000",
-    "EPHASH_10000",
+//    "PARQUET_10000",
+//    "PARQUET_5000",
+//    "PARQUET_20000",
+//    "PARQUET_50000",
+//    "MPHF",
+//    "HASH_2000",
+//    "HASH_5000",
+//    "HASH_10000",
+//    "HASH_20000",
+//    "EPHASH_2000",
+//    "EPHASH_5000",
+//    "EPHASH_10000",
     "EPHASH_20000",
     "EPHASH_50000"
   })
@@ -743,6 +744,39 @@ public class InvertedIndexBenchmark {
    */
   private static final AtomicLong READS = new AtomicLong();
 
+  /**
+   * Mirror of {@code ADLSInputStream.WIRE_REQUESTS}: number of actual ADLS HTTP GETs issued by the
+   * Azure SDK across all {@code ADLSInputStream} instances in this JVM. Read via {@link
+   * #wireRequestsSnapshot()} (reflection, so non-ADLS runs need no Azure classes on the classpath)
+   * and surfaced per-invocation as {@code lookup:wireRequests}. Falls back to {@link #READS} when
+   * the field isn't reachable (e.g. local-FS runs), which is the correct semantics there: every
+   * read on local FS is its own kernel syscall.
+   */
+  private static final Field ADLS_WIRE_REQUESTS_FIELD = resolveAdlsWireField();
+
+  private static Field resolveAdlsWireField() {
+    try {
+      Class<?> cls = Class.forName("org.apache.iceberg.azure.adlsv2.ADLSInputStream");
+      Field f = cls.getDeclaredField("WIRE_REQUESTS");
+      f.setAccessible(true);
+      return f;
+    } catch (Throwable t) {
+      return null;
+    }
+  }
+
+  private static long wireRequestsSnapshot() {
+    if (ADLS_WIRE_REQUESTS_FIELD != null) {
+      try {
+        return ((AtomicLong) ADLS_WIRE_REQUESTS_FIELD.get(null)).get();
+      } catch (IllegalAccessException e) {
+        // fall through to READS
+      }
+    }
+
+    return READS.get();
+  }
+
   // Cumulative wall-clock nanoseconds spent inside the corresponding IO call.
   private static final AtomicLong OPEN_NANOS = new AtomicLong();
   private static final AtomicLong SEEK_NANOS = new AtomicLong();
@@ -806,6 +840,13 @@ public class InvertedIndexBenchmark {
     /** Number of {@code read*()} calls issued against the underlying input stream. */
     public long reads;
 
+    /**
+     * Number of actual ADLS HTTP GETs issued during this invocation. Sampled from {@code
+     * ADLSInputStream.WIRE_REQUESTS} via {@link #wireRequestsSnapshot()}; on non-ADLS storages the
+     * counter falls back to {@link #reads} (every read on local FS is its own kernel syscall).
+     */
+    public long wireRequests;
+
     /** Total wall-clock microseconds spent inside {@code InputFile#newStream()}. */
     public long openMicros;
 
@@ -819,6 +860,7 @@ public class InvertedIndexBenchmark {
     private long startSeeks;
     private long startOpenStreams;
     private long startReads;
+    private long startWireRequests;
     private long startOpenNanos;
     private long startSeekNanos;
     private long startReadNanos;
@@ -846,6 +888,7 @@ public class InvertedIndexBenchmark {
       startSeeks = SEEKS.get();
       startOpenStreams = OPEN_INPUT_STREAMS.get();
       startReads = READS.get();
+      startWireRequests = wireRequestsSnapshot();
       startOpenNanos = OPEN_NANOS.get();
       startSeekNanos = SEEK_NANOS.get();
       startReadNanos = READ_NANOS.get();
@@ -857,6 +900,7 @@ public class InvertedIndexBenchmark {
       seeks = SEEKS.get() - startSeeks;
       openStreams = OPEN_INPUT_STREAMS.get() - startOpenStreams;
       reads = READS.get() - startReads;
+      wireRequests = wireRequestsSnapshot() - startWireRequests;
       openMicros = (OPEN_NANOS.get() - startOpenNanos) / 1_000L;
       seekMicros = (SEEK_NANOS.get() - startSeekNanos) / 1_000L;
       readMicros = (READ_NANOS.get() - startReadNanos) / 1_000L;
