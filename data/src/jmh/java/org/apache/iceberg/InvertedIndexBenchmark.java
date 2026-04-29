@@ -138,18 +138,18 @@ public class InvertedIndexBenchmark {
    * parameter.
    */
   @Param({
-//    "PARQUET_10000",
-//    "PARQUET_5000",
-//    "PARQUET_20000",
-//    "PARQUET_50000",
-//    "MPHF",
-//    "HASH_2000",
-//    "HASH_5000",
-//    "HASH_10000",
-//    "HASH_20000",
-//    "EPHASH_2000",
-//    "EPHASH_5000",
-//    "EPHASH_10000",
+    "PARQUET_10000",
+    "PARQUET_5000",
+    "PARQUET_20000",
+    "PARQUET_50000",
+    "MPHF",
+    "HASH_2000",
+    "HASH_5000",
+    "HASH_10000",
+    "HASH_20000",
+    "EPHASH_2000",
+    "EPHASH_5000",
+    "EPHASH_10000",
     "EPHASH_20000",
     "EPHASH_50000"
   })
@@ -384,6 +384,45 @@ public class InvertedIndexBenchmark {
             + indexType
             + " (expected MPHF, UCH_<kLimit>, HASH_<rows>, PHASH_<rows>,"
             + " EPHASH_<rows> or PARQUET_<rows>)");
+  }
+
+  /**
+   * Property toggle ({@code -Dindex.bench.freshClientPerIteration=true}) that forces {@link
+   * #refreshFileIO(IterationParams)} to close and rebuild the {@link FileIO} (and its underlying
+   * Azure / S3 SDK client, connection pool, TLS sessions) before every measurement iteration. Use
+   * this to isolate client-side caching effects from server-side caching when comparing per-op
+   * lookup latency across {@code numRows} on the same blob.
+   */
+  private static final String FRESH_CLIENT_PROP = "index.bench.freshClientPerIteration";
+
+  /**
+   * Drop and recreate {@link #io} so the next iteration runs against a brand-new SDK client. Done
+   * at {@link Level#ITERATION} (not per invocation) because rebuilding the client on every lookup
+   * would dominate the measurement; per-iteration is enough to invalidate connection-pool / TLS
+   * keepalive state that survives across the ~1000 invocations of a single iteration.
+   *
+   * <p>Skipped during warmup so warmup keeps doing what it's supposed to (priming the JIT) and
+   * doesn't drag in cold-connection variance.
+   */
+  @Setup(Level.Iteration)
+  public void refreshFileIO(IterationParams params) {
+    if (params.getType() != IterationType.MEASUREMENT) {
+      return;
+    }
+    if (!Boolean.getBoolean(FRESH_CLIENT_PROP)) {
+      return;
+    }
+    if (io != null) {
+      try {
+        io.close();
+      } catch (Exception e) {
+        LOG.warn("Failed to close FileIO on iteration refresh", e);
+      }
+    }
+    this.io = new CountingFileIO(createFileIO());
+    LOG.info(
+        "Rebuilt FileIO for fresh client (-D{}=true)",
+        FRESH_CLIENT_PROP);
   }
 
   @TearDown
