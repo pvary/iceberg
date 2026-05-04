@@ -783,12 +783,24 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
       long off = offsets[bucket];
       int len = lengths[bucket];
 
-      // 1) Single ranged read: pull the entire bucket parquet payload into memory. Uses
-      //    RangeReadable.readFully when the underlying FileIO supports it (S3/ADLS/GCS), so
-      //    object-store backends do exactly one HTTP request per lookup.
+      // 1) Pull the entire bucket parquet payload into memory. We deliberately route through
+      //    SeekableInputStream.seek() + IOUtil.readFully(stream, ...) instead of the
+      //    InputFile-based IOUtil.readFully(input, off, buf, 0, len) overload, because the
+      //    latter dispatches to RangeReadable.readFully on object-store adapters (S3/ADLS/GCS),
+      //    which issues a tight HTTP GET sized exactly to `len`. On ADLS, that path's
+      //    per-request fixed cost is not amortized for sub-MB reads -- the buffered-stream
+      //    path requests `adls.read.block-size-bytes` and serves subsequent reads locally,
+      //    which empirically halves per-lookup latency for ~30-700 KB bucket payloads. See
+      //    the per-phase instrumentation block below for the measurement that motivated this
+      //    choice. (EPHASH wins against CBUCKETS specifically because it accidentally
+      //    benefits from the buffered path via its two-shot read pattern.)
       long t0 = System.nanoTime();
       byte[] bucketBytes = new byte[len];
-      IOUtil.readFully(input, off, bucketBytes, 0, len);
+      try (org.apache.iceberg.io.SeekableInputStream stream = input.newStream()) {
+        stream.seek(off);
+        IOUtil.readFully(stream, bucketBytes, 0, len);
+      }
+
       long t1 = System.nanoTime();
 
       // 2) Hand the in-memory bucket bytes to Iceberg's standard Parquet read pipeline and
