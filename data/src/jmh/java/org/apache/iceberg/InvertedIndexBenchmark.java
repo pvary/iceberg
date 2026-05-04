@@ -430,11 +430,15 @@ public class InvertedIndexBenchmark {
     if (params.getType() != IterationType.MEASUREMENT) {
       return;
     }
-    // Zero CBUCKETS per-phase counters at the start of every measurement iteration so the
-    // periodic auto-log (every iceberg.cbuckets.instrumentLogEvery=1000 lookups) lines up with
-    // a single JMH iteration and the per-op averages exclude warmup-iteration costs.
+    // Zero CBUCKETS per-phase counters at the warmup-to-measurement boundary so the @TearDown
+    // dump reports an aggregate over the measurement run only. resetInstrumentationOnce() is
+    // CAS-gated: only the first MEASUREMENT iteration actually wipes the counters, every
+    // subsequent iteration is a no-op. This is the right shape for Mode.SingleShotTime, where
+    // each JMH iteration is one lookup -- an unconditional per-iteration reset would leave the
+    // counter holding only the final lookup, which is what produced the "@ 1 lookups" output
+    // before this fix.
     if (isCbuckets) {
-      ParquetIndexHandlerWithConcatenatedBuckets.resetInstrumentation();
+      ParquetIndexHandlerWithConcatenatedBuckets.resetInstrumentationOnce();
     }
     if (!Boolean.getBoolean(FRESH_CLIENT_PROP)) {
       return;

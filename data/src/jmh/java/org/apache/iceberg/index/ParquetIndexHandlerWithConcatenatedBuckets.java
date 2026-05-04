@@ -31,6 +31,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import org.apache.hadoop.util.Sets;
@@ -213,12 +214,45 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
   // -----------------------------------------------------------------------
 
   /**
+   * Has {@link #resetInstrumentationOnce()} been called yet in this JVM? Used so that, in
+   * {@link org.openjdk.jmh.annotations.Mode#SingleShotTime SingleShotTime} benchmarks where
+   * every JMH iteration is exactly one lookup, the warmup-to-measurement boundary triggers the
+   * counter reset exactly once -- not on every iteration -- so the {@code @TearDown} dump
+   * reports an aggregate over all 1000 measurement lookups instead of just the final one.
+   */
+  private static final AtomicBoolean INSTRUMENTATION_RESET =
+      new AtomicBoolean(false);
+
+  /**
    * Resets the per-phase lookup instrumentation counters (net / open / scan, plus the lookup
-   * count). Call between JMH warmup and measurement so the reported per-op averages reflect only
-   * the measurement window. Safe to call from any thread.
+   * count). Call only when you really want to wipe the counters mid-run; for the typical "zero
+   * once at the warmup-to-measurement boundary" use case prefer {@link
+   * #resetInstrumentationOnce()}, which CAS-gates the call so it's a no-op after the first
+   * invocation. Safe to call from any thread.
    */
   public static void resetInstrumentation() {
+    INSTRUMENTATION_RESET.set(true);
     Reader.resetInstrumentation();
+  }
+
+  /**
+   * CAS-gated variant of {@link #resetInstrumentation()}: the first caller wipes the counters,
+   * every subsequent caller is a no-op. Designed for {@link
+   * org.openjdk.jmh.annotations.Setup @Setup(Level.Iteration)} hooks in {@link
+   * org.openjdk.jmh.annotations.Mode#SingleShotTime SingleShotTime} benchmarks, where each
+   * iteration runs a single invocation and an unconditional per-iteration reset would leave the
+   * counter holding only the final iteration's sample.
+   *
+   * <p>Returns {@code true} if this call performed the reset, {@code false} if the counter had
+   * already been reset by an earlier call.
+   */
+  public static boolean resetInstrumentationOnce() {
+    if (INSTRUMENTATION_RESET.compareAndSet(false, true)) {
+      Reader.resetInstrumentation();
+      return true;
+    }
+
+    return false;
   }
 
   /**
