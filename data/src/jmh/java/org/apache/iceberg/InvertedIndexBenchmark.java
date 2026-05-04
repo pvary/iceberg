@@ -430,6 +430,12 @@ public class InvertedIndexBenchmark {
     if (params.getType() != IterationType.MEASUREMENT) {
       return;
     }
+    // Zero CBUCKETS per-phase counters at the start of every measurement iteration so the
+    // periodic auto-log (every iceberg.cbuckets.instrumentLogEvery=1000 lookups) lines up with
+    // a single JMH iteration and the per-op averages exclude warmup-iteration costs.
+    if (isCbuckets) {
+      ParquetIndexHandlerWithConcatenatedBuckets.resetInstrumentation();
+    }
     if (!Boolean.getBoolean(FRESH_CLIENT_PROP)) {
       return;
     }
@@ -446,6 +452,11 @@ public class InvertedIndexBenchmark {
 
   @TearDown
   public void tearDown() {
+    // Print the per-phase totals for the whole run before tearing down the FileIO so they show
+    // up immediately after the JMH summary table for this benchmark.
+    if (isCbuckets) {
+      ParquetIndexHandlerWithConcatenatedBuckets.dumpInstrumentation();
+    }
     if (io != null) {
       if (fileLocation != null) {
         try {

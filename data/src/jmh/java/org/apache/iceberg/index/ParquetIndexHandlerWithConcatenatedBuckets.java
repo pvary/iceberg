@@ -31,6 +31,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
 import org.apache.hadoop.util.Sets;
 import org.apache.iceberg.Schema;
@@ -205,6 +206,28 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
     long capped = Math.min(Math.max(approx, 4096L), 64L * 1024 * 1024);
     int rounded = Integer.highestOneBit(Math.toIntExact(capped - 1)) << 1;
     return Math.max(rounded, 4096);
+  }
+
+  // -----------------------------------------------------------------------
+  // Per-phase instrumentation hooks (pass-throughs to Reader's static counters)
+  // -----------------------------------------------------------------------
+
+  /**
+   * Resets the per-phase lookup instrumentation counters (net / open / scan, plus the lookup
+   * count). Call between JMH warmup and measurement so the reported per-op averages reflect only
+   * the measurement window. Safe to call from any thread.
+   */
+  public static void resetInstrumentation() {
+    Reader.resetInstrumentation();
+  }
+
+  /**
+   * Logs a one-line summary of the per-phase lookup instrumentation counters. Call from
+   * {@code @TearDown} to surface totals at end-of-run, independent of the periodic in-line log
+   * emitted every {@code -Diceberg.cbuckets.instrumentLogEvery=N} lookups (default 1000).
+   */
+  public static void dumpInstrumentation() {
+    Reader.dumpInstrumentation();
   }
 
   // -----------------------------------------------------------------------
@@ -600,6 +623,80 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
   // -----------------------------------------------------------------------
 
   private static final class Reader implements IndexHandler.Reader {
+
+    // -----------------------------------------------------------------------
+    // Per-phase instrumentation -- helps decide whether the per-lookup cost
+    // sits in the network ranged read, the per-bucket Parquet open (footer
+    // Thrift parse + reader-builder construction + zstd decompressor init),
+    // or the actual page decode / row scan. Always-on; the three nanoTime
+    // calls in the hot path cost <1us vs the multi-millisecond phases they
+    // bracket. Disable per-window logging by setting the system property to 0:
+    //
+    //   -Diceberg.cbuckets.instrumentLogEvery=0
+    //
+    // The benchmark may call resetInstrumentation() between warmup and
+    // measurement and dumpInstrumentation() in @TearDown to print final totals.
+    // -----------------------------------------------------------------------
+    private static final long INSTRUMENT_LOG_EVERY =
+        Long.getLong("iceberg.cbuckets.instrumentLogEvery", 1000L);
+    private static final AtomicLong NET_NANOS = new AtomicLong();
+    private static final AtomicLong OPEN_NANOS = new AtomicLong();
+    private static final AtomicLong SCAN_NANOS = new AtomicLong();
+    private static final AtomicLong LOOKUP_COUNT = new AtomicLong();
+
+    /** Resets the per-phase instrumentation counters. Safe to call from any thread. */
+    public static void resetInstrumentation() {
+      NET_NANOS.set(0L);
+      OPEN_NANOS.set(0L);
+      SCAN_NANOS.set(0L);
+      LOOKUP_COUNT.set(0L);
+    }
+
+    /**
+     * Logs a one-line summary of the per-phase instrumentation counters at INFO level. Reports
+     * both totals (us) and per-op averages (us/op). Safe to call concurrently with active
+     * lookups; values are a coherent snapshot only if no lookups are in flight.
+     */
+    public static void dumpInstrumentation() {
+      long n = LOOKUP_COUNT.get();
+      if (n == 0L) {
+        LOG.info("CBUCKETS instrumentation: no lookups recorded");
+        return;
+      }
+
+      long net = NET_NANOS.get();
+      long open = OPEN_NANOS.get();
+      long scan = SCAN_NANOS.get();
+      LOG.info(
+          "CBUCKETS instrumentation @ {} lookups: "
+              + "net={} us/op ({} us total), open={} us/op ({} us total), "
+              + "scan={} us/op ({} us total), sum={} us/op",
+          n,
+          net / n / 1000L,
+          net / 1000L,
+          open / n / 1000L,
+          open / 1000L,
+          scan / n / 1000L,
+          scan / 1000L,
+          (net + open + scan) / n / 1000L);
+    }
+
+    /**
+     * Records one lookup's per-phase wall-clock and, every {@link #INSTRUMENT_LOG_EVERY} calls,
+     * emits a running summary at INFO level. {@code netNanos} is the bucket-payload ranged read,
+     * {@code openNanos} is the in-memory Parquet open (footer Thrift parse + reader-builder
+     * construction), {@code scanNanos} is the row-iteration loop including {@code records.close()}.
+     */
+    private static void recordTimings(long netNanos, long openNanos, long scanNanos) {
+      NET_NANOS.addAndGet(netNanos);
+      OPEN_NANOS.addAndGet(openNanos);
+      SCAN_NANOS.addAndGet(scanNanos);
+      long n = LOOKUP_COUNT.incrementAndGet();
+      if (INSTRUMENT_LOG_EVERY > 0L && n % INSTRUMENT_LOG_EVERY == 0L) {
+        dumpInstrumentation();
+      }
+    }
+
     private final InputFile input;
     private final int[] lengths;
     private final long[] offsets;
@@ -655,12 +752,16 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
       // 1) Single ranged read: pull the entire bucket parquet payload into memory. Uses
       //    RangeReadable.readFully when the underlying FileIO supports it (S3/ADLS/GCS), so
       //    object-store backends do exactly one HTTP request per lookup.
+      long t0 = System.nanoTime();
       byte[] bucketBytes = new byte[len];
       IOUtil.readFully(input, off, bucketBytes, 0, len);
+      long t1 = System.nanoTime();
 
       // 2) Hand the in-memory bucket bytes to Iceberg's standard Parquet read pipeline and
       //    scan the single row group for the matching key. wrap() adopts the buffer without
       //    a defensive copy -- bucketBytes is owned by this stack frame and never mutated.
+      //    The build() call performs the in-memory footer Thrift parse + reader-builder
+      //    construction; t2 captures wall-clock at the boundary between "open" and "scan".
       InputFile bucketInput = InMemoryInputFile.wrap(bucketBytes);
       try (CloseableIterable<Record> records =
           Parquet.read(bucketInput)
@@ -668,22 +769,30 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
               .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(schema, fileSchema))
               .reuseContainers()
               .build()) {
-        for (Record row : records) {
-          if (!keyMatches(row, key)) {
-            continue;
+        long t2 = System.nanoTime();
+        try {
+          for (Record row : records) {
+            if (!keyMatches(row, key)) {
+              continue;
+            }
+
+            Object filePath = row.getField(FILE_PATH_COLUMN);
+            Object pos = row.getField(POS_COLUMN);
+            if (filePath == null || pos == null) {
+              continue;
+            }
+
+            return new HitImpl((String) filePath, (Long) pos);
           }
 
-          Object filePath = row.getField(FILE_PATH_COLUMN);
-          Object pos = row.getField(POS_COLUMN);
-          if (filePath == null || pos == null) {
-            continue;
-          }
-
-          return new HitImpl((String) filePath, (Long) pos);
+          return null;
+        } finally {
+          // Capture scan timing whether we hit (early return), missed (fall-through return null),
+          // or threw -- so the per-phase totals stay coherent across all outcomes.
+          long t3 = System.nanoTime();
+          recordTimings(t1 - t0, t2 - t1, t3 - t2);
         }
       }
-
-      return null;
     }
 
     private boolean keyMatches(Record row, Record key) {
