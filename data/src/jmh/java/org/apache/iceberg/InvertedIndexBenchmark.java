@@ -38,6 +38,7 @@ import org.apache.iceberg.index.HashIndexHandler;
 import org.apache.iceberg.index.IndexHandler;
 import org.apache.iceberg.index.MinimalPerfectHashFunctionIndexHandler;
 import org.apache.iceberg.index.ParquetIndexHandler;
+import org.apache.iceberg.index.ParquetIndexHandlerWithConcatenatedBuckets;
 import org.apache.iceberg.index.ParquetIndexHandlerWithEmbeddedMetadata;
 import org.apache.iceberg.index.ParquetIndexHandlerWithHashedRowGroups;
 import org.apache.iceberg.index.UltraCompactHasherIndexHandler;
@@ -138,20 +139,25 @@ public class InvertedIndexBenchmark {
    * parameter.
    */
   @Param({
-//    "PARQUET_10000",
-//    "PARQUET_5000",
-//    "PARQUET_20000",
-//    "PARQUET_50000",
-//    "MPHF",
-//    "HASH_2000",
-//    "HASH_5000",
-//    "HASH_10000",
-//    "HASH_20000",
-//    "EPHASH_2000",
-//    "EPHASH_5000",
-//    "EPHASH_10000",
-//    "EPHASH_20000",
-    "EPHASH_50000"
+    //    "PARQUET_10000",
+    //    "PARQUET_5000",
+    //    "PARQUET_20000",
+    //    "PARQUET_50000",
+    //    "MPHF",
+    //    "HASH_2000",
+    //    "HASH_5000",
+    //    "HASH_10000",
+    //    "HASH_20000",
+    //    "EPHASH_2000",
+    //    "EPHASH_5000",
+    //    "EPHASH_10000",
+    //    "EPHASH_20000",
+    "EPHASH_50000",
+    "CBUCKETS_2000",
+    "CBUCKETS_5000",
+    "CBUCKETS_10000",
+    "CBUCKETS_20000",
+    "CBUCKETS_50000"
   })
   private String indexType;
 
@@ -161,6 +167,7 @@ public class InvertedIndexBenchmark {
   private boolean isHash;
   private boolean isPhash;
   private boolean isEphash;
+  private boolean isCbuckets;
   private int bucketRows;
   private int kLimit;
 
@@ -224,6 +231,9 @@ public class InvertedIndexBenchmark {
     } else if (isEphash) {
       this.indexHandler =
           new ParquetIndexHandlerWithEmbeddedMetadata(keySchema, bucketRows, numRows);
+    } else if (isCbuckets) {
+      this.indexHandler =
+          new ParquetIndexHandlerWithConcatenatedBuckets(keySchema, bucketRows, numRows);
     } else {
       this.indexHandler = new ParquetIndexHandler(keySchema, bucketRows, numRows);
     }
@@ -327,6 +337,10 @@ public class InvertedIndexBenchmark {
       fileName =
           String.format(
               Locale.ROOT, "idx-%s-rows%d-ephash-rg%drows.bin", keyType, numRows, bucketRows);
+    } else if (isCbuckets) {
+      fileName =
+          String.format(
+              Locale.ROOT, "idx-%s-rows%d-cbuckets-rg%drows.parquet", keyType, numRows, bucketRows);
     } else {
       fileName =
           String.format(
@@ -342,6 +356,7 @@ public class InvertedIndexBenchmark {
     this.isHash = false;
     this.isPhash = false;
     this.isEphash = false;
+    this.isCbuckets = false;
     this.bucketRows = -1;
     this.kLimit = -1;
 
@@ -374,6 +389,12 @@ public class InvertedIndexBenchmark {
       return;
     }
 
+    if (indexType.regionMatches(true, 0, "CBUCKETS_", 0, "CBUCKETS_".length())) {
+      this.isCbuckets = true;
+      this.bucketRows = Integer.parseInt(indexType.substring("CBUCKETS_".length()));
+      return;
+    }
+
     if (indexType.regionMatches(true, 0, "PARQUET_", 0, "PARQUET_".length())) {
       this.bucketRows = Integer.parseInt(indexType.substring("PARQUET_".length()));
       return;
@@ -383,7 +404,7 @@ public class InvertedIndexBenchmark {
         "Unknown indexType: "
             + indexType
             + " (expected MPHF, UCH_<kLimit>, HASH_<rows>, PHASH_<rows>,"
-            + " EPHASH_<rows> or PARQUET_<rows>)");
+            + " EPHASH_<rows>, CBUCKETS_<rows> or PARQUET_<rows>)");
   }
 
   /**
@@ -420,9 +441,7 @@ public class InvertedIndexBenchmark {
       }
     }
     this.io = new CountingFileIO(createFileIO());
-    LOG.info(
-        "Rebuilt FileIO for fresh client (-D{}=true)",
-        FRESH_CLIENT_PROP);
+    LOG.info("Rebuilt FileIO for fresh client (-D{}=true)", FRESH_CLIENT_PROP);
   }
 
   @TearDown
@@ -446,8 +465,8 @@ public class InvertedIndexBenchmark {
 
   @Benchmark
   @Threads(1)
-  @Warmup(iterations = 10)
-  @Measurement(iterations = 100)
+  @Warmup(iterations = 100)
+  @Measurement(iterations = 1000)
   public void lookup(Blackhole bh, ReadCounter ioCounter) throws Exception {
     int idx = lookupCursor++ & (NUM_LOOKUP_KEYS - 1);
     long expectedPos = expectedPositions[idx];

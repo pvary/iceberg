@@ -145,7 +145,6 @@ public class ParquetIndexHandlerWithEmbeddedMetadata implements IndexHandler {
   /** Padding factor applied to the average bucket occupancy to size each row group. */
   private static final double BUCKET_PAD_FACTOR = 1.5;
 
-
   /**
    * Per-column meta-block payload bytes:
    *
@@ -620,7 +619,8 @@ public class ParquetIndexHandlerWithEmbeddedMetadata implements IndexHandler {
           //    contiguous in the source AND parquet-mr writes them back-to-back in the dest,
           //    the per-chunk page offsets it records exactly match the (offset + shift) values
           //    we just wrote into the meta block.
-          try (ByteArraySeekableInputStream src = new ByteArraySeekableInputStream(perBucketBytes)) {
+          try (ByteArraySeekableInputStream src =
+              new ByteArraySeekableInputStream(perBucketBytes)) {
             outer.appendRowGroup(src, block, /* dropColumns */ false);
           }
         }
@@ -1166,12 +1166,12 @@ public class ParquetIndexHandlerWithEmbeddedMetadata implements IndexHandler {
   // -----------------------------------------------------------------------
 
   /**
-   * parquet-mr {@link org.apache.parquet.io.OutputFile} that hands out the SAME already-open
-   * {@link org.apache.parquet.io.PositionOutputStream} every time {@code create*()} is called.
-   * Lets {@link Writer#close()} share one underlying stream between manual meta-block writes and
-   * an outer {@link ParquetFileWriter} that calls {@code start() / appendRowGroup() / end()} on
-   * the same bytes -- so MAGIC, the row-group payload copy, and the standard Parquet footer all
-   * land in the right place without us having to drive the file pointer ourselves.
+   * parquet-mr {@link org.apache.parquet.io.OutputFile} that hands out the SAME already-open {@link
+   * org.apache.parquet.io.PositionOutputStream} every time {@code create*()} is called. Lets {@link
+   * Writer#close()} share one underlying stream between manual meta-block writes and an outer
+   * {@link ParquetFileWriter} that calls {@code start() / appendRowGroup() / end()} on the same
+   * bytes -- so MAGIC, the row-group payload copy, and the standard Parquet footer all land in the
+   * right place without us having to drive the file pointer ourselves.
    */
   private static final class SharedStreamParquetOutputFile
       implements org.apache.parquet.io.OutputFile {
@@ -1204,10 +1204,10 @@ public class ParquetIndexHandlerWithEmbeddedMetadata implements IndexHandler {
 
   /**
    * Wraps an Iceberg {@link PositionOutputStream} as a parquet-mr {@link
-   * org.apache.parquet.io.PositionOutputStream}. {@link #close()} is a deliberate no-op because
-   * the surrounding try-with-resources owns the underlying Iceberg stream's lifecycle;
-   * {@link ParquetFileWriter#end} would otherwise close the stream out from under us before the
-   * outer block could flush it.
+   * org.apache.parquet.io.PositionOutputStream}. {@link #close()} is a deliberate no-op because the
+   * surrounding try-with-resources owns the underlying Iceberg stream's lifecycle; {@link
+   * ParquetFileWriter#end} would otherwise close the stream out from under us before the outer
+   * block could flush it.
    */
   private static final class IcebergParquetPositionOutputStream
       extends org.apache.parquet.io.PositionOutputStream {

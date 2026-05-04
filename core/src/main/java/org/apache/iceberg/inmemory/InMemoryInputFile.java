@@ -35,10 +35,34 @@ public class InMemoryInputFile implements InputFile {
   }
 
   public InMemoryInputFile(String location, byte[] contents) {
+    this(location, contents, true);
+  }
+
+  /**
+   * Returns an {@link InMemoryInputFile} that adopts {@code contents} <em>by reference</em> without
+   * making a defensive copy.
+   *
+   * <p>Use this when the caller owns the buffer for the lifetime of the returned file and
+   * guarantees it will not be mutated after the call -- for example, a freshly-allocated buffer
+   * filled by a single ranged read on a hot lookup path. Prefer the public constructors when those
+   * invariants do not hold.
+   *
+   * @param contents byte buffer to expose; <em>not</em> copied
+   */
+  public static InMemoryInputFile wrap(byte[] contents) {
+    return wrap("memory:" + UUID.randomUUID(), contents);
+  }
+
+  /** See {@link #wrap(byte[])}. */
+  public static InMemoryInputFile wrap(String location, byte[] contents) {
+    return new InMemoryInputFile(location, contents, false);
+  }
+
+  private InMemoryInputFile(String location, byte[] contents, boolean copy) {
     Preconditions.checkNotNull(location, "location is null");
     Preconditions.checkNotNull(contents, "contents is null");
     this.location = location;
-    this.contents = contents.clone();
+    this.contents = copy ? contents.clone() : contents;
   }
 
   @Override
