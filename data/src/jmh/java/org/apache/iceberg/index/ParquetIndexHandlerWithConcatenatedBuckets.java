@@ -842,126 +842,119 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
             "Bucket " + bucket + " too small (" + bucketLen + " bytes) to hold a parquet trailer");
       }
 
-      // Open the file ONCE per lookup. Both the bucket-footer range read and the subsequent
-      // column-chunk reads issued by ParquetFileReader.readRowGroup go through this same
-      // stream, so (a) the storage adapter's per-stream prefetch buffer can serve them as one
-      // contiguous run when its block size covers them, and (b) we incur exactly one
-      // openStream per lookup -- no separate stream for the footer read, no second stream for
-      // the parquet reader.
+      // ---------------------------------------------------------------------------------
+      // 1) Single forward ranged read: pull the whole bucket payload into RAM in one go.
+      //
+      // This is the *only* wire request per lookup. Going end-of-bucket -> footer -> start
+      // (the previous "navigate the embedded footer in place" approach) issued three GETs
+      // because each backwards seek discarded the storage adapter's prefetch buffer. A
+      // single forward read of `bucketLen` bytes -- typically ~24 KB at rowsPerBucket=2000
+      // -- collapses that to one round trip and lets the adapter satisfy any internal
+      // sub-reads from its already-warm buffer.
+      //
+      // openMicros / readMicros / wireRequests in JMH should now match EPHASH:
+      //   openStreams=1, seeks=1, reads=1 (or 2 if the adapter splits header/payload),
+      //   wireRequests=1.
+      // ---------------------------------------------------------------------------------
       long t0 = System.nanoTime();
-      SeekableInputStream rawStream = input.newStream();
-      long t1;
-      long t2;
-      long t3;
-      try {
-        // 1) Read the bucket's parquet trailer: the last 8 bytes of the bucket payload are
-        //    [int32-LE footerLen][PAR1]. The bucket parquet file lives at
-        //    [bucketStart, bucketStart + bucketLen) within the outer concatenated file, so its
-        //    own PAR1 magic sits at outer offset bucketStart, and its trailer at
-        //    bucketStart + bucketLen - 8.
-        long trailerStart = bucketStart + bucketLen - 8L;
-        byte[] trailer = new byte[8];
-        rawStream.seek(trailerStart);
-        readFully(rawStream, trailer);
-        if (trailer[4] != (byte) 'P'
-            || trailer[5] != (byte) 'A'
-            || trailer[6] != (byte) 'R'
-            || trailer[7] != (byte) '1') {
-          throw new IOException(
-              "Bucket " + bucket + " missing PAR1 trailer at offset " + trailerStart);
-        }
-        int footerLen = ByteBuffer.wrap(trailer, 0, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
-        if (footerLen <= 0 || footerLen > bucketLen - 8) {
-          throw new IOException("Bucket " + bucket + " has invalid footerLen=" + footerLen);
-        }
+      byte[] bucketBytes = new byte[bucketLen];
+      try (SeekableInputStream rawStream = input.newStream()) {
+        rawStream.seek(bucketStart);
+        readFully(rawStream, bucketBytes);
+      }
 
-        // 2) Read the bucket's own embedded Parquet footer (Thrift FileMetaData) and decode it
-        //    into a ParquetMetadata. Offsets in the resulting BlockMetaData are RELATIVE to the
-        //    bucket's PAR1 (i.e. the bucket-local coordinate space, where bucketStart maps to 0).
-        long footerOff = trailerStart - footerLen;
-        byte[] footerBytes = new byte[footerLen];
-        rawStream.seek(footerOff);
-        readFully(rawStream, footerBytes);
-        org.apache.parquet.format.FileMetaData formatMd =
-            Util.readFileMetaData(new ByteArrayInputStream(footerBytes));
-        ParquetMetadata bucketPmd = METADATA_CONVERTER.fromParquetMetadata(formatMd);
-        List<BlockMetaData> bucketBlocks = bucketPmd.getBlocks();
-        if (bucketBlocks.size() != 1) {
-          throw new IOException(
-              "Bucket "
-                  + bucket
-                  + " expected exactly 1 row group in embedded footer, got "
-                  + bucketBlocks.size());
-        }
+      // ---------------------------------------------------------------------------------
+      // 2) Parse the bucket's own embedded Parquet footer entirely from RAM.
+      //
+      // The trailer ([int32-LE footerLen][PAR1]) sits at the tail of bucketBytes. Offsets
+      // recovered from the bucket's footer are bucket-local (relative to the bucket's
+      // PAR1, i.e. the start of bucketBytes), which is exactly the coordinate space of
+      // the InMemoryInputFile we wrap below. No shiftBlock() needed on the read path --
+      // shiftBlock() is still used by the writer to translate into the outer file's
+      // coordinate space for the outer footer.
+      // ---------------------------------------------------------------------------------
+      if (bucketBytes[bucketLen - 4] != (byte) 'P'
+          || bucketBytes[bucketLen - 3] != (byte) 'A'
+          || bucketBytes[bucketLen - 2] != (byte) 'R'
+          || bucketBytes[bucketLen - 1] != (byte) '1') {
+        throw new IOException("Bucket " + bucket + " missing PAR1 trailer");
+      }
+      int footerLen =
+          ByteBuffer.wrap(bucketBytes, bucketLen - 8, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+      if (footerLen <= 0 || footerLen > bucketLen - 8) {
+        throw new IOException("Bucket " + bucket + " has invalid footerLen=" + footerLen);
+      }
+      int footerOff = bucketLen - 8 - footerLen;
+      org.apache.parquet.format.FileMetaData formatMd =
+          Util.readFileMetaData(new ByteArrayInputStream(bucketBytes, footerOff, footerLen));
+      ParquetMetadata bucketPmd = METADATA_CONVERTER.fromParquetMetadata(formatMd);
+      List<BlockMetaData> bucketBlocks = bucketPmd.getBlocks();
+      if (bucketBlocks.size() != 1) {
+        throw new IOException(
+            "Bucket "
+                + bucket
+                + " expected exactly 1 row group in embedded footer, got "
+                + bucketBlocks.size());
+      }
+      // Wrap the bucket-local block metadata in a ParquetMetadata that uses the
+      // schema-derived FileMetaData (we don't need anything from the bucket footer's
+      // FileMetaData -- schema, createdBy, kv-meta are all redundant with what we cached
+      // at construction time).
+      ParquetMetadata pmd =
+          new ParquetMetadata(fileMetaData, Collections.singletonList(bucketBlocks.get(0)));
 
-        // 3) Shift the bucket-local block into the outer file's absolute coordinate space and
-        //    wrap it in a synthetic single-block ParquetMetadata that uses the
-        //    schema-derived FileMetaData (we ignore the bucket footer's createdBy / kv-meta /
-        //    schema; they're identical to what we already cached at construction time).
-        BlockMetaData shifted = shiftBlock(bucketBlocks.get(0), bucketStart);
-        ParquetMetadata pmd =
-            new ParquetMetadata(fileMetaData, Collections.singletonList(shifted));
-        t1 = System.nanoTime();
-
-        // 4) Hand the prebuilt ParquetMetadata + the already-open stream straight to
-        //    ParquetFileReader. This constructor (parquet-mr 1.17+) skips the footer read and
-        //    reuses the supplied SeekableInputStream for chunk reads -- the same pattern as
-        //    ParquetIndexHandlerWithEmbeddedMetadata's hot path.
-        IcebergParquetSeekableInputStream wrapped =
-            new IcebergParquetSeekableInputStream(rawStream);
-        // From here on the parquet reader owns the stream; null out rawStream so the outer
-        // try/finally doesn't double-close it (ParquetFileReader.close() closes f).
-        rawStream = null;
-        try (ParquetFileReader pfr =
-            new ParquetFileReader(
-                new IcebergParquetInputFile(input), pmd, LOOKUP_OPTIONS, wrapped)) {
-          PageReadStore pages = pfr.readRowGroup(0);
-          t2 = System.nanoTime();
-          try {
-            if (pages == null) {
-              return null;
-            }
-
-            long rows = pages.getRowCount();
-            RecordReader<Group> rrdr = columnIO.getRecordReader(pages, converter);
-            for (long i = 0; i < rows; i++) {
-              Group g = rrdr.read();
-              if (g == null) {
-                continue;
-              }
-              // This handler doesn't pad short buckets, but defensively skip rows whose first
-              // key field is null -- they cannot match any non-null key.
-              if (g.getFieldRepetitionCount(0) == 0) {
-                continue;
-              }
-              if (!keyMatches(g, key)) {
-                continue;
-              }
-              if (g.getFieldRepetitionCount(filePathOrd) == 0
-                  || g.getFieldRepetitionCount(posOrd) == 0) {
-                continue;
-              }
-
-              String filePath = g.getString(filePathOrd, 0);
-              long pos = g.getLong(posOrd, 0);
-              return new HitImpl(filePath, pos);
-            }
-
+      // ---------------------------------------------------------------------------------
+      // 3) Hand the prebuilt ParquetMetadata + an in-memory stream straight to
+      //    ParquetFileReader. Same low-level decode pipeline as
+      //    ParquetIndexHandlerWithEmbeddedMetadata's hot path; all column-chunk reads
+      //    issued by readRowGroup(0) are served from RAM.
+      // ---------------------------------------------------------------------------------
+      InMemoryInputFile bucketInput = InMemoryInputFile.wrap(bucketBytes);
+      org.apache.parquet.io.SeekableInputStream parquetStream =
+          new IcebergParquetSeekableInputStream(bucketInput.newStream());
+      long t1 = System.nanoTime();
+      try (ParquetFileReader pfr =
+          new ParquetFileReader(
+              new IcebergParquetInputFile(bucketInput), pmd, LOOKUP_OPTIONS, parquetStream)) {
+        PageReadStore pages = pfr.readRowGroup(0);
+        long t2 = System.nanoTime();
+        long t3;
+        try {
+          if (pages == null) {
             return null;
-          } finally {
-            // Capture scan timing whether we hit (early return), missed (fall-through return
-            // null), or threw -- so the per-phase totals stay coherent across all outcomes.
-            t3 = System.nanoTime();
-            recordTimings(t1 - t0, t2 - t1, t3 - t2);
           }
-        }
-      } finally {
-        if (rawStream != null) {
-          try {
-            rawStream.close();
-          } catch (IOException ignore) {
-            // best-effort: lookup already failed if we got here with rawStream != null
+
+          long rows = pages.getRowCount();
+          RecordReader<Group> rrdr = columnIO.getRecordReader(pages, converter);
+          for (long i = 0; i < rows; i++) {
+            Group g = rrdr.read();
+            if (g == null) {
+              continue;
+            }
+            // This handler doesn't pad short buckets, but defensively skip rows whose first
+            // key field is null -- they cannot match any non-null key.
+            if (g.getFieldRepetitionCount(0) == 0) {
+              continue;
+            }
+            if (!keyMatches(g, key)) {
+              continue;
+            }
+            if (g.getFieldRepetitionCount(filePathOrd) == 0
+                || g.getFieldRepetitionCount(posOrd) == 0) {
+              continue;
+            }
+
+            String filePath = g.getString(filePathOrd, 0);
+            long pos = g.getLong(posOrd, 0);
+            return new HitImpl(filePath, pos);
           }
+
+          return null;
+        } finally {
+          // Capture scan timing whether we hit (early return), missed (fall-through return
+          // null), or threw -- so the per-phase totals stay coherent across all outcomes.
+          t3 = System.nanoTime();
+          recordTimings(t1 - t0, t2 - t1, t3 - t2);
         }
       }
     }
