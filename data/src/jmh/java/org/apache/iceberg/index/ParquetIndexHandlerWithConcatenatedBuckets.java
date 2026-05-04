@@ -22,6 +22,8 @@ import static org.apache.iceberg.types.Types.NestedField.optional;
 
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
+import java.io.ByteArrayInputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -31,6 +33,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
@@ -46,10 +49,10 @@ import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.apache.iceberg.inmemory.InMemoryOutputFile;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.FileAppender;
-import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.PositionOutputStream;
+import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.parquet.ParquetSchemaUtil;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -57,7 +60,10 @@ import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
 import org.apache.parquet.ParquetReadOptions;
+import org.apache.parquet.column.page.PageReadStore;
 import org.apache.parquet.conf.PlainParquetConfiguration;
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.example.data.simple.convert.GroupRecordConverter;
 import org.apache.parquet.format.Util;
 import org.apache.parquet.format.converter.ParquetMetadataConverter;
 import org.apache.parquet.hadoop.ParquetFileReader;
@@ -66,7 +72,10 @@ import org.apache.parquet.hadoop.metadata.BlockMetaData;
 import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData;
 import org.apache.parquet.hadoop.metadata.FileMetaData;
 import org.apache.parquet.hadoop.metadata.ParquetMetadata;
+import org.apache.parquet.io.ColumnIOFactory;
 import org.apache.parquet.io.DelegatingSeekableInputStream;
+import org.apache.parquet.io.MessageColumnIO;
+import org.apache.parquet.io.RecordReader;
 import org.apache.parquet.schema.MessageType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -345,6 +354,59 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
   }
 
   // -----------------------------------------------------------------------
+  // Shared helpers (used by both Writer and Reader)
+  // -----------------------------------------------------------------------
+
+  /** Reused across all lookups; thread-safe construction once. */
+  private static final ParquetMetadataConverter METADATA_CONVERTER = new ParquetMetadataConverter();
+
+  /**
+   * {@link ParquetReadOptions} used on the lookup hot path. All footer-driven filtering is
+   * disabled: the bucket has exactly one row group and we never push a predicate -- the row scan
+   * does the actual key matching.
+   */
+  private static final ParquetReadOptions LOOKUP_OPTIONS =
+      ParquetReadOptions.builder(new PlainParquetConfiguration())
+          .useStatsFilter(false)
+          .useColumnIndexFilter(false)
+          .useDictionaryFilter(false)
+          .useBloomFilter(false)
+          .build();
+
+  /**
+   * Returns a copy of {@code src} whose column-chunk page offsets are translated by adding {@code
+   * shift}. Used by the writer to produce outer-footer block metadata in the concatenated file's
+   * coordinate space, and by the reader to translate per-bucket {@link BlockMetaData} (parsed from
+   * the bucket's own embedded Parquet footer, with offsets relative to the bucket's PAR1) into the
+   * outer file's absolute coordinate space.
+   */
+  private static BlockMetaData shiftBlock(BlockMetaData src, long shift) {
+    BlockMetaData dst = new BlockMetaData();
+    dst.setRowCount(src.getRowCount());
+    dst.setTotalByteSize(src.getTotalByteSize());
+    for (ColumnChunkMetaData c : src.getColumns()) {
+      long dictOff = c.getDictionaryPageOffset();
+      long firstDataOff = c.getFirstDataPageOffset();
+      ColumnChunkMetaData shifted =
+          ColumnChunkMetaData.get(
+              c.getPath(),
+              c.getPrimitiveType(),
+              c.getCodec(),
+              c.getEncodingStats(),
+              c.getEncodings(),
+              c.getStatistics(),
+              firstDataOff + shift,
+              dictOff > 0L ? dictOff + shift : 0L,
+              c.getValueCount(),
+              c.getTotalSize(),
+              c.getTotalUncompressedSize());
+      dst.addColumn(shifted);
+    }
+
+    return dst;
+  }
+
+  // -----------------------------------------------------------------------
   // Writer
   // -----------------------------------------------------------------------
 
@@ -504,35 +566,6 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
       return s;
     }
 
-    /**
-     * Returns a copy of {@code src} whose column-chunk page offsets are translated into the outer
-     * file's coordinate space by adding {@code shift}.
-     */
-    private static BlockMetaData shiftBlock(BlockMetaData src, long shift) {
-      BlockMetaData dst = new BlockMetaData();
-      dst.setRowCount(src.getRowCount());
-      dst.setTotalByteSize(src.getTotalByteSize());
-      for (ColumnChunkMetaData c : src.getColumns()) {
-        long dictOff = c.getDictionaryPageOffset();
-        long firstDataOff = c.getFirstDataPageOffset();
-        ColumnChunkMetaData shifted =
-            ColumnChunkMetaData.get(
-                c.getPath(),
-                c.getPrimitiveType(),
-                c.getCodec(),
-                c.getEncodingStats(),
-                c.getEncodings(),
-                c.getStatistics(),
-                firstDataOff + shift,
-                dictOff > 0L ? dictOff + shift : 0L,
-                c.getValueCount(),
-                c.getTotalSize(),
-                c.getTotalUncompressedSize());
-        dst.addColumn(shifted);
-      }
-
-      return dst;
-    }
 
     /**
      * Serializes a standard Parquet footer (Thrift {@code FileMetaData} + {@code [int32
@@ -734,17 +767,33 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
     private final InputFile input;
     private final int[] lengths;
     private final long[] offsets;
-    private final Schema schema;
-    private final List<String> keyFieldNames;
     private final int keyFieldCount;
+    private final List<Types.NestedField> keyFields;
+    private final int filePathOrd;
+    private final int posOrd;
     private final int numBuckets;
     private final Function<Record, byte[]> keyEncoder;
+
+    /**
+     * Caches derived <em>only</em> from the on-disk schema (not from any footer read). Both the
+     * writer and the reader build the same {@link MessageType} via {@link
+     * ParquetSchemaUtil#convert(Schema, String)}, so the column IO pipeline is deterministic and
+     * needs no runtime discovery.
+     */
+    private final FileMetaData fileMetaData;
+
+    private final MessageColumnIO columnIO;
+    private final GroupRecordConverter converter;
 
     /**
      * Construct a reader from the externally-recovered per-bucket lengths and the cumulative
      * offsets they imply. This constructor performs <em>no</em> I/O against {@code input}: the
      * outer Parquet footer is opened at most once per file location -- in {@link
-     * #recoverBucketIndex(InputFile, int)} -- and cached process-wide.
+     * #recoverBucketIndex(InputFile, int)} -- and cached process-wide. Critically, on the lookup
+     * hot path the outer footer is never consulted: each {@link #lookup(Record)} navigates to the
+     * start of the targeted bucket parquet file, parses that bucket's own embedded footer, and
+     * uses the column-chunk offsets it carries (after a constant {@code +offsets[bucket]} shift)
+     * to drive a single low-level {@link ParquetFileReader#readRowGroup} call.
      */
     Reader(
         InputFile input,
@@ -762,16 +811,22 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
       this.input = input;
       this.lengths = lengths;
       this.offsets = offsets;
-      this.schema = schema;
       this.keyFieldCount = keyFieldCount;
-      List<String> names = Lists.newArrayListWithCapacity(keyFieldCount);
-      for (int i = 0; i < keyFieldCount; i++) {
-        names.add(schema.columns().get(i).name());
-      }
-
-      this.keyFieldNames = Collections.unmodifiableList(names);
+      this.keyFields = schema.columns().subList(0, keyFieldCount);
+      this.filePathOrd = keyFieldCount;
+      this.posOrd = keyFieldCount + 1;
       this.numBuckets = numBuckets;
       this.keyEncoder = keyEncoder;
+
+      // Derive Parquet-side decode pipeline from the Iceberg schema. Both writer and reader use
+      // ParquetSchemaUtil.convert(schema, "table"), so this matches the on-disk per-bucket
+      // schema exactly. createdBy is intentionally null -- we never read the outer footer on
+      // the hot path, and the bucket footers we do parse aren't consulted for createdBy here.
+      MessageType derivedMessageType = ParquetSchemaUtil.convert(schema, "table");
+      this.fileMetaData =
+          new FileMetaData(derivedMessageType, Collections.emptyMap(), /* createdBy */ null);
+      this.columnIO = new ColumnIOFactory(/* createdBy */ null).getColumnIO(derivedMessageType);
+      this.converter = new GroupRecordConverter(derivedMessageType);
     }
 
     @Override
@@ -780,77 +835,204 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
 
       byte[] encoded = keyEncoder.apply(key);
       int bucket = HashIndexHandler.bucketOf(encoded, numBuckets);
-      long off = offsets[bucket];
-      int len = lengths[bucket];
-
-      // 1) Pull the entire bucket parquet payload into memory. We deliberately route through
-      //    SeekableInputStream.seek() + IOUtil.readFully(stream, ...) instead of the
-      //    InputFile-based IOUtil.readFully(input, off, buf, 0, len) overload, because the
-      //    latter dispatches to RangeReadable.readFully on object-store adapters (S3/ADLS/GCS),
-      //    which issues a tight HTTP GET sized exactly to `len`. On ADLS, that path's
-      //    per-request fixed cost is not amortized for sub-MB reads -- the buffered-stream
-      //    path requests `adls.read.block-size-bytes` and serves subsequent reads locally,
-      //    which empirically halves per-lookup latency for ~30-700 KB bucket payloads. See
-      //    the per-phase instrumentation block below for the measurement that motivated this
-      //    choice. (EPHASH wins against CBUCKETS specifically because it accidentally
-      //    benefits from the buffered path via its two-shot read pattern.)
-      long t0 = System.nanoTime();
-      byte[] bucketBytes = new byte[len];
-      try (org.apache.iceberg.io.SeekableInputStream stream = input.newStream()) {
-        stream.seek(off);
-        IOUtil.readFully(stream, bucketBytes, 0, len);
+      long bucketStart = offsets[bucket];
+      int bucketLen = lengths[bucket];
+      if (bucketLen < 12) {
+        throw new IOException(
+            "Bucket " + bucket + " too small (" + bucketLen + " bytes) to hold a parquet trailer");
       }
 
-      long t1 = System.nanoTime();
+      // Open the file ONCE per lookup. Both the bucket-footer range read and the subsequent
+      // column-chunk reads issued by ParquetFileReader.readRowGroup go through this same
+      // stream, so (a) the storage adapter's per-stream prefetch buffer can serve them as one
+      // contiguous run when its block size covers them, and (b) we incur exactly one
+      // openStream per lookup -- no separate stream for the footer read, no second stream for
+      // the parquet reader.
+      long t0 = System.nanoTime();
+      SeekableInputStream rawStream = input.newStream();
+      long t1;
+      long t2;
+      long t3;
+      try {
+        // 1) Read the bucket's parquet trailer: the last 8 bytes of the bucket payload are
+        //    [int32-LE footerLen][PAR1]. The bucket parquet file lives at
+        //    [bucketStart, bucketStart + bucketLen) within the outer concatenated file, so its
+        //    own PAR1 magic sits at outer offset bucketStart, and its trailer at
+        //    bucketStart + bucketLen - 8.
+        long trailerStart = bucketStart + bucketLen - 8L;
+        byte[] trailer = new byte[8];
+        rawStream.seek(trailerStart);
+        readFully(rawStream, trailer);
+        if (trailer[4] != (byte) 'P'
+            || trailer[5] != (byte) 'A'
+            || trailer[6] != (byte) 'R'
+            || trailer[7] != (byte) '1') {
+          throw new IOException(
+              "Bucket " + bucket + " missing PAR1 trailer at offset " + trailerStart);
+        }
+        int footerLen = ByteBuffer.wrap(trailer, 0, 4).order(ByteOrder.LITTLE_ENDIAN).getInt();
+        if (footerLen <= 0 || footerLen > bucketLen - 8) {
+          throw new IOException("Bucket " + bucket + " has invalid footerLen=" + footerLen);
+        }
 
-      // 2) Hand the in-memory bucket bytes to Iceberg's standard Parquet read pipeline and
-      //    scan the single row group for the matching key. wrap() adopts the buffer without
-      //    a defensive copy -- bucketBytes is owned by this stack frame and never mutated.
-      //    The build() call performs the in-memory footer Thrift parse + reader-builder
-      //    construction; t2 captures wall-clock at the boundary between "open" and "scan".
-      InputFile bucketInput = InMemoryInputFile.wrap(bucketBytes);
-      try (CloseableIterable<Record> records =
-          Parquet.read(bucketInput)
-              .project(schema)
-              .createReaderFunc(fileSchema -> GenericParquetReaders.buildReader(schema, fileSchema))
-              .reuseContainers()
-              .build()) {
-        long t2 = System.nanoTime();
-        try {
-          for (Record row : records) {
-            if (!keyMatches(row, key)) {
-              continue;
+        // 2) Read the bucket's own embedded Parquet footer (Thrift FileMetaData) and decode it
+        //    into a ParquetMetadata. Offsets in the resulting BlockMetaData are RELATIVE to the
+        //    bucket's PAR1 (i.e. the bucket-local coordinate space, where bucketStart maps to 0).
+        long footerOff = trailerStart - footerLen;
+        byte[] footerBytes = new byte[footerLen];
+        rawStream.seek(footerOff);
+        readFully(rawStream, footerBytes);
+        org.apache.parquet.format.FileMetaData formatMd =
+            Util.readFileMetaData(new ByteArrayInputStream(footerBytes));
+        ParquetMetadata bucketPmd = METADATA_CONVERTER.fromParquetMetadata(formatMd);
+        List<BlockMetaData> bucketBlocks = bucketPmd.getBlocks();
+        if (bucketBlocks.size() != 1) {
+          throw new IOException(
+              "Bucket "
+                  + bucket
+                  + " expected exactly 1 row group in embedded footer, got "
+                  + bucketBlocks.size());
+        }
+
+        // 3) Shift the bucket-local block into the outer file's absolute coordinate space and
+        //    wrap it in a synthetic single-block ParquetMetadata that uses the
+        //    schema-derived FileMetaData (we ignore the bucket footer's createdBy / kv-meta /
+        //    schema; they're identical to what we already cached at construction time).
+        BlockMetaData shifted = shiftBlock(bucketBlocks.get(0), bucketStart);
+        ParquetMetadata pmd =
+            new ParquetMetadata(fileMetaData, Collections.singletonList(shifted));
+        t1 = System.nanoTime();
+
+        // 4) Hand the prebuilt ParquetMetadata + the already-open stream straight to
+        //    ParquetFileReader. This constructor (parquet-mr 1.17+) skips the footer read and
+        //    reuses the supplied SeekableInputStream for chunk reads -- the same pattern as
+        //    ParquetIndexHandlerWithEmbeddedMetadata's hot path.
+        IcebergParquetSeekableInputStream wrapped =
+            new IcebergParquetSeekableInputStream(rawStream);
+        // From here on the parquet reader owns the stream; null out rawStream so the outer
+        // try/finally doesn't double-close it (ParquetFileReader.close() closes f).
+        rawStream = null;
+        try (ParquetFileReader pfr =
+            new ParquetFileReader(
+                new IcebergParquetInputFile(input), pmd, LOOKUP_OPTIONS, wrapped)) {
+          PageReadStore pages = pfr.readRowGroup(0);
+          t2 = System.nanoTime();
+          try {
+            if (pages == null) {
+              return null;
             }
 
-            Object filePath = row.getField(FILE_PATH_COLUMN);
-            Object pos = row.getField(POS_COLUMN);
-            if (filePath == null || pos == null) {
-              continue;
+            long rows = pages.getRowCount();
+            RecordReader<Group> rrdr = columnIO.getRecordReader(pages, converter);
+            for (long i = 0; i < rows; i++) {
+              Group g = rrdr.read();
+              if (g == null) {
+                continue;
+              }
+              // This handler doesn't pad short buckets, but defensively skip rows whose first
+              // key field is null -- they cannot match any non-null key.
+              if (g.getFieldRepetitionCount(0) == 0) {
+                continue;
+              }
+              if (!keyMatches(g, key)) {
+                continue;
+              }
+              if (g.getFieldRepetitionCount(filePathOrd) == 0
+                  || g.getFieldRepetitionCount(posOrd) == 0) {
+                continue;
+              }
+
+              String filePath = g.getString(filePathOrd, 0);
+              long pos = g.getLong(posOrd, 0);
+              return new HitImpl(filePath, pos);
             }
 
-            return new HitImpl((String) filePath, (Long) pos);
+            return null;
+          } finally {
+            // Capture scan timing whether we hit (early return), missed (fall-through return
+            // null), or threw -- so the per-phase totals stay coherent across all outcomes.
+            t3 = System.nanoTime();
+            recordTimings(t1 - t0, t2 - t1, t3 - t2);
           }
-
-          return null;
-        } finally {
-          // Capture scan timing whether we hit (early return), missed (fall-through return null),
-          // or threw -- so the per-phase totals stay coherent across all outcomes.
-          long t3 = System.nanoTime();
-          recordTimings(t1 - t0, t2 - t1, t3 - t2);
+        }
+      } finally {
+        if (rawStream != null) {
+          try {
+            rawStream.close();
+          } catch (IOException ignore) {
+            // best-effort: lookup already failed if we got here with rawStream != null
+          }
         }
       }
     }
 
-    private boolean keyMatches(Record row, Record key) {
+    /** Repeated read into {@code buf} until full; throws {@link EOFException} on premature EOF. */
+    private static void readFully(org.apache.iceberg.io.SeekableInputStream s, byte[] buf)
+        throws IOException {
+      int off = 0;
+      int rem = buf.length;
+      while (rem > 0) {
+        int n = s.read(buf, off, rem);
+        if (n < 0) {
+          throw new EOFException("Unexpected EOF after " + off + " of " + buf.length + " bytes");
+        }
+        off += n;
+        rem -= n;
+      }
+    }
+
+    /**
+     * Field-by-field comparison of a parquet-mr {@link Group} to the lookup key. Type dispatch
+     * mirrors the on-disk encoding emitted by Iceberg's Parquet writer.
+     */
+    private boolean keyMatches(Group row, Record key) {
       for (int i = 0; i < keyFieldCount; i++) {
-        Object expected = key.get(i);
-        Object actual = row.getField(keyFieldNames.get(i));
-        if (expected == null) {
-          if (actual != null) {
+        Types.NestedField f = keyFields.get(i);
+        Object kv = key.get(i);
+        if (row.getFieldRepetitionCount(i) == 0) {
+          if (kv != null) {
             return false;
           }
-        } else if (!expected.equals(actual)) {
+          continue;
+        }
+        if (kv == null) {
           return false;
+        }
+        switch (f.type().typeId()) {
+          case LONG -> {
+            if (row.getLong(i, 0) != (long) kv) {
+              return false;
+            }
+          }
+          case INTEGER -> {
+            if (row.getInteger(i, 0) != (int) kv) {
+              return false;
+            }
+          }
+          case STRING -> {
+            if (!row.getString(i, 0).equals(kv.toString())) {
+              return false;
+            }
+          }
+          case UUID -> {
+            UUID u = (UUID) kv;
+            byte[] expected = new byte[16];
+            ByteBuffer.wrap(expected)
+                .putLong(u.getMostSignificantBits())
+                .putLong(u.getLeastSignificantBits());
+            byte[] actual = row.getBinary(i, 0).getBytes();
+            if (actual.length != 16) {
+              return false;
+            }
+            for (int b = 0; b < 16; b++) {
+              if (actual[b] != expected[b]) {
+                return false;
+              }
+            }
+          }
+          default ->
+              throw new IllegalStateException(
+                  "Unsupported key field type at position " + i + ": " + f.type());
         }
       }
 
