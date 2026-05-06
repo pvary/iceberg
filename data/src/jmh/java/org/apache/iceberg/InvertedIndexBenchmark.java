@@ -135,10 +135,9 @@ public class InvertedIndexBenchmark {
 
   /**
    * Index format and (for Parquet) row group size, encoded as {@code "PARQUET_<rows>"}, {@code
-   * "UCH_<kLimit>"}, {@code "HASH_<rows>"}, {@code "PHASH_<rows>"}, {@code "EPHASH_<rows>"},
-   * {@code "EFILES_<rows>"}, {@code "CBUCKETS_<rows>"} or {@code "MPHF"}. {@link
-   * #setupBenchmark()} parses it into the {@code is*} flags and the corresponding numeric
-   * parameter.
+   * "UCH_<kLimit>"}, {@code "HASH_<rows>"}, {@code "PHASH_<rows>"}, {@code "EPHASH_<rows>"}, {@code
+   * "EFILES_<rows>"}, {@code "CBUCKETS_<rows>"} or {@code "MPHF"}. {@link #setupBenchmark()} parses
+   * it into the {@code is*} flags and the corresponding numeric parameter.
    */
   @Param({
     //    "PARQUET_10000",
@@ -156,15 +155,15 @@ public class InvertedIndexBenchmark {
     //    "EPHASH_20000",
     "EPHASH_2000",
     "EFILES_2000",
-//    "EFILES_5000",
-//    "EFILES_10000",
-//    "EFILES_20000",
-//    "EFILES_50000",
-//    "CBUCKETS_2000",
-//    "CBUCKETS_5000",
-//    "CBUCKETS_10000",
-//    "CBUCKETS_20000",
-//    "CBUCKETS_50000"
+    //    "EFILES_5000",
+    //    "EFILES_10000",
+    //    "EFILES_20000",
+    //    "EFILES_50000",
+    //    "CBUCKETS_2000",
+    //    "CBUCKETS_5000",
+    //    "CBUCKETS_10000",
+    //    "CBUCKETS_20000",
+    //    "CBUCKETS_50000"
   })
   private String indexType;
 
@@ -240,8 +239,7 @@ public class InvertedIndexBenchmark {
       this.indexHandler =
           new ParquetIndexHandlerWithEmbeddedMetadata(keySchema, bucketRows, numRows);
     } else if (isEfiles) {
-      this.indexHandler =
-          new ParquetIndexHandlerWithEmbeddedFiles(keySchema, bucketRows, numRows);
+      this.indexHandler = new ParquetIndexHandlerWithEmbeddedFiles(keySchema, bucketRows, numRows);
     } else if (isCbuckets) {
       this.indexHandler =
           new ParquetIndexHandlerWithConcatenatedBuckets(keySchema, bucketRows, numRows);

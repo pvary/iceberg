@@ -18,6 +18,8 @@
  */
 package org.apache.iceberg.index;
 
+import static org.apache.iceberg.types.Types.NestedField.optional;
+
 import it.unimi.dsi.fastutil.ints.IntArrayList;
 import it.unimi.dsi.fastutil.longs.LongArrayList;
 import java.io.EOFException;
@@ -72,8 +74,6 @@ import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import static org.apache.iceberg.types.Types.NestedField.optional;
 
 /**
  * Parquet-derived inverted-index file format that embeds, before every row group, a compact binary
@@ -1267,8 +1267,7 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
     }
   }
 
-  private static final class ByteArraySeekableInputStream
-      extends SeekableInputStream {
+  private static final class ByteArraySeekableInputStream extends SeekableInputStream {
     private final byte[] data;
     private int pos;
 

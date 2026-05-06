@@ -371,7 +371,7 @@ public class ParquetIndexHandlerWithEmbeddedMetadata implements IndexHandler {
    * <p>Unbounded with no eviction by design: each entry is just {@code 8 * numBuckets} bytes and
    * the JMH benchmarks that motivate this handler open at most a handful of distinct files per JVM.
    * All access goes through the {@code synchronized} {@link #recoverMetaOffsets} method, so a plain
-   * {@link java.util.HashMap} is sufficient.
+   * {@link HashMap} is sufficient.
    */
   private static final Map<String, long[]> META_OFFSETS_CACHE = new HashMap<>();
 
@@ -956,7 +956,7 @@ public class ParquetIndexHandlerWithEmbeddedMetadata implements IndexHandler {
     }
 
     @Override
-    public IndexHandler.Hit lookup(Record key) throws IOException {
+    public Hit lookup(Record key) throws IOException {
       if (key == null) {
         throw new IllegalArgumentException("Lookup key cannot be null");
       }
@@ -1262,13 +1262,12 @@ public class ParquetIndexHandlerWithEmbeddedMetadata implements IndexHandler {
     }
 
     @Override
-    public org.apache.parquet.io.SeekableInputStream newStream() {
+    public SeekableInputStream newStream() {
       return new ByteArraySeekableInputStream(data);
     }
   }
 
-  private static final class ByteArraySeekableInputStream
-      extends org.apache.parquet.io.SeekableInputStream {
+  private static final class ByteArraySeekableInputStream extends SeekableInputStream {
     private final byte[] data;
     private int pos;
 
@@ -1366,7 +1365,7 @@ public class ParquetIndexHandlerWithEmbeddedMetadata implements IndexHandler {
     }
 
     @Override
-    public org.apache.parquet.io.SeekableInputStream newStream() {
+    public SeekableInputStream newStream() {
       return new IcebergParquetSeekableInputStream(delegate.newStream());
     }
   }

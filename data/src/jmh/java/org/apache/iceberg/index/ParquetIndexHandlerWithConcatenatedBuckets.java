@@ -223,21 +223,20 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
   // -----------------------------------------------------------------------
 
   /**
-   * Has {@link #resetInstrumentationOnce()} been called yet in this JVM? Used so that, in
-   * {@link org.openjdk.jmh.annotations.Mode#SingleShotTime SingleShotTime} benchmarks where
-   * every JMH iteration is exactly one lookup, the warmup-to-measurement boundary triggers the
-   * counter reset exactly once -- not on every iteration -- so the {@code @TearDown} dump
-   * reports an aggregate over all 1000 measurement lookups instead of just the final one.
+   * Has {@link #resetInstrumentationOnce()} been called yet in this JVM? Used so that, in {@link
+   * org.openjdk.jmh.annotations.Mode#SingleShotTime SingleShotTime} benchmarks where every JMH
+   * iteration is exactly one lookup, the warmup-to-measurement boundary triggers the counter reset
+   * exactly once -- not on every iteration -- so the {@code @TearDown} dump reports an aggregate
+   * over all 1000 measurement lookups instead of just the final one.
    */
-  private static final AtomicBoolean INSTRUMENTATION_RESET =
-      new AtomicBoolean(false);
+  private static final AtomicBoolean INSTRUMENTATION_RESET = new AtomicBoolean(false);
 
   /**
    * Resets the per-phase lookup instrumentation counters (net / open / scan, plus the lookup
-   * count). Call only when you really want to wipe the counters mid-run; for the typical "zero
-   * once at the warmup-to-measurement boundary" use case prefer {@link
-   * #resetInstrumentationOnce()}, which CAS-gates the call so it's a no-op after the first
-   * invocation. Safe to call from any thread.
+   * count). Call only when you really want to wipe the counters mid-run; for the typical "zero once
+   * at the warmup-to-measurement boundary" use case prefer {@link #resetInstrumentationOnce()},
+   * which CAS-gates the call so it's a no-op after the first invocation. Safe to call from any
+   * thread.
    */
   public static void resetInstrumentation() {
     INSTRUMENTATION_RESET.set(true);
@@ -566,7 +565,6 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
       return s;
     }
 
-
     /**
      * Serializes a standard Parquet footer (Thrift {@code FileMetaData} + {@code [int32
      * footerLen][PAR1]} trailer) at the current stream position. The kv-metadata carries the
@@ -720,9 +718,9 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
     }
 
     /**
-     * Logs a one-line summary of the per-phase instrumentation counters at INFO level. Reports
-     * both totals (us) and per-op averages (us/op). Safe to call concurrently with active
-     * lookups; values are a coherent snapshot only if no lookups are in flight.
+     * Logs a one-line summary of the per-phase instrumentation counters at INFO level. Reports both
+     * totals (us) and per-op averages (us/op). Safe to call concurrently with active lookups;
+     * values are a coherent snapshot only if no lookups are in flight.
      */
     public static void dumpInstrumentation() {
       long n = LOOKUP_COUNT.get();
@@ -791,9 +789,9 @@ public class ParquetIndexHandlerWithConcatenatedBuckets implements IndexHandler 
      * outer Parquet footer is opened at most once per file location -- in {@link
      * #recoverBucketIndex(InputFile, int)} -- and cached process-wide. Critically, on the lookup
      * hot path the outer footer is never consulted: each {@link #lookup(Record)} navigates to the
-     * start of the targeted bucket parquet file, parses that bucket's own embedded footer, and
-     * uses the column-chunk offsets it carries (after a constant {@code +offsets[bucket]} shift)
-     * to drive a single low-level {@link ParquetFileReader#readRowGroup} call.
+     * start of the targeted bucket parquet file, parses that bucket's own embedded footer, and uses
+     * the column-chunk offsets it carries (after a constant {@code +offsets[bucket]} shift) to
+     * drive a single low-level {@link ParquetFileReader#readRowGroup} call.
      */
     Reader(
         InputFile input,
