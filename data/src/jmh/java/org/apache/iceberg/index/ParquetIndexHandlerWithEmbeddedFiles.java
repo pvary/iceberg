@@ -41,6 +41,7 @@ import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
 import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.exceptions.RuntimeIOException;
+import org.apache.iceberg.inmemory.InMemoryInputFile;
 import org.apache.iceberg.inmemory.InMemoryOutputFile;
 import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.InputFile;
@@ -58,7 +59,6 @@ import org.apache.parquet.conf.PlainParquetConfiguration;
 import org.apache.parquet.example.data.Group;
 import org.apache.parquet.example.data.simple.convert.GroupRecordConverter;
 import org.apache.parquet.hadoop.ParquetFileReader;
-import org.apache.parquet.hadoop.ParquetFileWriter;
 import org.apache.parquet.hadoop.metadata.BlockMetaData;
 import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData;
 import org.apache.parquet.hadoop.metadata.ColumnPath;
@@ -76,28 +76,30 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 /**
- * Parquet-derived inverted-index file format that embeds, before every row group, a compact binary
- * metadata block describing exactly that row group's column chunks. The resulting file is
- * <em>also</em> a fully valid Parquet file -- the writer emits a standard Parquet footer at the end
- * whose {@link BlockMetaData} entries point at the same column chunks the embedded meta blocks
- * describe. Generic Parquet tooling (parquet-tools, Spark, DuckDB, ...) can therefore open the file
- * as-is.
+ * Inverted-index file format that, for every bucket, writes a compact binary metadata block
+ * immediately followed by an entire <em>self-contained single-row-group Parquet file</em> for that
+ * bucket. Unlike {@link ParquetIndexHandlerWithEmbeddedMetadata}, the outer container is
+ * <em>not</em> a single valid Parquet file -- each bucket payload is a complete Parquet file (PAR1
+ * magic, single row group, full footer + trailer) embedded verbatim. A custom file trailer carrying
+ * {@code metaOffsets[]} lets readers locate each bucket without parsing any Parquet structure at
+ * open time.
  *
- * <p>Lookups never touch the Parquet footer on the hot path: the reader uses the footer
- * <em>once</em> at open time to recover {@code metaOffsets[]} (one per row group, computed as
- * {@code block.getStartingPos() - metaBlockSize}) and the per-column codec / encoding caches, then
- * performs each {@link Reader#lookup(Record) lookup} via a single small range read of the
- * fixed-size meta block followed by one bounded range read of the targeted row-group payload.
+ * <p>Lookups never read a Parquet footer on the hot path: the reader recovers {@code metaOffsets[]}
+ * <em>once</em> at open time from the custom trailer, then performs each {@link
+ * Reader#lookup(Record) lookup} via a single small range read of the fixed-size meta block followed
+ * by one bounded range read of the targeted row-group payload. The per-column page offsets stored
+ * inside the meta block are absolute final-file offsets, computed at write time by shifting the
+ * embedded Parquet's intrinsic offsets by {@code metaOffset + metaBlockSize}.
  *
  * <h2>File layout</h2>
  *
  * <pre>
- *   [PAR1]
- *   [meta_block_0][row_group_payload_0]
- *   [meta_block_1][row_group_payload_1]
+ *   [IDXF]                                            // 4-byte magic
+ *   [meta_block_0][per-bucket parquet file 0]
+ *   [meta_block_1][per-bucket parquet file 1]
  *   ...
- *   [meta_block_{B-1}][row_group_payload_{B-1}]
- *   [parquet footer (thrift FileMetaData)][int32 footerLen][PAR1]
+ *   [meta_block_{B-1}][per-bucket parquet file {B-1}]
+ *   [int64 metaOffsets[B]][int32 numBuckets][IDXF]    // trailer
  * </pre>
  *
  * <h2>Meta block (per row group)</h2>
@@ -168,6 +170,16 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
 
   /** Meta-block fixed header: rowCount (int32) + numCols (int32). */
   private static final int META_HEADER_BYTES = 8;
+
+  /**
+   * Magic bytes that bookend the file. The leading copy lets generic file probers recognize the
+   * format; the trailing copy is part of the {@link #TRAILER_FIXED_BYTES} trailer that the reader
+   * uses to validate / locate the {@code metaOffsets[]} array.
+   */
+  private static final byte[] MAGIC_BYTES = {'I', 'D', 'X', 'F'};
+
+  /** Trailer = numBuckets (int32) + magic (4 bytes); the {@code int64 metaOffsets[]} precedes. */
+  private static final int TRAILER_FIXED_BYTES = 4 + 4;
 
   private final Schema schema;
   private final int keyFieldCount;
@@ -266,12 +278,13 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
     // Reader is intentionally constructed from a minimal externally-supplied set:
     //   (input, metaOffsets, schema, keyFieldCount, numBuckets, rowsPerBucket, keyEncoder,
     //    numCols).
-    // It performs NO I/O against `input` at construction time and never reads the Parquet
-    // footer on the lookup path either. To simulate "metaOffsets came from somewhere external
-    // (sidecar manifest, compaction job output, ...)" we open the footer here, exactly once
-    // outside the Reader, just to recover the offsets. In a real deployment this step would
-    // be replaced by reading those offsets from wherever the writer published them.
-    long[] metaOffsets = recoverMetaOffsets(input, numBuckets, numCols);
+    // It performs NO I/O against `input` at construction time apart from the small custom-trailer
+    // read that recovers metaOffsets[]; the embedded per-bucket Parquet footers are never read on
+    // the lookup path. To simulate "metaOffsets came from somewhere external (sidecar manifest,
+    // compaction job output, ...)" we read the trailer here, exactly once outside the Reader. In
+    // a real deployment this step would be replaced by reading those offsets from wherever the
+    // writer published them.
+    long[] metaOffsets = recoverMetaOffsets(input, numBuckets);
     return new Reader(
         input, metaOffsets, schema, keyFieldCount, numBuckets, rowsPerBucket, keyEncoder, numCols);
   }
@@ -376,40 +389,59 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
   private static final Map<String, long[]> META_OFFSETS_CACHE = new HashMap<>();
 
   /**
-   * One-shot footer read used solely to recover {@code metaOffsets[]}. Each row group's
-   * column-chunk payload sits {@code metaBlockSize} bytes after its preceding meta block, so {@code
-   * metaOffsets[b] = block.getStartingPos() - metaBlockSize}. Results are cached in {@link
+   * One-shot trailer read used solely to recover {@code metaOffsets[]}. The trailer at the very end
+   * of the file is {@code numBuckets * 8 + 4 + 4} bytes -- {@code int64 metaOffsets[B]} + {@code
+   * int32 numBuckets} + 4-byte {@link #MAGIC_BYTES}. Results are cached in {@link
    * #META_OFFSETS_CACHE} keyed by {@code input.location()} so subsequent reader constructions on
-   * the same input file skip the footer read entirely.
+   * the same input file skip the trailer read entirely.
    */
-  private static synchronized long[] recoverMetaOffsets(
-      InputFile input, int numBuckets, int numCols) throws IOException {
+  private static synchronized long[] recoverMetaOffsets(InputFile input, int numBuckets) {
     return META_OFFSETS_CACHE.computeIfAbsent(
         input.location(),
         k -> {
-          int metaBlockSize = META_HEADER_BYTES + numCols * META_PER_COL_BYTES;
-          long[] offsets;
-          try (ParquetFileReader pfr =
-              ParquetFileReader.open(
-                  new IcebergParquetInputFile(input),
-                  ParquetReadOptions.builder(new PlainParquetConfiguration()).build())) {
-            List<BlockMetaData> blocks = pfr.getRowGroups();
-            if (blocks.size() != numBuckets) {
-              throw new IOException(
-                  "Footer block count "
-                      + blocks.size()
-                      + " does not match numBuckets "
-                      + numBuckets);
-            }
-            offsets = new long[numBuckets];
-            for (int b = 0; b < numBuckets; b++) {
-              offsets[b] = blocks.get(b).getStartingPos() - metaBlockSize;
+          int trailerLen = numBuckets * Long.BYTES + TRAILER_FIXED_BYTES;
+          long fileLen = input.getLength();
+          if (fileLen < trailerLen + MAGIC_BYTES.length) {
+            throw new RuntimeIOException(
+                new IOException(
+                    "File too small to contain a valid trailer: length="
+                        + fileLen
+                        + ", required>="
+                        + (trailerLen + MAGIC_BYTES.length)));
+          }
+          byte[] trailer = new byte[trailerLen];
+          try (org.apache.iceberg.io.SeekableInputStream in = input.newStream()) {
+            in.seek(fileLen - trailerLen);
+            int off = 0;
+            while (off < trailerLen) {
+              int n = in.read(trailer, off, trailerLen - off);
+              if (n < 0) {
+                throw new EOFException(
+                    "Unexpected EOF reading trailer at offset " + (fileLen - trailerLen + off));
+              }
+              off += n;
             }
           } catch (IOException e) {
+            throw new RuntimeIOException(e, "Failed to read trailer of file: %s", input.location());
+          }
+          ByteBuffer bb = ByteBuffer.wrap(trailer).order(ByteOrder.LITTLE_ENDIAN);
+          long[] offsets = new long[numBuckets];
+          for (int b = 0; b < numBuckets; b++) {
+            offsets[b] = bb.getLong();
+          }
+          int storedBuckets = bb.getInt();
+          if (storedBuckets != numBuckets) {
             throw new RuntimeIOException(
-                e,
-                "Failed to recover meta offsets from Parquet footer of file: %s",
-                input.location());
+                new IOException(
+                    "Trailer numBuckets mismatch: stored="
+                        + storedBuckets
+                        + ", expected="
+                        + numBuckets));
+          }
+          for (byte expected : MAGIC_BYTES) {
+            if (bb.get() != expected) {
+              throw new RuntimeIOException(new IOException("Bad trailer magic"));
+            }
           }
           return offsets;
         });
@@ -501,7 +533,7 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
       }
 
       LOG.info(
-          "ParquetIndexHandlerWithEmbeddedMetadata writing keys={} numBuckets={} rowsPerBucket={} maxBucket={}",
+          "ParquetIndexHandlerWithEmbeddedFiles writing keys={} numBuckets={} rowsPerBucket={} maxBucket={}",
           n,
           numBuckets,
           rowsPerBucket,
@@ -509,30 +541,22 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
 
       long[] metaOffsets = new long[numBuckets];
       long metaSize = META_HEADER_BYTES + (long) numCols * META_PER_COL_BYTES;
-      MessageType parquetSchema = ParquetSchemaUtil.convert(schema, "table");
 
       // For checkRecommendedReadBlockSize: largest single bucket payload (sum of column-chunk
-      // compressed sizes). Tracked inline so we don't have to re-walk the footer afterwards.
+      // compressed sizes). Tracked inline so we don't have to re-walk anything afterwards.
       long maxPayloadBytes = 0L;
+      // Largest entire embedded per-bucket parquet file (payload + Parquet metadata + trailer).
+      long maxBucketFileBytes = 0L;
       // Captured from bucket 0 purely for the post-write sanity log.
       CompressionCodecName codec0 = null;
       Set<Encoding> encodings0 = null;
 
       try (PositionOutputStream rawOut = output.createOrOverwrite()) {
-        org.apache.parquet.io.PositionOutputStream sharedOut =
-            new IcebergParquetPositionOutputStream(rawOut);
-        // Outer parquet-mr writer: owns MAGIC, per-block BlockMetaData bookkeeping with
-        // automatically-shifted page offsets (via appendRowGroup), and the standard Parquet
-        // footer + [int32 footerLen][PAR1] trailer at end(). This eliminates ~80 lines of
-        // hand-rolled footer encoding and ColumnChunkMetaData mirroring.
-        ParquetFileWriter outer =
-            new ParquetFileWriter(
-                new SharedStreamParquetOutputFile(sharedOut),
-                parquetSchema,
-                ParquetFileWriter.Mode.OVERWRITE,
-                org.apache.parquet.hadoop.ParquetWriter.DEFAULT_BLOCK_SIZE,
-                /* maxPaddingSize */ 0);
-        outer.start(); // writes PAR1 at position 0
+        // Leading magic so generic file probers can identify the format. The container is NOT a
+        // valid Parquet file -- each bucket payload is a self-contained Parquet file embedded
+        // verbatim immediately after a fixed-size meta block. metaOffsets[] is recoverable from
+        // the trailer at the very end of the file.
+        rawOut.write(MAGIC_BYTES);
 
         Record padding = GenericRecord.create(schema);
         for (int b = 0; b < numBuckets; b++) {
@@ -556,7 +580,8 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
           byte[] perBucketBytes = inMem.toByteArray();
 
           // 2) Re-open the in-memory parquet to recover the single block's column-chunk
-          //    metadata; appendRowGroup needs a BlockMetaData to drive the chunk-by-chunk copy.
+          //    metadata; the meta block we emit at step 4 mirrors these offsets shifted into
+          //    the outer file's coordinate space.
           BlockMetaData block;
           try (ParquetFileReader pfr =
               ParquetFileReader.open(
@@ -571,11 +596,11 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
           }
 
           // 3) Verify chunks are contiguous in the source file -- our single-shift meta-block
-          //    encoding (step 5) relies on it. GenericParquetWriter has always produced
-          //    contiguous chunks; this assertion catches any future writer-side regression.
+          //    encoding (step 4) relies on it. Since we copy the per-bucket file verbatim into
+          //    the outer container, contiguity in the source implies contiguity in the dest at
+          //    the same intra-file offsets.
           List<ColumnChunkMetaData> cols = block.getColumns();
-          long inMemPayloadStart = block.getStartingPos();
-          long expectedNext = inMemPayloadStart;
+          long expectedNext = block.getStartingPos();
           long bucketPayloadBytes = 0L;
           for (int c = 0; c < numCols; c++) {
             ColumnChunkMetaData ccmd = cols.get(c);
@@ -600,41 +625,51 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
           if (bucketPayloadBytes > maxPayloadBytes) {
             maxPayloadBytes = bucketPayloadBytes;
           }
+          if (perBucketBytes.length > maxBucketFileBytes) {
+            maxBucketFileBytes = perBucketBytes.length;
+          }
           if (b == 0) {
             codec0 = cols.get(0).getCodec();
             encodings0 = cols.get(0).getEncodings();
           }
 
-          // 4) Record meta-block offset and write the meta block at the current outer position.
-          //    appendRowGroup will then place column chunks immediately after, so all per-column
-          //    page offsets in the meta block can be derived via a single shift.
-          long metaOffset = outer.getPos();
+          // 4) Record meta-block offset and write the meta block at the current outer position,
+          //    immediately followed by the entire embedded per-bucket Parquet file. The bucket
+          //    file starts at (metaOffset + metaSize); per-column chunk offsets within the
+          //    bucket file therefore translate to absolute final-file offsets via the same
+          //    single shift.
+          long metaOffset = rawOut.getPos();
           metaOffsets[b] = metaOffset;
-          long shift = (metaOffset + metaSize) - inMemPayloadStart;
-          writeMetaBlock(sharedOut, block, shift);
+          long shift = metaOffset + metaSize;
+          writeMetaBlock(rawOut, block, shift);
 
-          // 5) Let parquet-mr append the row group: reads each chunk's bytes from the in-memory
-          //    bucket file and writes them to the shared output stream, building a shifted
-          //    BlockMetaData for the eventual footer. Because we just verified chunks are
-          //    contiguous in the source AND parquet-mr writes them back-to-back in the dest,
-          //    the per-chunk page offsets it records exactly match the (offset + shift) values
-          //    we just wrote into the meta block.
-          try (ByteArraySeekableInputStream src =
-              new ByteArraySeekableInputStream(perBucketBytes)) {
-            outer.appendRowGroup(src, block, /* dropColumns */ false);
-          }
+          // 5) Write the entire per-bucket parquet file (PAR1 + row group + footer + trailer).
+          rawOut.write(perBucketBytes);
         }
 
-        // 6) Standard Parquet footer + trailer.
-        outer.end(Collections.emptyMap());
+        // 6) Custom trailer:
+        //      int64 metaOffsets[numBuckets]
+        //      int32 numBuckets
+        //      4 bytes magic
+        //    Reader recovers metaOffsets[] from this trailer in a single small range read.
+        int trailerLen = numBuckets * Long.BYTES + TRAILER_FIXED_BYTES;
+        ByteBuffer trailer = ByteBuffer.allocate(trailerLen).order(ByteOrder.LITTLE_ENDIAN);
+        for (int b = 0; b < numBuckets; b++) {
+          trailer.putLong(metaOffsets[b]);
+        }
+        trailer.putInt(numBuckets);
+        trailer.put(MAGIC_BYTES);
+        rawOut.write(trailer.array());
       }
 
       LOG.info(
-          "ParquetIndexHandlerWithEmbeddedMetadata footer: {} block(s), codec[0]={}, encodings[0]={}, metaOffsets[0]={}",
+          "ParquetIndexHandlerWithEmbeddedFiles wrote {} bucket(s), codec[0]={}, encodings[0]={}, "
+              + "metaOffsets[0]={}, maxBucketFileBytes={}",
           numBuckets,
           codec0,
           encodings0,
-          metaOffsets[0]);
+          metaOffsets[0],
+          maxBucketFileBytes);
 
       checkRecommendedReadBlockSize(maxPayloadBytes);
 
@@ -642,12 +677,12 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
     }
 
     /**
-     * Writes the {@code 8 + numCols * 64} byte embedded meta block at the shared stream's current
-     * position. Per-column page offsets are translated from the source in-memory bucket file's
-     * coordinate space into the final file's coordinate space via {@code shift}.
+     * Writes the {@code 8 + numCols * 64} byte embedded meta block at the output stream's current
+     * position. Per-column page offsets are translated from the embedded per-bucket Parquet file's
+     * intrinsic coordinate space into the outer file's coordinate space via {@code shift =
+     * metaOffset + metaBlockSize} (i.e. the absolute offset at which the per-bucket file begins).
      */
-    private void writeMetaBlock(
-        org.apache.parquet.io.PositionOutputStream sharedOut, BlockMetaData block, long shift)
+    private void writeMetaBlock(PositionOutputStream out, BlockMetaData block, long shift)
         throws IOException {
       long metaSize = META_HEADER_BYTES + (long) numCols * META_PER_COL_BYTES;
       ByteBuffer meta = ByteBuffer.allocate((int) metaSize).order(ByteOrder.LITTLE_ENDIAN);
@@ -687,7 +722,7 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
           meta.putInt(0);
         }
       }
-      sharedOut.write(meta.array());
+      out.write(meta.array());
     }
 
     /**
@@ -739,13 +774,19 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
     }
 
     /**
-     * Reopens the just-written file via Iceberg's high-level {@link Parquet#read(InputFile)}
-     * pipeline (the same code path real callers use) and asserts that the multiset of non-padding
-     * {@code (file_path, pos)} pairs equals exactly what the caller {@link #add added}. Throws
-     * {@link IOException} on any mismatch so the writer's {@code close()} surfaces the problem.
+     * Reopens the just-written file, recovers {@code metaOffsets[]} from the custom trailer (the
+     * same path the production reader uses), then for each bucket slices the embedded per-bucket
+     * Parquet file off disk and reads it via Iceberg's high-level {@link Parquet#read(InputFile)}
+     * pipeline. Asserts that the multiset of non-padding {@code (file_path, pos)} pairs across all
+     * buckets equals exactly what the caller {@link #add added}. Throws {@link IOException} on any
+     * mismatch so the writer's {@code close()} surfaces the problem.
      */
     private void validateWrittenFile() throws IOException {
       InputFile in = output.toInputFile();
+      long[] offsets = recoverMetaOffsets(in, numBuckets);
+      long fileLen = in.getLength();
+      long metaSize = META_HEADER_BYTES + (long) numCols * META_PER_COL_BYTES;
+      int trailerLen = numBuckets * Long.BYTES + TRAILER_FIXED_BYTES;
 
       // Build the expected multiset (filePath\u0001pos) once across all buckets -- using a
       // single global set sidesteps having to recover the bucket assignment from the file.
@@ -755,40 +796,76 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
       }
       int totalNonPadding = 0;
 
-      try (org.apache.iceberg.io.CloseableIterable<Record> records =
-          Parquet.read(in)
-              .project(schema)
-              .createReaderFunc(
-                  fileSchema ->
-                      org.apache.iceberg.data.parquet.GenericParquetReaders.buildReader(
-                          schema, fileSchema))
-              .reuseContainers()
-              .build()) {
-        for (Record r : records) {
-          // Padding rows have all key columns null -- the writer fills key columns and both
-          // payload columns together, so the first key column is a sufficient canary.
-          if (r.get(0) == null) {
-            continue;
-          }
-          totalNonPadding++;
-          Object filePathVal = r.getField(FILE_PATH_COLUMN);
-          Object posVal = r.getField(POS_COLUMN);
-          if (filePathVal == null || posVal == null) {
+      try (org.apache.iceberg.io.SeekableInputStream raw = in.newStream()) {
+        for (int b = 0; b < numBuckets; b++) {
+          long bucketFileStart = offsets[b] + metaSize;
+          long bucketFileEnd = (b + 1 < numBuckets) ? offsets[b + 1] : (fileLen - trailerLen);
+          long bucketFileLenLong = bucketFileEnd - bucketFileStart;
+          if (bucketFileLenLong <= 0L || bucketFileLenLong > Integer.MAX_VALUE) {
             throw new IOException(
-                "validateWrittenFile: row has key but null payload (filePath="
-                    + filePathVal
-                    + ", pos="
-                    + posVal
+                "Bucket "
+                    + b
+                    + " has invalid embedded-parquet length="
+                    + bucketFileLenLong
+                    + " (start="
+                    + bucketFileStart
+                    + ", end="
+                    + bucketFileEnd
                     + ")");
           }
-          String composite = filePathVal + "\u0001" + posVal;
-          if (!expected.remove(composite)) {
-            throw new IOException(
-                "validateWrittenFile: unexpected (filePath, pos)=("
-                    + filePathVal
-                    + ", "
-                    + posVal
-                    + ")");
+          int bucketFileLen = (int) bucketFileLenLong;
+          byte[] bucketBytes = new byte[bucketFileLen];
+          raw.seek(bucketFileStart);
+          int off = 0;
+          while (off < bucketFileLen) {
+            int rd = raw.read(bucketBytes, off, bucketFileLen - off);
+            if (rd < 0) {
+              throw new EOFException(
+                  "Unexpected EOF reading bucket " + b + " at offset " + (bucketFileStart + off));
+            }
+            off += rd;
+          }
+
+          try (org.apache.iceberg.io.CloseableIterable<Record> records =
+              Parquet.read(new InMemoryInputFile(bucketBytes))
+                  .project(schema)
+                  .createReaderFunc(
+                      fileSchema ->
+                          org.apache.iceberg.data.parquet.GenericParquetReaders.buildReader(
+                              schema, fileSchema))
+                  .reuseContainers()
+                  .build()) {
+            for (Record r : records) {
+              // Padding rows have all key columns null -- the writer fills key columns and both
+              // payload columns together, so the first key column is a sufficient canary.
+              if (r.get(0) == null) {
+                continue;
+              }
+              totalNonPadding++;
+              Object filePathVal = r.getField(FILE_PATH_COLUMN);
+              Object posVal = r.getField(POS_COLUMN);
+              if (filePathVal == null || posVal == null) {
+                throw new IOException(
+                    "validateWrittenFile: bucket "
+                        + b
+                        + " row has key but null payload (filePath="
+                        + filePathVal
+                        + ", pos="
+                        + posVal
+                        + ")");
+              }
+              String composite = filePathVal + "\u0001" + posVal;
+              if (!expected.remove(composite)) {
+                throw new IOException(
+                    "validateWrittenFile: bucket "
+                        + b
+                        + " unexpected (filePath, pos)=("
+                        + filePathVal
+                        + ", "
+                        + posVal
+                        + ")");
+              }
+            }
           }
         }
       }
@@ -808,7 +885,7 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
                 + expected.iterator().next());
       }
       LOG.info(
-          "ParquetIndexHandlerWithEmbeddedMetadata validateWrittenFile: OK ({} rows across {} blocks)",
+          "ParquetIndexHandlerWithEmbeddedFiles validateWrittenFile: OK ({} rows across {} embedded parquet files)",
           totalNonPadding,
           numBuckets);
     }
@@ -1164,89 +1241,6 @@ public class ParquetIndexHandlerWithEmbeddedFiles implements IndexHandler {
   // -----------------------------------------------------------------------
   // Iceberg → parquet-mr InputFile adapters
   // -----------------------------------------------------------------------
-
-  /**
-   * parquet-mr {@link org.apache.parquet.io.OutputFile} that hands out the SAME already-open {@link
-   * org.apache.parquet.io.PositionOutputStream} every time {@code create*()} is called. Lets {@link
-   * Writer#close()} share one underlying stream between manual meta-block writes and an outer
-   * {@link ParquetFileWriter} that calls {@code start() / appendRowGroup() / end()} on the same
-   * bytes -- so MAGIC, the row-group payload copy, and the standard Parquet footer all land in the
-   * right place without us having to drive the file pointer ourselves.
-   */
-  private static final class SharedStreamParquetOutputFile
-      implements org.apache.parquet.io.OutputFile {
-    private final org.apache.parquet.io.PositionOutputStream stream;
-
-    SharedStreamParquetOutputFile(org.apache.parquet.io.PositionOutputStream stream) {
-      this.stream = stream;
-    }
-
-    @Override
-    public org.apache.parquet.io.PositionOutputStream create(long blockSizeHint) {
-      return stream;
-    }
-
-    @Override
-    public org.apache.parquet.io.PositionOutputStream createOrOverwrite(long blockSizeHint) {
-      return stream;
-    }
-
-    @Override
-    public boolean supportsBlockSize() {
-      return false;
-    }
-
-    @Override
-    public long defaultBlockSize() {
-      return 0L;
-    }
-  }
-
-  /**
-   * Wraps an Iceberg {@link PositionOutputStream} as a parquet-mr {@link
-   * org.apache.parquet.io.PositionOutputStream}. {@link #close()} is a deliberate no-op because the
-   * surrounding try-with-resources owns the underlying Iceberg stream's lifecycle; {@link
-   * ParquetFileWriter#end} would otherwise close the stream out from under us before the outer
-   * block could flush it.
-   */
-  private static final class IcebergParquetPositionOutputStream
-      extends org.apache.parquet.io.PositionOutputStream {
-    private final PositionOutputStream delegate;
-
-    IcebergParquetPositionOutputStream(PositionOutputStream delegate) {
-      this.delegate = delegate;
-    }
-
-    @Override
-    public long getPos() throws IOException {
-      return delegate.getPos();
-    }
-
-    @Override
-    public void write(int b) throws IOException {
-      delegate.write(b);
-    }
-
-    @Override
-    public void write(byte[] b) throws IOException {
-      delegate.write(b);
-    }
-
-    @Override
-    public void write(byte[] b, int off, int len) throws IOException {
-      delegate.write(b, off, len);
-    }
-
-    @Override
-    public void flush() throws IOException {
-      delegate.flush();
-    }
-
-    @Override
-    public void close() {
-      // owned by Writer.close()'s try-with-resources
-    }
-  }
 
   /** Wraps a byte[] buffer as a parquet-mr InputFile (used to re-read in-memory bucket files). */
   private static final class ByteArrayParquetInputFile implements org.apache.parquet.io.InputFile {
