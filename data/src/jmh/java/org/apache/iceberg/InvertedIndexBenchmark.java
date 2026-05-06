@@ -39,6 +39,7 @@ import org.apache.iceberg.index.IndexHandler;
 import org.apache.iceberg.index.MinimalPerfectHashFunctionIndexHandler;
 import org.apache.iceberg.index.ParquetIndexHandler;
 import org.apache.iceberg.index.ParquetIndexHandlerWithConcatenatedBuckets;
+import org.apache.iceberg.index.ParquetIndexHandlerWithEmbeddedFiles;
 import org.apache.iceberg.index.ParquetIndexHandlerWithEmbeddedMetadata;
 import org.apache.iceberg.index.ParquetIndexHandlerWithHashedRowGroups;
 import org.apache.iceberg.index.UltraCompactHasherIndexHandler;
@@ -134,7 +135,8 @@ public class InvertedIndexBenchmark {
 
   /**
    * Index format and (for Parquet) row group size, encoded as {@code "PARQUET_<rows>"}, {@code
-   * "UCH_<kLimit>"}, {@code "HASH_<rows>"}, {@code "PHASH_<rows>"} or {@code "MPHF"}. {@link
+   * "UCH_<kLimit>"}, {@code "HASH_<rows>"}, {@code "PHASH_<rows>"}, {@code "EPHASH_<rows>"},
+   * {@code "EFILES_<rows>"}, {@code "CBUCKETS_<rows>"} or {@code "MPHF"}. {@link
    * #setupBenchmark()} parses it into the {@code is*} flags and the corresponding numeric
    * parameter.
    */
@@ -152,12 +154,17 @@ public class InvertedIndexBenchmark {
     //    "EPHASH_5000",
     //    "EPHASH_10000",
     //    "EPHASH_20000",
-    "EPHASH_50000",
-    "CBUCKETS_2000",
-    "CBUCKETS_5000",
-    "CBUCKETS_10000",
-    "CBUCKETS_20000",
-    "CBUCKETS_50000"
+    "EPHASH_2000",
+    "EFILES_2000",
+//    "EFILES_5000",
+//    "EFILES_10000",
+//    "EFILES_20000",
+//    "EFILES_50000",
+//    "CBUCKETS_2000",
+//    "CBUCKETS_5000",
+//    "CBUCKETS_10000",
+//    "CBUCKETS_20000",
+//    "CBUCKETS_50000"
   })
   private String indexType;
 
@@ -167,6 +174,7 @@ public class InvertedIndexBenchmark {
   private boolean isHash;
   private boolean isPhash;
   private boolean isEphash;
+  private boolean isEfiles;
   private boolean isCbuckets;
   private int bucketRows;
   private int kLimit;
@@ -231,6 +239,9 @@ public class InvertedIndexBenchmark {
     } else if (isEphash) {
       this.indexHandler =
           new ParquetIndexHandlerWithEmbeddedMetadata(keySchema, bucketRows, numRows);
+    } else if (isEfiles) {
+      this.indexHandler =
+          new ParquetIndexHandlerWithEmbeddedFiles(keySchema, bucketRows, numRows);
     } else if (isCbuckets) {
       this.indexHandler =
           new ParquetIndexHandlerWithConcatenatedBuckets(keySchema, bucketRows, numRows);
@@ -337,6 +348,10 @@ public class InvertedIndexBenchmark {
       fileName =
           String.format(
               Locale.ROOT, "idx-%s-rows%d-ephash-rg%drows.bin", keyType, numRows, bucketRows);
+    } else if (isEfiles) {
+      fileName =
+          String.format(
+              Locale.ROOT, "idx-%s-rows%d-efiles-rg%drows.parquet", keyType, numRows, bucketRows);
     } else if (isCbuckets) {
       fileName =
           String.format(
@@ -356,6 +371,7 @@ public class InvertedIndexBenchmark {
     this.isHash = false;
     this.isPhash = false;
     this.isEphash = false;
+    this.isEfiles = false;
     this.isCbuckets = false;
     this.bucketRows = -1;
     this.kLimit = -1;
@@ -389,6 +405,12 @@ public class InvertedIndexBenchmark {
       return;
     }
 
+    if (indexType.regionMatches(true, 0, "EFILES_", 0, "EFILES_".length())) {
+      this.isEfiles = true;
+      this.bucketRows = Integer.parseInt(indexType.substring("EFILES_".length()));
+      return;
+    }
+
     if (indexType.regionMatches(true, 0, "CBUCKETS_", 0, "CBUCKETS_".length())) {
       this.isCbuckets = true;
       this.bucketRows = Integer.parseInt(indexType.substring("CBUCKETS_".length()));
@@ -404,7 +426,7 @@ public class InvertedIndexBenchmark {
         "Unknown indexType: "
             + indexType
             + " (expected MPHF, UCH_<kLimit>, HASH_<rows>, PHASH_<rows>,"
-            + " EPHASH_<rows>, CBUCKETS_<rows> or PARQUET_<rows>)");
+            + " EPHASH_<rows>, EFILES_<rows>, CBUCKETS_<rows> or PARQUET_<rows>)");
   }
 
   /**
