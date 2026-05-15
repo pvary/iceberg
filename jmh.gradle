@@ -70,13 +70,6 @@ configure(jmhProjects) {
       jmhImplementation project(':iceberg-aws-bundle')
       jmhImplementation project(':iceberg-azure')
       jmhImplementation project(':iceberg-azure-bundle')
-      // Azure SDK types are compileOnly in :iceberg-azure (provided at runtime by
-      // :iceberg-azure-bundle); pull them onto the JMH compile classpath so benchmarks
-      // can reference HttpPipelinePolicy / DataLakeFileSystemClient / Mono directly.
-      jmhCompileOnly platform(libs.azuresdk.bom)
-      jmhCompileOnly "com.azure:azure-storage-file-datalake"
-      jmhCompileOnly "com.azure:azure-core"
-      jmhCompileOnly "io.projectreactor:reactor-core:3.6.5"
       // MphfIndexBenchmark / MphfIndexFile. Pulls in fastutil + dsiutils transitively.
       jmhImplementation ('it.unimi.dsi:sux4j:5.4.1') {
           exclude group: 'ch.qos.logback'
