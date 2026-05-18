@@ -113,6 +113,40 @@ public class InvertedIndexBenchmark {
   /** Number of source data files referenced by the index. */
   private static final int NUM_SOURCE_FILES = 1024 * 1024;
 
+  /**
+   * Number of distinct Spark write queries that produced the source data files. Each query gets
+   * its own randomly-generated {@code queryId} (UUID), and the {@link #NUM_SOURCE_FILES} are
+   * distributed evenly across them. Kept small (a handful) to mimic a table populated by "a few"
+   * inserts.
+   */
+  private static final int NUM_QUERIES = 4;
+
+  /**
+   * Base location used in the synthetic Spark-style data file paths. Unpartitioned table => files
+   * live directly under {@code <table>/data/}.
+   */
+  private static final String DATA_LOCATION = "s3://bucket/warehouse/db/tbl/data";
+
+  /**
+   * Pre-computed Spark-style data file paths, indexed by source file index in {@code [0,
+   * NUM_SOURCE_FILES)}. Built once in {@link #setupBenchmark()} so the writer and the lookup
+   * verifier observe identical strings.
+   *
+   * <p>File-name pattern (see {@code OutputFileFactory}):
+   *
+   * <pre>{partitionId:05d}-{taskId}-{queryId}-{epochId:05d}-{fileCount:05d}.parquet</pre>
+   *
+   * <ul>
+   *   <li>{@code queryId} - one of {@link #NUM_QUERIES} random UUIDs (a few INSERT queries)
+   *   <li>{@code epochId} - always {@code 0} (batch writes / streaming epoch 0; the query
+   *       succeeded on the first attempt so no retried operation ids)
+   *   <li>{@code partitionId} / {@code taskId} - vary across files within a single query to
+   *       simulate multiple writer tasks
+   *   <li>{@code fileCount} - {@code 0} (one file per writer, which is the common case)
+   * </ul>
+   */
+  private String[] sourceFilePaths;
+
   /** Number of pre-generated lookup keys to rotate through during measurement. */
   private static final int NUM_LOOKUP_KEYS = 1024 * 1024;
 
@@ -140,10 +174,10 @@ public class InvertedIndexBenchmark {
    * it into the {@code is*} flags and the corresponding numeric parameter.
    */
   @Param({
-    //    "PARQUET_10000",
-    //    "PARQUET_5000",
-    //    "PARQUET_20000",
-    //    "PARQUET_50000",
+        "PARQUET_10000",
+        "PARQUET_5000",
+        "PARQUET_20000",
+        "PARQUET_50000",
     //    "MPHF",
     //    "HASH_2000",
     //    "HASH_5000",
@@ -153,8 +187,8 @@ public class InvertedIndexBenchmark {
     //    "EPHASH_5000",
     //    "EPHASH_10000",
     //    "EPHASH_20000",
-    "EPHASH_2000",
-    "EFILES_2000",
+//    "EPHASH_2000",
+//    "EFILES_2000",
     //    "EFILES_5000",
     //    "EFILES_10000",
     //    "EFILES_20000",
@@ -225,6 +259,7 @@ public class InvertedIndexBenchmark {
         System.getProperty(PURGE_CACHE_PROP),
         System.getProperty("os.name"));
     parseIndexType();
+    this.sourceFilePaths = buildSparkStyleSourceFilePaths();
     this.keySchema = buildKeySchema(keyType);
     if (isMphf) {
       this.indexHandler = new MinimalPerfectHashFunctionIndexHandler(keySchema, numRows);
@@ -500,13 +535,12 @@ public class InvertedIndexBenchmark {
 
   @Benchmark
   @Threads(1)
-  @Warmup(iterations = 100)
-  @Measurement(iterations = 1000)
+  @Warmup(iterations = 0)
+  @Measurement(iterations = 1)
   public void lookup(Blackhole bh, ReadCounter ioCounter) throws Exception {
     int idx = lookupCursor++ & (NUM_LOOKUP_KEYS - 1);
     long expectedPos = expectedPositions[idx];
-    String expectedFilePath =
-        "s3://bucket/warehouse/db/tbl/data/file-" + (expectedPos % NUM_SOURCE_FILES) + ".parquet";
+    String expectedFilePath = sourceFilePaths[(int) (expectedPos % NUM_SOURCE_FILES)];
 
     try (IndexHandler.Reader reader = indexHandler.reader(io.newInputFile(fileLocation))) {
       IndexHandler.Hit hit = reader.lookup(lookupKeyRecords[idx]);
@@ -634,8 +668,7 @@ public class InvertedIndexBenchmark {
                 allLongs[row],
                 allUuids == null ? null : allUuids[row],
                 allStrings == null ? null : allStrings[row]);
-        String filePath =
-            "s3://bucket/warehouse/db/tbl/data/file-" + (row % NUM_SOURCE_FILES) + ".parquet";
+        String filePath = sourceFilePaths[row % NUM_SOURCE_FILES];
         writer.add(keyRecord, filePath, row);
       }
     }
@@ -644,6 +677,55 @@ public class InvertedIndexBenchmark {
   // --------------------------------------------------------------------------
   // helpers
   // --------------------------------------------------------------------------
+
+  /**
+   * Builds {@link #NUM_SOURCE_FILES} synthetic data file paths that mimic what Spark's {@code
+   * OutputFileFactory} would produce for an unpartitioned Iceberg table written by {@link
+   * #NUM_QUERIES} successful INSERTs, each fanned out across multiple writer tasks.
+   *
+   * <p>File name pattern:
+   *
+   * <pre>{partitionId:05d}-{taskId}-{queryId}-{epochId:05d}-{fileCount:05d}.parquet</pre>
+   *
+   * Per-file field assignment:
+   *
+   * <ul>
+   *   <li>{@code queryId} - one of {@link #NUM_QUERIES} fixed-seed random UUIDs (so the same
+   *       table layout is reproduced across JVM runs)
+   *   <li>{@code epochId} = {@code 0} - the query succeeded on the first try
+   *   <li>{@code partitionId} = {@code taskId} = the file's index within its query - models
+   *       multiple writer tasks each producing one file
+   *   <li>{@code fileCount} = {@code 0} - one output file per writer task
+   * </ul>
+   */
+  private static String[] buildSparkStyleSourceFilePaths() {
+    // Seeded RNG so the generated queryIds (and therefore the full path strings) are stable
+    // across JVM runs: the writer and the lookup verifier must see byte-identical paths.
+    Random rand = new Random(SEED ^ 0xC0FFEE_BEEFL);
+    String[] queryIds = new String[NUM_QUERIES];
+    for (int q = 0; q < NUM_QUERIES; q++) {
+      queryIds[q] = new UUID(rand.nextLong(), rand.nextLong()).toString();
+    }
+
+    int filesPerQuery = (NUM_SOURCE_FILES + NUM_QUERIES - 1) / NUM_QUERIES;
+    String[] paths = new String[NUM_SOURCE_FILES];
+    for (int i = 0; i < NUM_SOURCE_FILES; i++) {
+      int queryIdx = i / filesPerQuery;
+      int taskIdx = i % filesPerQuery; // distinct writer task within the query
+      String name =
+          String.format(
+              Locale.ROOT,
+              "%05d-%d-%s-%05d-%05d.parquet",
+              taskIdx, // partitionId
+              taskIdx, // taskId
+              queryIds[queryIdx],
+              0, // epochId - first (and only) attempt
+              0); // fileCount - one file per writer
+      paths[i] = DATA_LOCATION + "/" + name;
+    }
+
+    return paths;
+  }
 
   /** Builds the key-only schema (no payload columns). Used to configure the index handler. */
   private static Schema buildKeySchema(KeyType type) {
