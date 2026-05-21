@@ -41,6 +41,7 @@ import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Types;
+import org.apache.parquet.column.ParquetProperties;
 
 /**
  * Parquet-backed inverted-index file format.
@@ -302,6 +303,7 @@ public class ParquetIndexHandler implements IndexHandler {
       return Parquet.write(output)
           .schema(schema)
           .createWriterFunc(GenericParquetWriter::create)
+          .writerVersion(ParquetProperties.WriterVersion.PARQUET_2_0)
           .set(TableProperties.PARQUET_COMPRESSION, "zstd")
           .set(TableProperties.PARQUET_ROW_GROUP_SIZE_BYTES, "1")
           .set(TableProperties.PARQUET_ROW_GROUP_CHECK_MIN_RECORD_COUNT, rgRows)

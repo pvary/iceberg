@@ -34,6 +34,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.iceberg.data.GenericRecord;
 import org.apache.iceberg.data.Record;
+import org.apache.iceberg.index.AvroIndexHandler;
 import org.apache.iceberg.index.HashIndexHandler;
 import org.apache.iceberg.index.IndexHandler;
 import org.apache.iceberg.index.MinimalPerfectHashFunctionIndexHandler;
@@ -122,6 +123,15 @@ public class InvertedIndexBenchmark {
   private static final int NUM_QUERIES = 4;
 
   /**
+   * Number of output files produced by a single Spark writer task. Real Spark writers roll over
+   * to a new file whenever the current one hits {@code write.target-file-size-bytes}, so a long
+   * task typically emits several files with monotonically increasing {@code fileCount}. Bumping
+   * this above {@code 1} reduces the {@code taskId} cardinality for a fixed {@link
+   * #NUM_SOURCE_FILES} and makes the synthetic layout look more like a realistic insert.
+   */
+  private static final int FILES_PER_TASK = 16;
+
+  /**
    * Base location used in the synthetic Spark-style data file paths. Unpartitioned table => files
    * live directly under {@code <table>/data/}.
    */
@@ -142,8 +152,9 @@ public class InvertedIndexBenchmark {
    *       succeeded on the first attempt so no retried operation ids)
    *   <li>{@code partitionId} / {@code taskId} - vary across files within a single query to
    *       simulate multiple writer tasks
-   *   <li>{@code fileCount} - {@code 0} (one file per writer, which is the common case)
-   * </ul>
+   *   <li>{@code fileCount} - {@code 0..FILES_PER_TASK-1} (writer rolled over to a new file
+   *       when the previous one hit the target file size)
+   *   </ul>
    */
   private String[] sourceFilePaths;
 
@@ -174,10 +185,8 @@ public class InvertedIndexBenchmark {
    * it into the {@code is*} flags and the corresponding numeric parameter.
    */
   @Param({
-        "PARQUET_10000",
-        "PARQUET_5000",
-        "PARQUET_20000",
-        "PARQUET_50000",
+        "PARQUET_400000",
+        "AVRO_400000",
     //    "MPHF",
     //    "HASH_2000",
     //    "HASH_5000",
@@ -209,6 +218,7 @@ public class InvertedIndexBenchmark {
   private boolean isEphash;
   private boolean isEfiles;
   private boolean isCbuckets;
+  private boolean isAvro;
   private int bucketRows;
   private int kLimit;
 
@@ -236,8 +246,17 @@ public class InvertedIndexBenchmark {
   private UUID[] uuidKeys; // used for UUID type
   private Record[] lookupKeyRecords; // one Record per lookup key, matching keySchema
 
-  /** The row index the sampled lookup key came from. Used to validate {@code lookup()} hits. */
+  /**
+   * The {@code pos} the writer stored for each sampled lookup key. Decoupled from the row index
+   * via {@link #allPositions} so {@code pos} is not trivially predictable from the key.
+   */
   private long[] expectedPositions;
+
+  /**
+   * The row index each sampled lookup key came from. Needed to recover the expected
+   * {@code filePath} (which is still indexed by row, see {@link #writeIndex()}).
+   */
+  private int[] expectedRows;
 
   private int lookupCursor;
 
@@ -246,6 +265,31 @@ public class InvertedIndexBenchmark {
   private long[] allLongs;
   private UUID[] allUuids;
   private String[] allStrings;
+
+  /**
+   * Random permutation of {@code [0, numRows)} stored as {@code long}s. {@code allPositions[row]}
+   * is the {@code pos} the writer records for the row, so {@code pos} is uncorrelated with the key
+   * (which is still derived from {@code row}).
+   */
+  private long[] allPositions;
+
+  /**
+   * Random permutation of {@code [0, numRows)} that determines the order in which rows are
+   * appended to the index file. With keys derived from {@code row}, iterating rows in shuffled
+   * order means the on-disk sequence of {@code (key, filePath, pos)} tuples is uncorrelated with
+   * the key, mirroring a real workload where inserts arrive out of key order. The verifier still
+   * works because it indexes by {@code row} via {@link #expectedRows} / {@link #expectedPositions}.
+   */
+  private int[] writeOrder;
+
+  /**
+   * Random permutation of {@code [0, NUM_SOURCE_FILES)} used to map a row index to a source file
+   * index. Without this, {@code sourceFilePaths[row % NUM_SOURCE_FILES]} would make the path a
+   * direct function of {@code row} (and therefore of the key), so consecutive keys would share
+   * {@code queryId} / {@code taskId} / {@code fileCount}. The permutation breaks that correlation:
+   * key and {@code file_path} are now independent.
+   */
+  private int[] fileAssignment;
 
   // Counter used by the write benchmark to generate unique destination paths per invocation
   // so repeated iterations don't collide on the same file.
@@ -278,6 +322,8 @@ public class InvertedIndexBenchmark {
     } else if (isCbuckets) {
       this.indexHandler =
           new ParquetIndexHandlerWithConcatenatedBuckets(keySchema, bucketRows, numRows);
+    } else if (isAvro) {
+      this.indexHandler = new AvroIndexHandler(keySchema, bucketRows, numRows);
     } else {
       this.indexHandler = new ParquetIndexHandler(keySchema, bucketRows, numRows);
     }
@@ -319,19 +365,64 @@ public class InvertedIndexBenchmark {
       }
     }
 
+    // Build a random permutation of [0, numRows) to use as per-row positions, so the recorded
+    // `pos` is uncorrelated with the key (which is still derived from `row`).
+    Random posRand = new Random(SEED ^ 0xB0BAFE77L);
+    allPositions = new long[numRows];
+    for (int i = 0; i < numRows; i++) {
+      allPositions[i] = i;
+    }
+    for (int i = numRows - 1; i > 0; i--) {
+      int j = posRand.nextInt(i + 1);
+      long tmp = allPositions[i];
+      allPositions[i] = allPositions[j];
+      allPositions[j] = tmp;
+    }
+
+    // Independent random permutation of the row indices used as the write order, so the on-disk
+    // sequence of (key, filePath, pos) tuples is uncorrelated with the key.
+    Random orderRand = new Random(SEED ^ 0xD15EA5EDL);
+    writeOrder = new int[numRows];
+    for (int i = 0; i < numRows; i++) {
+      writeOrder[i] = i;
+    }
+    for (int i = numRows - 1; i > 0; i--) {
+      int j = orderRand.nextInt(i + 1);
+      int tmp = writeOrder[i];
+      writeOrder[i] = writeOrder[j];
+      writeOrder[j] = tmp;
+    }
+
+    // Independent random permutation of [0, NUM_SOURCE_FILES) so the file path each row maps to
+    // is uncorrelated with the key. Built once with a fixed seed so the writer and the lookup
+    // verifier agree on the row -> filePath mapping across runs.
+    Random fileRand = new Random(SEED ^ 0xF11EA551L);
+    fileAssignment = new int[NUM_SOURCE_FILES];
+    for (int i = 0; i < NUM_SOURCE_FILES; i++) {
+      fileAssignment[i] = i;
+    }
+    for (int i = NUM_SOURCE_FILES - 1; i > 0; i--) {
+      int j = fileRand.nextInt(i + 1);
+      int tmp = fileAssignment[i];
+      fileAssignment[i] = fileAssignment[j];
+      fileAssignment[j] = tmp;
+    }
+
     // Sample lookup keys uniformly from the row range.
     Random rand = new Random(SEED);
     longKeys = new long[NUM_LOOKUP_KEYS];
     stringKeys = new String[NUM_LOOKUP_KEYS];
     uuidKeys = new UUID[NUM_LOOKUP_KEYS];
     expectedPositions = new long[NUM_LOOKUP_KEYS];
+    expectedRows = new int[NUM_LOOKUP_KEYS];
     lookupKeyRecords = new Record[NUM_LOOKUP_KEYS];
     for (int i = 0; i < NUM_LOOKUP_KEYS; i++) {
       int row = rand.nextInt(numRows);
       longKeys[i] = allLongs[row];
       stringKeys[i] = allStrings == null ? null : allStrings[row];
       uuidKeys[i] = allUuids == null ? null : allUuids[row];
-      expectedPositions[i] = row;
+      expectedRows[i] = row;
+      expectedPositions[i] = allPositions[row];
       lookupKeyRecords[i] =
           buildKeyRecord(keySchema, keyType, longKeys[i], uuidKeys[i], stringKeys[i]);
     }
@@ -389,6 +480,10 @@ public class InvertedIndexBenchmark {
       fileName =
           String.format(
               Locale.ROOT, "idx-%s-rows%d-cbuckets-rg%drows.parquet", keyType, numRows, bucketRows);
+    } else if (isAvro) {
+      fileName =
+          String.format(
+              Locale.ROOT, "idx-%s-rows%d-avro-rg%drows.avro", keyType, numRows, bucketRows);
     } else {
       fileName =
           String.format(
@@ -406,6 +501,7 @@ public class InvertedIndexBenchmark {
     this.isEphash = false;
     this.isEfiles = false;
     this.isCbuckets = false;
+    this.isAvro = false;
     this.bucketRows = -1;
     this.kLimit = -1;
 
@@ -450,6 +546,12 @@ public class InvertedIndexBenchmark {
       return;
     }
 
+    if (indexType.regionMatches(true, 0, "AVRO_", 0, "AVRO_".length())) {
+      this.isAvro = true;
+      this.bucketRows = Integer.parseInt(indexType.substring("AVRO_".length()));
+      return;
+    }
+
     if (indexType.regionMatches(true, 0, "PARQUET_", 0, "PARQUET_".length())) {
       this.bucketRows = Integer.parseInt(indexType.substring("PARQUET_".length()));
       return;
@@ -459,7 +561,7 @@ public class InvertedIndexBenchmark {
         "Unknown indexType: "
             + indexType
             + " (expected MPHF, UCH_<kLimit>, HASH_<rows>, PHASH_<rows>,"
-            + " EPHASH_<rows>, EFILES_<rows>, CBUCKETS_<rows> or PARQUET_<rows>)");
+            + " EPHASH_<rows>, EFILES_<rows>, CBUCKETS_<rows>, AVRO_<rows> or PARQUET_<rows>)");
   }
 
   /**
@@ -540,7 +642,7 @@ public class InvertedIndexBenchmark {
   public void lookup(Blackhole bh, ReadCounter ioCounter) throws Exception {
     int idx = lookupCursor++ & (NUM_LOOKUP_KEYS - 1);
     long expectedPos = expectedPositions[idx];
-    String expectedFilePath = sourceFilePaths[(int) (expectedPos % NUM_SOURCE_FILES)];
+    String expectedFilePath = sourceFilePaths[fileAssignment[expectedRows[idx] % NUM_SOURCE_FILES]];
 
     try (IndexHandler.Reader reader = indexHandler.reader(io.newInputFile(fileLocation))) {
       IndexHandler.Hit hit = reader.lookup(lookupKeyRecords[idx]);
@@ -640,6 +742,16 @@ public class InvertedIndexBenchmark {
           seq);
     }
 
+    if (isAvro) {
+      return String.format(
+          Locale.ROOT,
+          "write-idx-%s-rows%d-avro-rg%drows-%d.avro",
+          keyType,
+          numRows,
+          bucketRows,
+          seq);
+    }
+
     return String.format(
         Locale.ROOT,
         "write-idx-%s-rows%d-parquet-rg%drows-%d.parquet",
@@ -660,7 +772,8 @@ public class InvertedIndexBenchmark {
    */
   private void writeIndex() throws Exception {
     try (IndexHandler.Writer writer = indexHandler.writer(io.newOutputFile(fileLocation))) {
-      for (int row = 0; row < numRows; row++) {
+      for (int i = 0; i < numRows; i++) {
+        int row = writeOrder[i];
         Record keyRecord =
             buildKeyRecord(
                 keySchema,
@@ -668,8 +781,8 @@ public class InvertedIndexBenchmark {
                 allLongs[row],
                 allUuids == null ? null : allUuids[row],
                 allStrings == null ? null : allStrings[row]);
-        String filePath = sourceFilePaths[row % NUM_SOURCE_FILES];
-        writer.add(keyRecord, filePath, row);
+        String filePath = sourceFilePaths[fileAssignment[row % NUM_SOURCE_FILES]];
+        writer.add(keyRecord, filePath, allPositions[row]);
       }
     }
   }
@@ -693,9 +806,9 @@ public class InvertedIndexBenchmark {
    *   <li>{@code queryId} - one of {@link #NUM_QUERIES} fixed-seed random UUIDs (so the same
    *       table layout is reproduced across JVM runs)
    *   <li>{@code epochId} = {@code 0} - the query succeeded on the first try
-   *   <li>{@code partitionId} = {@code taskId} = the file's index within its query - models
-   *       multiple writer tasks each producing one file
-   *   <li>{@code fileCount} = {@code 0} - one output file per writer task
+   *   <li>{@code partitionId} = {@code taskId} = the writer task's index within its query
+   *   <li>{@code fileCount} = {@code 0..FILES_PER_TASK-1} - each task rolls over to a new
+   *       output file every {@link #FILES_PER_TASK} files
    * </ul>
    */
   private static String[] buildSparkStyleSourceFilePaths() {
@@ -711,16 +824,18 @@ public class InvertedIndexBenchmark {
     String[] paths = new String[NUM_SOURCE_FILES];
     for (int i = 0; i < NUM_SOURCE_FILES; i++) {
       int queryIdx = i / filesPerQuery;
-      int taskIdx = i % filesPerQuery; // distinct writer task within the query
+      int withinQuery = i % filesPerQuery;
+      int taskIdx = withinQuery / FILES_PER_TASK; // one writer task -> FILES_PER_TASK outputs
+      int fileCount = withinQuery % FILES_PER_TASK; // rolls over within a task
       String name =
           String.format(
               Locale.ROOT,
               "%05d-%d-%s-%05d-%05d.parquet",
               taskIdx, // partitionId
-              taskIdx, // taskId
+              taskIdx % 128, // taskId
               queryIds[queryIdx],
               0, // epochId - first (and only) attempt
-              0); // fileCount - one file per writer
+              fileCount); // file index within this writer task
       paths[i] = DATA_LOCATION + "/" + name;
     }
 
@@ -761,9 +876,11 @@ public class InvertedIndexBenchmark {
     return record;
   }
 
+    private static final long LONG_KEY_BASE = 1_000_000L;
+
   private static Object[] generateKey(KeyType type, int row, Random rand) {
     return switch (type) {
-      case LONG -> new Object[] {rand.nextLong() & 0x0FFFFFFFFFFFFFFFL};
+      case LONG -> new Object[] {LONG_KEY_BASE + row};
       case UUID -> new Object[] {new UUID(rand.nextLong(), rand.nextLong())};
       case STRING -> new Object[] {randomString(rand, 24)};
       case COMPOSITE -> new Object[] {(long) row, randomString(rand, 16)};
@@ -807,7 +924,7 @@ public class InvertedIndexBenchmark {
 
     Storage storage = selectedStorage();
     if (storage == Storage.LOCAL) {
-      File benchDir = new File("data/benchmark/inverted-index");
+      File benchDir = new File("data/benchmark/inverted-index3");
       if (!benchDir.exists() && !benchDir.mkdirs()) {
         throw new IllegalStateException(
             "Could not create benchmark dir: " + benchDir.getAbsolutePath());
@@ -893,6 +1010,9 @@ public class InvertedIndexBenchmark {
       long tp = expectedPositions[i];
       expectedPositions[i] = expectedPositions[j];
       expectedPositions[j] = tp;
+      int tr0 = expectedRows[i];
+      expectedRows[i] = expectedRows[j];
+      expectedRows[j] = tr0;
       if (lookupKeyRecords != null) {
         Record tr = lookupKeyRecords[i];
         lookupKeyRecords[i] = lookupKeyRecords[j];
