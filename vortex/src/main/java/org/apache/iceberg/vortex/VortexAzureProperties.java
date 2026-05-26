@@ -44,6 +44,22 @@ public class VortexAzureProperties implements ObjectStoreProperties {
     return this;
   }
 
+  /**
+   * Tells the underlying Rust object_store backend to obtain credentials from a logged-in Azure CLI
+   * session ({@code az login}). Useful for local development / benchmarking against ADLS without
+   * provisioning a SAS token or account key.
+   */
+  public VortexAzureProperties setUseAzureCli(boolean useAzureCli) {
+    properties.put(USE_AZURE_CLI, String.valueOf(useAzureCli));
+    return this;
+  }
+
+  /** Sets a pre-acquired OAuth bearer token (e.g. from {@code az account get-access-token}). */
+  public VortexAzureProperties setBearerToken(String bearerToken) {
+    properties.put(BEARER_TOKEN, bearerToken);
+    return this;
+  }
+
   @Override
   public Map<String, String> asProperties() {
     return ImmutableMap.copyOf(properties);

@@ -18,12 +18,16 @@
  */
 package org.apache.iceberg.spark.data;
 
-import dev.vortex.api.Array;
-import dev.vortex.api.DType;
 import java.util.List;
 import java.util.Map;
+import org.apache.arrow.vector.FieldVector;
+import org.apache.arrow.vector.VectorSchemaRoot;
+import org.apache.arrow.vector.types.TimeUnit;
+import org.apache.arrow.vector.types.pojo.ArrowType;
+import org.apache.arrow.vector.types.pojo.Field;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.data.vortex.GenericVortexReaders;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.types.Type;
 import org.apache.iceberg.types.Types;
 import org.apache.iceberg.vortex.VortexRowReader;
@@ -34,16 +38,31 @@ import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
 
 /** Read Vortex as Spark {@link InternalRow}. */
 public class SparkVortexReader implements VortexRowReader<InternalRow> {
-  private final VortexValueReader<?> reader;
+  private final List<VortexValueReader<?>> fieldReaders;
 
-  public SparkVortexReader(Schema readSchema, DType vortexSchema, Map<Integer, ?> idToConstant) {
-    this.reader =
-        VortexSchemaWithTypeVisitor.visit(readSchema, vortexSchema, SparkReadBuilder.INSTANCE);
+  public SparkVortexReader(
+      Schema readSchema,
+      org.apache.arrow.vector.types.pojo.Schema fileArrowSchema,
+      Map<Integer, ?> idToConstant) {
+    List<Field> fields = fileArrowSchema.getFields();
+    List<Types.NestedField> expected = readSchema.columns();
+    this.fieldReaders = Lists.newArrayListWithExpectedSize(expected.size());
+    for (int i = 0; i < expected.size(); i++) {
+      Type icebergType = expected.get(i).type();
+      Field arrowField = fields.get(i);
+      this.fieldReaders.add(
+          VortexSchemaWithTypeVisitor.visit(icebergType, arrowField, SparkReadBuilder.INSTANCE));
+    }
   }
 
   @Override
-  public InternalRow read(Array batch, int row) {
-    return (InternalRow) reader.read(batch, row);
+  public InternalRow read(VectorSchemaRoot batch, int row) {
+    GenericInternalRow result = new GenericInternalRow(fieldReaders.size());
+    for (int i = 0; i < fieldReaders.size(); i++) {
+      VortexValueReader<?> reader = fieldReaders.get(i);
+      result.update(i, reader.read(batch.getVector(i), row));
+    }
+    return result;
   }
 
   static class SparkReadBuilder extends VortexSchemaWithTypeVisitor<VortexValueReader<?>> {
@@ -53,21 +72,18 @@ public class SparkVortexReader implements VortexRowReader<InternalRow> {
 
     @Override
     public VortexValueReader<?> struct(
-        Types.StructType schema,
-        List<DType> types,
-        List<String> names,
-        List<VortexValueReader<?>> fields) {
-      return new StructReader(fields);
+        Types.StructType schema, List<Field> fields, List<VortexValueReader<?>> children) {
+      return new StructReader(children);
     }
 
     @Override
     public VortexValueReader<?> list(
-        Types.ListType iList, DType array, VortexValueReader<?> element) {
+        Types.ListType iList, Field listField, VortexValueReader<?> element) {
       throw new UnsupportedOperationException("Vortex LIST types are not supported yet");
     }
 
     @Override
-    public VortexValueReader<?> primitive(Type.PrimitiveType icebergType, DType vortexType) {
+    public VortexValueReader<?> primitive(Type.PrimitiveType icebergType, Field primField) {
       switch (icebergType.typeId()) {
         case BOOLEAN:
           return GenericVortexReaders.bools();
@@ -82,19 +98,20 @@ public class SparkVortexReader implements VortexRowReader<InternalRow> {
         case STRING:
           return SparkVortexValueReaders.utf8String();
         case BINARY:
-          // Spark expects binary to be in another format, no?
           return GenericVortexReaders.bytes();
         case DECIMAL:
           return GenericVortexReaders.decimals();
         case TIMESTAMP:
         case TIMESTAMP_NANO:
-          // TODO(aduffy): timestamp and date types
-          return SparkVortexValueReaders.timestamp(vortexType.getTimeUnit());
+          {
+            ArrowType.Timestamp ts = (ArrowType.Timestamp) primField.getType();
+            return SparkVortexValueReaders.timestamp(ts.getUnit());
+          }
         case DATE:
-          // TODO(aduffy): timestamp and date types
-          return SparkVortexValueReaders.date(vortexType.getTimeUnit());
+          return SparkVortexValueReaders.date();
+        case UUID:
+          return SparkVortexValueReaders.uuid();
         case TIME:
-          // TODO(aduffy): timestamp and date types
         default:
           throw new UnsupportedOperationException("Unsupported type: " + icebergType);
       }
@@ -109,14 +126,20 @@ public class SparkVortexReader implements VortexRowReader<InternalRow> {
     }
 
     @Override
-    public InternalRow readNonNull(Array array, int row) {
+    public InternalRow readNonNull(FieldVector vector, int row) {
+      org.apache.arrow.vector.complex.StructVector struct =
+          (org.apache.arrow.vector.complex.StructVector) vector;
       GenericInternalRow result = new GenericInternalRow(fields.size());
       for (int i = 0; i < fields.size(); i++) {
         VortexValueReader<?> fieldReader = fields.get(i);
-        Object field = fieldReader.read(array.getField(i), row);
-        result.update(i, field);
+        FieldVector child = (FieldVector) struct.getChildByOrdinal(i);
+        result.update(i, fieldReader.read(child, row));
       }
       return result;
     }
   }
+
+  // Silence unused warning that TimeUnit class is required for the public API.
+  @SuppressWarnings("unused")
+  private static final TimeUnit UNUSED = TimeUnit.MICROSECOND;
 }
