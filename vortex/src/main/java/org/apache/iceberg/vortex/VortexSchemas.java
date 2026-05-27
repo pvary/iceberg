@@ -176,14 +176,17 @@ public final class VortexSchemas {
   }
 
   private static Type toIcebergType(Field field) {
-    ArrowType arrowType = field.getType();
-    // UUID is conveyed as the {@code arrow.uuid} extension over FixedSizeBinary(16). Check the
-    // metadata directly so this works whether or not the extension is registered with
-    // ExtensionTypeRegistry (i.e. whether arrowType deserialized to ExtensionType or stayed as
+    // UUID is conveyed as the {@code arrow.uuid} extension over
+    // FixedSizeBinary(16). Check the
+    // metadata directly so this works whether or not the extension is registered
+    // with
+    // ExtensionTypeRegistry (i.e. whether arrowType deserialized to ExtensionType
+    // or stayed as
     // FixedSizeBinary).
     if (isUuidField(field)) {
       return Types.UUIDType.get();
     }
+    ArrowType arrowType = field.getType();
     if (arrowType instanceof ArrowType.Null) {
       return Types.UnknownType.get();
     } else if (arrowType instanceof ArrowType.Bool) {

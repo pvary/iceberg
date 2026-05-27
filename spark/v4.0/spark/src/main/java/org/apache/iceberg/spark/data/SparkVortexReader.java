@@ -38,6 +38,7 @@ import org.apache.spark.sql.catalyst.expressions.GenericInternalRow;
 
 /** Read Vortex as Spark {@link InternalRow}. */
 public class SparkVortexReader implements VortexRowReader<InternalRow> {
+
   private final List<VortexValueReader<?>> fieldReaders;
 
   public SparkVortexReader(
@@ -66,6 +67,7 @@ public class SparkVortexReader implements VortexRowReader<InternalRow> {
   }
 
   static class SparkReadBuilder extends VortexSchemaWithTypeVisitor<VortexValueReader<?>> {
+
     static final SparkReadBuilder INSTANCE = new SparkReadBuilder();
 
     private SparkReadBuilder() {}
@@ -119,6 +121,7 @@ public class SparkVortexReader implements VortexRowReader<InternalRow> {
   }
 
   static class StructReader implements VortexValueReader<InternalRow> {
+
     private final List<VortexValueReader<?>> fields;
 
     private StructReader(List<VortexValueReader<?>> fields) {
