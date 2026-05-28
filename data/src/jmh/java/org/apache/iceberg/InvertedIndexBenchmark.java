@@ -44,6 +44,7 @@ import org.apache.iceberg.index.ParquetIndexHandlerWithEmbeddedFiles;
 import org.apache.iceberg.index.ParquetIndexHandlerWithEmbeddedMetadata;
 import org.apache.iceberg.index.ParquetIndexHandlerWithHashedRowGroups;
 import org.apache.iceberg.index.UltraCompactHasherIndexHandler;
+import org.apache.iceberg.index.VortexIndexHandler;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
@@ -175,18 +176,20 @@ public class InvertedIndexBenchmark {
   private KeyType keyType;
 
   /** Total rows written into the index file. */
-  @Param({"1000000", "10000000"})
+  @Param({"400000"/*, "1000000", "10000000"*/})
   private int numRows;
 
   /**
    * Index format and (for Parquet) row group size, encoded as {@code "PARQUET_<rows>"}, {@code
    * "UCH_<kLimit>"}, {@code "HASH_<rows>"}, {@code "PHASH_<rows>"}, {@code "EPHASH_<rows>"}, {@code
-   * "EFILES_<rows>"}, {@code "CBUCKETS_<rows>"} or {@code "MPHF"}. {@link #setupBenchmark()} parses
-   * it into the {@code is*} flags and the corresponding numeric parameter.
+   * "EFILES_<rows>"}, {@code "CBUCKETS_<rows>"}, {@code "VORTEX"} or {@code "MPHF"}. {@link
+   * #setupBenchmark()} parses it into the {@code is*} flags and the corresponding numeric
+   * parameter.
    */
   @Param({
         "PARQUET_400000",
-        "AVRO_400000",
+//        "AVRO_400000",
+        "VORTEX",
     //    "MPHF",
     //    "HASH_2000",
     //    "HASH_5000",
@@ -219,6 +222,7 @@ public class InvertedIndexBenchmark {
   private boolean isEfiles;
   private boolean isCbuckets;
   private boolean isAvro;
+  private boolean isVortex;
   private int bucketRows;
   private int kLimit;
 
@@ -324,6 +328,8 @@ public class InvertedIndexBenchmark {
           new ParquetIndexHandlerWithConcatenatedBuckets(keySchema, bucketRows, numRows);
     } else if (isAvro) {
       this.indexHandler = new AvroIndexHandler(keySchema, bucketRows, numRows);
+    } else if (isVortex) {
+      this.indexHandler = new VortexIndexHandler(keySchema);
     } else {
       this.indexHandler = new ParquetIndexHandler(keySchema, bucketRows, numRows);
     }
@@ -484,6 +490,8 @@ public class InvertedIndexBenchmark {
       fileName =
           String.format(
               Locale.ROOT, "idx-%s-rows%d-avro-rg%drows.avro", keyType, numRows, bucketRows);
+    } else if (isVortex) {
+      fileName = String.format(Locale.ROOT, "idx-%s-rows%d-vortex.vortex", keyType, numRows);
     } else {
       fileName =
           String.format(
@@ -502,11 +510,17 @@ public class InvertedIndexBenchmark {
     this.isEfiles = false;
     this.isCbuckets = false;
     this.isAvro = false;
+    this.isVortex = false;
     this.bucketRows = -1;
     this.kLimit = -1;
 
     if ("MPHF".equalsIgnoreCase(indexType)) {
       this.isMphf = true;
+      return;
+    }
+
+    if ("VORTEX".equalsIgnoreCase(indexType)) {
+      this.isVortex = true;
       return;
     }
 
@@ -560,7 +574,7 @@ public class InvertedIndexBenchmark {
     throw new IllegalArgumentException(
         "Unknown indexType: "
             + indexType
-            + " (expected MPHF, UCH_<kLimit>, HASH_<rows>, PHASH_<rows>,"
+            + " (expected MPHF, VORTEX, UCH_<kLimit>, HASH_<rows>, PHASH_<rows>,"
             + " EPHASH_<rows>, EFILES_<rows>, CBUCKETS_<rows>, AVRO_<rows> or PARQUET_<rows>)");
   }
 
@@ -637,8 +651,8 @@ public class InvertedIndexBenchmark {
 
   @Benchmark
   @Threads(1)
-  @Warmup(iterations = 0)
-  @Measurement(iterations = 1)
+  @Warmup(iterations = 101)
+  @Measurement(iterations = 1000)
   public void lookup(Blackhole bh, ReadCounter ioCounter) throws Exception {
     int idx = lookupCursor++ & (NUM_LOOKUP_KEYS - 1);
     long expectedPos = expectedPositions[idx];
@@ -750,6 +764,11 @@ public class InvertedIndexBenchmark {
           numRows,
           bucketRows,
           seq);
+    }
+
+    if (isVortex) {
+      return String.format(
+          Locale.ROOT, "write-idx-%s-rows%d-vortex-%d.vortex", keyType, numRows, seq);
     }
 
     return String.format(

@@ -54,6 +54,48 @@ import org.apache.parquet.schema.Type;
 public class ParquetValueReaders {
   private ParquetValueReaders() {}
 
+  /**
+   * Per-thread holder for the {@code created_by} string from the Parquet file currently being
+   * opened. Set by {@link ReadConf} around the call to the user-supplied reader-builder function
+   * so that {@link PrimitiveReader} -- which constructs its {@link ColumnIterator} before the
+   * file's pages are wired up -- can pass the real writer version down to {@link
+   * BasePageIterator}.
+   *
+   * <p>parquet-mr's {@code CorruptDeltaByteArrays.requiresSequentialReads(createdBy, encoding)}
+   * uses this string to decide whether the file was produced by a writer affected by PARQUET-246.
+   * When it is {@code null} or empty (the old hardcoded {@code ""}), parquet-mr logs
+   * {@code "Requiring sequential reads because file version is empty. See PARQUET-246"} on every
+   * read of a {@code DELTA_BYTE_ARRAY}-encoded column -- the default BINARY encoding for files
+   * written with {@code PARQUET_2_0}.
+   */
+  private static final ThreadLocal<String> CURRENT_FILE_CREATED_BY = new ThreadLocal<>();
+
+  /**
+   * Runs {@code body} with {@code createdBy} exposed via {@link #currentFileCreatedBy()}. Used by
+   * {@link ReadConf} when invoking the user-supplied {@code readerFunc} so any {@link
+   * PrimitiveReader} constructed inside it picks up the real {@code created_by} from the file
+   * footer instead of the empty fallback.
+   */
+  static <R> R withCurrentFileCreatedBy(String createdBy, java.util.function.Supplier<R> body) {
+    String previous = CURRENT_FILE_CREATED_BY.get();
+    CURRENT_FILE_CREATED_BY.set(createdBy);
+    try {
+      return body.get();
+    } finally {
+      if (previous == null) {
+        CURRENT_FILE_CREATED_BY.remove();
+      } else {
+        CURRENT_FILE_CREATED_BY.set(previous);
+      }
+    }
+  }
+
+  /** Returns the {@code created_by} of the file currently being opened, or {@code ""} if none. */
+  static String currentFileCreatedBy() {
+    String value = CURRENT_FILE_CREATED_BY.get();
+    return value != null ? value : "";
+  }
+
   public static <T> ParquetValueReader<T> option(
       Type type, int definitionLevel, ParquetValueReader<T> reader) {
     if (type.isRepetition(Type.Repetition.OPTIONAL)) {
@@ -466,7 +508,7 @@ public class ParquetValueReaders {
 
     protected PrimitiveReader(ColumnDescriptor desc) {
       this.desc = desc;
-      this.column = ColumnIterator.newIterator(desc, "");
+      this.column = ColumnIterator.newIterator(desc, currentFileCreatedBy());
       this.children = ImmutableList.of(column);
     }
 

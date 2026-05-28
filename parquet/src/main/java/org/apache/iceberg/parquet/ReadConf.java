@@ -118,7 +118,13 @@ class ReadConf<T> {
 
     this.totalValues = computedTotalValues;
     if (readerFunc != null) {
-      this.model = (ParquetValueReader<T>) readerFunc.apply(typeWithIds);
+      // Expose the file's created_by to PrimitiveReader so the ColumnIterator it builds
+      // here gets the real writer version (parquet-mr uses it to decide whether the file
+      // is affected by PARQUET-246 for DELTA_BYTE_ARRAY columns).
+      String createdBy = reader.getFileMetaData().getCreatedBy();
+      this.model =
+          ParquetValueReaders.withCurrentFileCreatedBy(
+              createdBy, () -> (ParquetValueReader<T>) readerFunc.apply(typeWithIds));
       this.vectorizedModel = null;
       this.columnChunkMetaDataForRowGroups = null;
     } else {
