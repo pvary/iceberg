@@ -23,10 +23,19 @@ package org.apache.iceberg.index;
 
 import org.apache.iceberg.io.OutputFile;
 
-public interface MetadataHandler  {
-    Writer writer(OutputFile output);
+public interface MetadataHandler {
+  Writer writer(OutputFile output);
 
-    interface Writer extends AutoCloseable {
-        void add(String filePath, long offset, long minValue);
+  interface Writer extends AutoCloseable {
+    default void add(String filePath, String updateFilePath, long minValue, long maxValue) {
+      add(filePath, updateFilePath, minValue, maxValue, null);
     }
+
+    void add(
+        String filePath,
+        String updateFilePath,
+        long minValue,
+        long maxValue,
+        byte[] serializedMumblingBitmap);
+  }
 }
