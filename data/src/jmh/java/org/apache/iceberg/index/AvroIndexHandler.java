@@ -1,22 +1,20 @@
 /*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
  *
- *  * Licensed to the Apache Software Foundation (ASF) under one
- *  * or more contributor license agreements.  See the NOTICE file
- *  * distributed with this work for additional information
- *  * regarding copyright ownership.  The ASF licenses this file
- *  * to you under the Apache License, Version 2.0 (the
- *  * "License"); you may not use this file except in compliance
- *  * with the License.  You may obtain a copy of the License at
- *  *
- *  *   http://www.apache.org/licenses/LICENSE-2.0
- *  *
- *  * Unless required by applicable law or agreed to in writing,
- *  * software distributed under the License is distributed on an
- *  * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- *  * KIND, either express or implied.  See the License for the
- *  * specific language governing permissions and limitations
- *  * under the License.
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
 package org.apache.iceberg.index;
 
@@ -50,14 +48,14 @@ import org.apache.iceberg.types.Types;
  * concatenated with two payload columns: {@code file_path} (string) and {@code pos} (long). Each
  * key column is stored in its declared Iceberg type.
  *
- * <p>Rows are sorted by the key columns at write time so a point lookup can early-exit on the
- * first record whose key is greater than the target. Avro does <em>not</em> support row-group
- * level statistics pruning the way Parquet does, so {@link Reader#lookup(Record)} performs a
- * sequential scan from the start of the file; the cost is therefore {@code O(rowsScanned)} per
- * lookup. The {@link #bucketRows} parameter controls the Avro sync block size in <em>rows</em>
- * (translated to bytes using an empirical row-width estimate) so callers can mirror the same
- * "bucket size" knob exposed by {@link ParquetIndexHandler}; it does not enable any kind of
- * pruning but keeps individual decompression units small.
+ * <p>Rows are sorted by the key columns at write time so a point lookup can early-exit on the first
+ * record whose key is greater than the target. Avro does <em>not</em> support row-group level
+ * statistics pruning the way Parquet does, so {@link Reader#lookup(Record)} performs a sequential
+ * scan from the start of the file; the cost is therefore {@code O(rowsScanned)} per lookup. The
+ * {@link #bucketRows} parameter controls the Avro sync block size in <em>rows</em> (translated to
+ * bytes using an empirical row-width estimate) so callers can mirror the same "bucket size" knob
+ * exposed by {@link ParquetIndexHandler}; it does not enable any kind of pruning but keeps
+ * individual decompression units small.
  *
  * <p>Each handler instance is bound to both a key {@link Schema} and a {@code bucketRows} value.
  */
@@ -78,11 +76,11 @@ public class AvroIndexHandler implements IndexHandler {
   private static final long ESTIMATED_AVRO_ROW_BYTES = 20L;
 
   /**
-   * Avro sync (block) interval in bytes. The Avro {@code DataFileWriter} flushes a compressed
-   * sync block roughly every {@code SYNC_INTERVAL_BYTES} of uncompressed input. Set to 16 MiB
-   * (vs. Avro's 64 KiB default) to amortize codec / sync overhead over many more index rows --
-   * appropriate for write-once, sequentially-scanned index files where small blocks waste IO
-   * but offer no pruning benefit.
+   * Avro sync (block) interval in bytes. The Avro {@code DataFileWriter} flushes a compressed sync
+   * block roughly every {@code SYNC_INTERVAL_BYTES} of uncompressed input. Set to 16 MiB (vs.
+   * Avro's 64 KiB default) to amortize codec / sync overhead over many more index rows --
+   * appropriate for write-once, sequentially-scanned index files where small blocks waste IO but
+   * offer no pruning benefit.
    */
   private static final int SYNC_INTERVAL_BYTES = 16 * 1024 * 1024;
 
@@ -155,8 +153,8 @@ public class AvroIndexHandler implements IndexHandler {
 
   /**
    * Estimates a single sync-block worth of compressed Avro bytes ({@code bucketRows *
-   * ESTIMATED_AVRO_ROW_BYTES}) and rounds up to the next power of two. Floored at 4 KiB, capped
-   * at 16 MiB.
+   * ESTIMATED_AVRO_ROW_BYTES}) and rounds up to the next power of two. Floored at 4 KiB, capped at
+   * 16 MiB.
    *
    * <p>Avro readers always scan from the start, so this hint primarily helps the storage adapter
    * pick a sensible first-GET size when the file is small enough that a single read covers it.
@@ -380,7 +378,3 @@ public class AvroIndexHandler implements IndexHandler {
     }
   }
 }
-
-
-
-

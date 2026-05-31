@@ -115,19 +115,19 @@ public class InvertedIndexBenchmark {
   private static final int NUM_SOURCE_FILES = 1024 * 1024;
 
   /**
-   * Number of distinct Spark write queries that produced the source data files. Each query gets
-   * its own randomly-generated {@code queryId} (UUID), and the {@link #NUM_SOURCE_FILES} are
+   * Number of distinct Spark write queries that produced the source data files. Each query gets its
+   * own randomly-generated {@code queryId} (UUID), and the {@link #NUM_SOURCE_FILES} are
    * distributed evenly across them. Kept small (a handful) to mimic a table populated by "a few"
    * inserts.
    */
   private static final int NUM_QUERIES = 4;
 
   /**
-   * Number of output files produced by a single Spark writer task. Real Spark writers roll over
-   * to a new file whenever the current one hits {@code write.target-file-size-bytes}, so a long
-   * task typically emits several files with monotonically increasing {@code fileCount}. Bumping
-   * this above {@code 1} reduces the {@code taskId} cardinality for a fixed {@link
-   * #NUM_SOURCE_FILES} and makes the synthetic layout look more like a realistic insert.
+   * Number of output files produced by a single Spark writer task. Real Spark writers roll over to
+   * a new file whenever the current one hits {@code write.target-file-size-bytes}, so a long task
+   * typically emits several files with monotonically increasing {@code fileCount}. Bumping this
+   * above {@code 1} reduces the {@code taskId} cardinality for a fixed {@link #NUM_SOURCE_FILES}
+   * and makes the synthetic layout look more like a realistic insert.
    */
   private static final int FILES_PER_TASK = 16;
 
@@ -148,13 +148,13 @@ public class InvertedIndexBenchmark {
    *
    * <ul>
    *   <li>{@code queryId} - one of {@link #NUM_QUERIES} random UUIDs (a few INSERT queries)
-   *   <li>{@code epochId} - always {@code 0} (batch writes / streaming epoch 0; the query
-   *       succeeded on the first attempt so no retried operation ids)
+   *   <li>{@code epochId} - always {@code 0} (batch writes / streaming epoch 0; the query succeeded
+   *       on the first attempt so no retried operation ids)
    *   <li>{@code partitionId} / {@code taskId} - vary across files within a single query to
    *       simulate multiple writer tasks
-   *   <li>{@code fileCount} - {@code 0..FILES_PER_TASK-1} (writer rolled over to a new file
-   *       when the previous one hit the target file size)
-   *   </ul>
+   *   <li>{@code fileCount} - {@code 0..FILES_PER_TASK-1} (writer rolled over to a new file when
+   *       the previous one hit the target file size)
+   * </ul>
    */
   private String[] sourceFilePaths;
 
@@ -185,8 +185,8 @@ public class InvertedIndexBenchmark {
    * it into the {@code is*} flags and the corresponding numeric parameter.
    */
   @Param({
-        "PARQUET_400000",
-        "AVRO_400000",
+    "PARQUET_400000",
+    "AVRO_400000",
     //    "MPHF",
     //    "HASH_2000",
     //    "HASH_5000",
@@ -196,8 +196,8 @@ public class InvertedIndexBenchmark {
     //    "EPHASH_5000",
     //    "EPHASH_10000",
     //    "EPHASH_20000",
-//    "EPHASH_2000",
-//    "EFILES_2000",
+    //    "EPHASH_2000",
+    //    "EFILES_2000",
     //    "EFILES_5000",
     //    "EFILES_10000",
     //    "EFILES_20000",
@@ -247,14 +247,14 @@ public class InvertedIndexBenchmark {
   private Record[] lookupKeyRecords; // one Record per lookup key, matching keySchema
 
   /**
-   * The {@code pos} the writer stored for each sampled lookup key. Decoupled from the row index
-   * via {@link #allPositions} so {@code pos} is not trivially predictable from the key.
+   * The {@code pos} the writer stored for each sampled lookup key. Decoupled from the row index via
+   * {@link #allPositions} so {@code pos} is not trivially predictable from the key.
    */
   private long[] expectedPositions;
 
   /**
-   * The row index each sampled lookup key came from. Needed to recover the expected
-   * {@code filePath} (which is still indexed by row, see {@link #writeIndex()}).
+   * The row index each sampled lookup key came from. Needed to recover the expected {@code
+   * filePath} (which is still indexed by row, see {@link #writeIndex()}).
    */
   private int[] expectedRows;
 
@@ -274,11 +274,11 @@ public class InvertedIndexBenchmark {
   private long[] allPositions;
 
   /**
-   * Random permutation of {@code [0, numRows)} that determines the order in which rows are
-   * appended to the index file. With keys derived from {@code row}, iterating rows in shuffled
-   * order means the on-disk sequence of {@code (key, filePath, pos)} tuples is uncorrelated with
-   * the key, mirroring a real workload where inserts arrive out of key order. The verifier still
-   * works because it indexes by {@code row} via {@link #expectedRows} / {@link #expectedPositions}.
+   * Random permutation of {@code [0, numRows)} that determines the order in which rows are appended
+   * to the index file. With keys derived from {@code row}, iterating rows in shuffled order means
+   * the on-disk sequence of {@code (key, filePath, pos)} tuples is uncorrelated with the key,
+   * mirroring a real workload where inserts arrive out of key order. The verifier still works
+   * because it indexes by {@code row} via {@link #expectedRows} / {@link #expectedPositions}.
    */
   private int[] writeOrder;
 
@@ -803,12 +803,12 @@ public class InvertedIndexBenchmark {
    * Per-file field assignment:
    *
    * <ul>
-   *   <li>{@code queryId} - one of {@link #NUM_QUERIES} fixed-seed random UUIDs (so the same
-   *       table layout is reproduced across JVM runs)
+   *   <li>{@code queryId} - one of {@link #NUM_QUERIES} fixed-seed random UUIDs (so the same table
+   *       layout is reproduced across JVM runs)
    *   <li>{@code epochId} = {@code 0} - the query succeeded on the first try
    *   <li>{@code partitionId} = {@code taskId} = the writer task's index within its query
-   *   <li>{@code fileCount} = {@code 0..FILES_PER_TASK-1} - each task rolls over to a new
-   *       output file every {@link #FILES_PER_TASK} files
+   *   <li>{@code fileCount} = {@code 0..FILES_PER_TASK-1} - each task rolls over to a new output
+   *       file every {@link #FILES_PER_TASK} files
    * </ul>
    */
   private static String[] buildSparkStyleSourceFilePaths() {
@@ -876,7 +876,7 @@ public class InvertedIndexBenchmark {
     return record;
   }
 
-    private static final long LONG_KEY_BASE = 1_000_000L;
+  private static final long LONG_KEY_BASE = 1_000_000L;
 
   private static Object[] generateKey(KeyType type, int row, Random rand) {
     return switch (type) {
