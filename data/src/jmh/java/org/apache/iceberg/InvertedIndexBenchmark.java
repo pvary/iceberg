@@ -105,6 +105,7 @@ import org.slf4j.LoggerFactory;
  *       -Dindex.bench.io.adls.sas-token.<account>=...}).
  * </ul>
  */
+
 @Fork(1)
 @State(Scope.Benchmark)
 @BenchmarkMode(Mode.SingleShotTime)
@@ -339,9 +340,16 @@ public class InvertedIndexBenchmark {
 
     this.fileLocation = joinPath(baseLocation(), filename());
     InputFile existing = io.newInputFile(fileLocation);
+    // Probe for an existing file via getLength() rather than exists(). On ADLS, InputFile#exists()
+    // is backed by DataLakeFileClient#exists(), which the Azure SDK routes to the *Blob* endpoint
+    // (*.blob.core.windows.net), while every other operation here uses the *DFS* endpoint
+    // (*.dfs.core.windows.net). In environments where only the DFS endpoint is reachable, the
+    // exists() probe blocks until it times out (default 10s) and then fails. getLength() goes
+    // through DataLakeFileClient#getProperties() on the DFS endpoint, so it succeeds when the file
+    // is present and throws a 404-backed RuntimeException (handled below) when it is absent.
     boolean reuseExisting;
     try {
-      reuseExisting = existing.exists() && existing.getLength() > 0;
+      reuseExisting = existing.getLength() > 0;
     } catch (RuntimeException e) {
       reuseExisting = false;
     }
@@ -651,8 +659,8 @@ public class InvertedIndexBenchmark {
 
   @Benchmark
   @Threads(1)
-  @Warmup(iterations = 101)
-  @Measurement(iterations = 1000)
+  @Warmup(iterations = 10)
+  @Measurement(iterations = 100)
   public void lookup(Blackhole bh, ReadCounter ioCounter) throws Exception {
     int idx = lookupCursor++ & (NUM_LOOKUP_KEYS - 1);
     long expectedPos = expectedPositions[idx];
@@ -999,8 +1007,145 @@ public class InvertedIndexBenchmark {
       }
     }
 
+    // Vortex does not go through the Iceberg FileIO; its native object_store backend authenticates
+    // independently. Bridge the same credentials the FileIO uses into the vortex.storage.* system
+    // properties that VortexFileUtil forwards to the native writer/reader (which run in this same
+    // forked JVM). Without this the native Azure/S3 backend falls back to the cloud metadata (IMDS)
+    // endpoint and fails to close the writer.
+    if (isVortex) {
+      bridgeVortexStorageCredentials(storage, props);
+    }
+
     LOG.info("Using FileIO impl={} props={}", impl, props.keySet());
     return CatalogUtil.loadFileIO(impl, props, null);
+  }
+
+  /**
+   * Translates the FileIO credential properties (sourced from {@code -Dindex.bench.io.*}) into the
+   * {@code vortex.storage.<key>} system properties understood by {@code VortexFileUtil}. Existing
+   * {@code -Dvortex.storage.*} overrides are preserved (set-if-absent), so a user can still force a
+   * specific credential mode (e.g. {@code azure_storage_use_azure_cli}) from the command line.
+   */
+  private static void bridgeVortexStorageCredentials(Storage storage, Map<String, String> ioProps) {
+    switch (storage) {
+      case ADLS -> {
+        // Prefer any explicit static credential the user passed to the FileIO.
+        String accountKey = ioProps.get("adls.auth.shared-key.account.key");
+        if (accountKey != null) {
+          setVortexStorageIfAbsent("azure_storage_account_key", accountKey);
+        }
+
+        String token = ioProps.get("adls.token");
+        if (token != null) {
+          setVortexStorageIfAbsent("azure_storage_token", token);
+        }
+
+        // adls.sas-token.<account> -> azure_storage_sas_key (account is encoded in the URI).
+        boolean hasSas = false;
+        for (Map.Entry<String, String> entry : ioProps.entrySet()) {
+          if (entry.getKey().startsWith("adls.sas-token.")) {
+            setVortexStorageIfAbsent("azure_storage_sas_key", entry.getValue());
+            hasSas = true;
+            break;
+          }
+        }
+
+        // If no static credential is configured, ADLSFileIO authenticates via the Azure identity
+        // chain (DefaultAzureCredential: az login / env vars / managed identity). Vortex's native
+        // Rust object_store cannot reuse that Java credential, so without help it falls back to the
+        // IMDS metadata endpoint (169.254.169.254) and the writer fails on close. Acquire a bearer
+        // token from the same identity chain here and hand it to Vortex as azure_storage_token,
+        // unless the user already forced a credential mode via -Dvortex.storage.*.
+        boolean hasStatic = accountKey != null || token != null || hasSas;
+        boolean userOverride =
+            System.getProperty("vortex.storage.azure_storage_account_key") != null
+                || System.getProperty("vortex.storage.azure_storage_sas_key") != null
+                || System.getProperty("vortex.storage.azure_storage_token") != null
+                || System.getProperty("vortex.storage.azure_storage_use_azure_cli") != null;
+        if (!hasStatic && !userOverride) {
+          acquireAzureBearerToken()
+              .ifPresent(bearer -> setVortexStorageIfAbsent("azure_storage_token", bearer));
+        }
+      }
+      case S3 -> {
+        // S3FileIO property -> Vortex (Rust object_store) S3 key.
+        bridgeIfPresent(ioProps, "s3.access-key-id", "aws_access_key_id");
+        bridgeIfPresent(ioProps, "s3.secret-access-key", "aws_secret_access_key");
+        bridgeIfPresent(ioProps, "s3.session-token", "aws_session_token");
+        bridgeIfPresent(ioProps, "s3.endpoint", "aws_endpoint");
+        bridgeIfPresent(ioProps, "client.region", "aws_region");
+        bridgeIfPresent(ioProps, "s3.region", "aws_region");
+      }
+      case LOCAL -> {
+        // No credentials needed for the local filesystem.
+      }
+    }
+  }
+
+  /**
+   * Acquires an OAuth bearer token for Azure Storage from the default Azure identity chain (the
+   * same {@code DefaultAzureCredential} {@code ADLSFileIO} uses: {@code az login}, environment
+   * variables, workload/managed identity, ...). Returns empty if no credential is available so the
+   * caller can fall back gracefully.
+   *
+   * <p>Done reflectively so the JMH module needs no compile-time dependency on the Azure SDK; the
+   * classes are present on the runtime classpath via {@code iceberg-azure}.
+   */
+  private static java.util.Optional<String> acquireAzureBearerToken() {
+    try {
+      // new DefaultAzureCredentialBuilder().build()
+      Class<?> builderClass = Class.forName("com.azure.identity.DefaultAzureCredentialBuilder");
+      Object builder = builderClass.getDeclaredConstructor().newInstance();
+      Object credential = builderClass.getMethod("build").invoke(builder);
+
+      // new TokenRequestContext().addScopes("https://storage.azure.com/.default")
+      Class<?> contextClass = Class.forName("com.azure.core.credential.TokenRequestContext");
+      Object context = contextClass.getDeclaredConstructor().newInstance();
+      contextClass
+          .getMethod("addScopes", String[].class)
+          .invoke(context, (Object) new String[] {"https://storage.azure.com/.default"});
+
+      // credential.getToken(context) -> reactor.core.publisher.Mono
+      Class<?> credentialClass = Class.forName("com.azure.core.credential.TokenCredential");
+      Object mono = credentialClass.getMethod("getToken", contextClass).invoke(credential, context);
+
+      // mono.block(Duration.ofSeconds(30)) -> AccessToken
+      Object accessToken =
+          mono.getClass()
+              .getMethod("block", java.time.Duration.class)
+              .invoke(mono, java.time.Duration.ofSeconds(30));
+      if (accessToken != null) {
+        // accessToken.getToken() -> String
+        Object token = accessToken.getClass().getMethod("getToken").invoke(accessToken);
+        if (token instanceof String s && !s.isEmpty()) {
+          LOG.info("Acquired Azure bearer token from DefaultAzureCredential for Vortex backend");
+          return java.util.Optional.of(s);
+        }
+      }
+    } catch (ReflectiveOperationException | RuntimeException e) {
+      LOG.warn(
+          "Could not acquire an Azure bearer token for the Vortex native backend; "
+              + "set -Dindex.bench.io.adls.* static credentials or -Dvortex.storage.* explicitly",
+          e);
+    }
+
+    return java.util.Optional.empty();
+  }
+
+  private static void bridgeIfPresent(
+      Map<String, String> ioProps, String ioKey, String vortexKey) {
+    String value = ioProps.get(ioKey);
+    if (value != null) {
+      setVortexStorageIfAbsent(vortexKey, value);
+    }
+  }
+
+  private static void setVortexStorageIfAbsent(String vortexKey, String value) {
+    String sysPropKey = "vortex.storage." + vortexKey;
+    if (System.getProperty(sysPropKey) == null) {
+      System.setProperty(sysPropKey, value);
+      LOG.info("Bridged FileIO credential to {} for Vortex native backend", sysPropKey);
+    }
   }
 
   private static Map<String, String> collectIoProps() {

@@ -101,7 +101,11 @@ configure(jmhProjects) {
     // InvertedIndexBenchmark pick up storage/credentials configuration (index.bench.*,
     // iceberg.io.*) and lets the Azure SDK HTTP wire logger (org.slf4j.*, AZURE_*) be
     // toggled from the command line without editing this file.
-    def forwardedPrefixes = ['index.bench.', 'range.bench.', 'iceberg.io.', 'org.slf4j.', 'AZURE_']
+    // 'vortex.storage.' carries credentials/config straight to Vortex's native object_store
+    // backend (see VortexFileUtil#overlayWithSysProps); it must be forwarded so the writer/reader
+    // running in the forked JMH JVM can authenticate to S3/ADLS instead of falling back to the
+    // cloud metadata (IMDS) endpoint.
+    def forwardedPrefixes = ['index.bench.', 'range.bench.', 'iceberg.io.', 'org.slf4j.', 'AZURE_', 'vortex.storage.']
     def forwarded = System.properties.findAll { k, v ->
       def key = k.toString()
       forwardedPrefixes.any { key.startsWith(it) }
