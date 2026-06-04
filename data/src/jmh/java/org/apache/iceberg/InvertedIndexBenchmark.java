@@ -24,6 +24,7 @@ import static org.apache.iceberg.types.Types.NestedField.required;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.lang.reflect.Field;
 import java.util.List;
 import java.util.Locale;
@@ -46,10 +47,13 @@ import org.apache.iceberg.index.ParquetIndexHandlerWithHashedRowGroups;
 import org.apache.iceberg.index.UltraCompactHasherIndexHandler;
 import org.apache.iceberg.index.VortexIndexHandler;
 import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.IOUtil;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.PositionOutputStream;
+import org.apache.iceberg.io.RangeReadable;
 import org.apache.iceberg.io.SeekableInputStream;
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.types.Types;
@@ -232,6 +236,20 @@ public class InvertedIndexBenchmark {
   private static final String STORAGE_PROP = "index.bench.storage";
   private static final String LOCATION_PROP = "index.bench.location";
   private static final String IO_PROP_PREFIX = "index.bench.io.";
+
+  /**
+   * When {@code true}, every {@link InputFile} opened by the benchmark eagerly downloads its entire
+   * payload in a single bounded {@code RangeReadable.readFully([0, length))} (one ADLS/S3 GET) and
+   * serves all subsequent Parquet reads -- footer, metadata and row-group column chunks -- from
+   * that in-memory buffer. This is the only way to force "read the whole file at once": the Parquet
+   * reader otherwise issues a footer read plus one bounded range read per column chunk, and {@code
+   * adls.read.block-size-bytes} cannot widen a bounded {@code readFully} beyond its requested
+   * length. Toggled via {@code -Dindex.bench.prefetch-whole-file=true} (default {@code false}).
+   */
+  private static final String PREFETCH_WHOLE_FILE_PROP = "index.bench.prefetch-whole-file";
+
+  private static final boolean PREFETCH_WHOLE_FILE =
+      Boolean.getBoolean(PREFETCH_WHOLE_FILE_PROP);
 
   private FileIO io;
   private String fileLocation;
@@ -1427,9 +1445,31 @@ public class InvertedIndexBenchmark {
     public SeekableInputStream newStream() {
       OPEN_INPUT_STREAMS.incrementAndGet();
       long t0 = System.nanoTime();
-      SeekableInputStream s = delegate.newStream();
+      SeekableInputStream s = PREFETCH_WHOLE_FILE ? prefetchWholeFile() : delegate.newStream();
       OPEN_NANOS.addAndGet(System.nanoTime() - t0);
       return new CountingSeekableInputStream(s);
+    }
+
+    /**
+     * Downloads the entire file in a single bounded {@code readFully([0, length))} -- one wire GET
+     * against ADLS/S3 -- and returns an in-memory stream over the result, so the Parquet reader's
+     * footer/metadata/row-group reads are all served from memory instead of issuing one ranged GET
+     * per column chunk.
+     */
+    private SeekableInputStream prefetchWholeFile() {
+      long length = delegate.getLength();
+      byte[] data = new byte[Math.toIntExact(length)];
+      try (SeekableInputStream in = delegate.newStream()) {
+        if (in instanceof RangeReadable rangeReadable) {
+          rangeReadable.readFully(0L, data, 0, data.length);
+        } else {
+          IOUtil.readFully(in, data, 0, data.length);
+        }
+      } catch (IOException e) {
+        throw new UncheckedIOException("Failed to prefetch whole file: " + delegate.location(), e);
+      }
+
+      return new ByteArraySeekableInputStream(data);
     }
 
     @Override
@@ -1441,6 +1481,65 @@ public class InvertedIndexBenchmark {
     public boolean exists() {
       return delegate.exists();
     }
+  }
+
+  /** In-memory {@link SeekableInputStream} over a fully prefetched file buffer. */
+  private static final class ByteArraySeekableInputStream extends SeekableInputStream
+      implements RangeReadable {
+    private final byte[] data;
+    private int pos;
+
+    ByteArraySeekableInputStream(byte[] data) {
+      this.data = data;
+    }
+
+    @Override
+    public long getPos() {
+      return pos;
+    }
+
+    @Override
+    public void seek(long newPos) {
+      Preconditions.checkArgument(newPos >= 0, "Cannot seek to negative position: %s", newPos);
+      this.pos = Math.toIntExact(Math.min(newPos, data.length));
+    }
+
+    @Override
+    public int read() {
+      if (pos >= data.length) {
+        return -1;
+      }
+
+      return data[pos++] & 0xff;
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) {
+      if (pos >= data.length) {
+        return -1;
+      }
+
+      int n = Math.min(len, data.length - pos);
+      System.arraycopy(data, pos, b, off, n);
+      pos += n;
+      return n;
+    }
+
+    @Override
+    public void readFully(long position, byte[] buffer, int offset, int length) {
+      Preconditions.checkPositionIndexes(offset, offset + length, buffer.length);
+      System.arraycopy(data, Math.toIntExact(position), buffer, offset, length);
+    }
+
+    @Override
+    public int readTail(byte[] buffer, int offset, int length) {
+      int readStart = data.length - length;
+      System.arraycopy(data, readStart, buffer, offset, length);
+      return length;
+    }
+
+    @Override
+    public void close() {}
   }
 
   /** Thin counting passthrough: records bytes/seek/read timings without altering IO patterns. */
