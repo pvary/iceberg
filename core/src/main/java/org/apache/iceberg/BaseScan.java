@@ -25,9 +25,11 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.stream.Collectors;
+import org.apache.iceberg.catalog.IndexCatalog;
 import org.apache.iceberg.expressions.Binder;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.metrics.MetricsReporter;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
@@ -296,6 +298,16 @@ abstract class BaseScan<ThisT, T extends ScanTask, G extends ScanTaskGroup<T>>
   @Override
   public ThisT minRowsRequested(long numRows) {
     return newRefinedScan(table, schema, context.minRowsRequested(numRows));
+  }
+
+  @Override
+  public ThisT availableIndexes(Collection<IndexDefinition> indexes) {
+    return newRefinedScan(table, schema, context.availableIndexes(indexes));
+  }
+
+  @Override
+  public ThisT indexCatalog(IndexCatalog indexCatalog) {
+    return newRefinedScan(table, schema, context.indexCatalog(indexCatalog));
   }
 
   /**

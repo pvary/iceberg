@@ -20,7 +20,9 @@ package org.apache.iceberg;
 
 import java.util.Collection;
 import java.util.concurrent.ExecutorService;
+import org.apache.iceberg.catalog.IndexCatalog;
 import org.apache.iceberg.expressions.Expression;
+import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.metrics.MetricsReporter;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -207,5 +209,13 @@ public interface Scan<ThisT, T extends ScanTask, G extends ScanTaskGroup<T>> {
   default ThisT minRowsRequested(long numRows) {
     throw new UnsupportedOperationException(
         this.getClass().getName() + " doesn't implement minRowsRequested");
+  }
+
+  default ThisT availableIndexes(Collection<IndexDefinition> indexes) {
+    throw new UnsupportedOperationException("Not implemented yet");
+  }
+
+  default ThisT indexCatalog(IndexCatalog indexCatalog) {
+    throw new UnsupportedOperationException("Not implemented yet");
   }
 }

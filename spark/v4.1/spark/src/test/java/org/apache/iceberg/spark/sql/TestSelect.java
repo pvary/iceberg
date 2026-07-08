@@ -29,18 +29,27 @@ import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import org.apache.iceberg.IndexSnapshots;
 import org.apache.iceberg.Parameter;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Parameters;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.IndexCatalog;
+import org.apache.iceberg.catalog.IndexIdentifier;
+import org.apache.iceberg.catalog.Namespace;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.events.Listeners;
 import org.apache.iceberg.events.ScanEvent;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.hive.HiveCatalog;
+import org.apache.iceberg.index.IndexType;
+import org.apache.iceberg.inmemory.InMemoryCatalog;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.spark.CatalogTestBase;
 import org.apache.iceberg.spark.Spark3Util;
+import org.apache.iceberg.spark.SparkCatalog;
 import org.apache.iceberg.spark.SparkCatalogConfig;
 import org.apache.iceberg.spark.SparkReadOptions;
 import org.apache.spark.sql.Dataset;
@@ -741,5 +750,83 @@ public class TestSelect extends CatalogTestBase {
                 "SELECT id, try_variant_get(v2, '$.x', 'int') FROM %s WHERE try_variant_get(v2, '$.x', 'int') < 100",
                 tableName))
         .containsExactlyInAnyOrder(row(1L, 15), row(2L, 20));
+  }
+
+  @TestTemplate
+  public void testSelectQueriesIndexSnapshot() {
+    // Register a dedicated Spark catalog backed by an in-memory Iceberg catalog that implements
+    // IndexCatalog so the read path can route the query to an index snapshot.
+    String indexCatalogName = "index_cat_" + catalogName;
+    spark.conf().set("spark.sql.catalog." + indexCatalogName, SparkCatalog.class.getName());
+    spark
+        .conf()
+        .set(
+            "spark.sql.catalog." + indexCatalogName + ".catalog-impl",
+            InMemoryCatalog.class.getName());
+    spark.conf().set("spark.sql.catalog." + indexCatalogName + ".cache-enabled", "false");
+
+    String namespace = "db";
+    String baseTable = indexCatalogName + "." + namespace + ".indexed";
+    String indexDataTable = indexCatalogName + "." + namespace + ".index_data";
+
+    try {
+      sql("CREATE NAMESPACE IF NOT EXISTS %s.%s", indexCatalogName, namespace);
+
+      // base table holding the original data; "category" (column id 3) is not covered by the index
+      sql("CREATE TABLE %s (id bigint, data string, category string) USING iceberg", baseTable);
+      sql(
+          "INSERT INTO %s VALUES (1, 'a', 'p'), (2, 'b', 'q'), (3, 'c', 'r')",
+          baseTable);
+
+      // separate table whose data files back the index snapshot (distinguishable rows). It only
+      // contains the indexed columns (id, data).
+      sql("CREATE TABLE %s (id bigint, data string) USING iceberg", indexDataTable);
+      sql("INSERT INTO %s VALUES (4, 'x'), (5, 'y'), (6, 'z')", indexDataTable);
+
+      Catalog icebergCatalog = Spark3Util.loadIcebergCatalog(spark, indexCatalogName);
+      IndexCatalog indexCatalog = (IndexCatalog) icebergCatalog;
+
+      TableIdentifier baseIdent = TableIdentifier.of(Namespace.of(namespace), "indexed");
+      TableIdentifier indexDataIdent = TableIdentifier.of(Namespace.of(namespace), "index_data");
+
+      Table base = icebergCatalog.loadTable(baseIdent);
+      Table indexData = icebergCatalog.loadTable(indexDataIdent);
+
+      long baseSnapshotId = base.currentSnapshot().snapshotId();
+      String manifestList = indexData.currentSnapshot().manifestListLocation();
+
+      // the index covers only the id (1) and data (2) columns
+      IndexIdentifier indexIdent = IndexIdentifier.of(baseIdent, "data_index");
+      indexCatalog
+          .buildIndex(indexIdent)
+          .withTableUuid(base.uuid())
+          .withType(IndexType.BTREE)
+          .withIndexColumnIds(2)
+          .withOptimizedColumnIds(1)
+          .create();
+
+      indexCatalog
+          .loadIndex(indexIdent)
+          .addIndexSnapshot()
+          .withTableSnapshotId(baseSnapshotId)
+          .withIndexSnapshotId(1L)
+          .withSnapshotProperty(IndexSnapshots.MANIFEST_LIST, manifestList)
+          .commit();
+
+      // querying only indexed columns is served from the index snapshot's data
+      assertEquals(
+          "Query using only indexed columns should be served from the index snapshot",
+          ImmutableList.of(row(4L, "x"), row(5L, "y"), row(6L, "z")),
+          sql("SELECT id, data FROM %s ORDER BY id", baseTable));
+
+      // querying the unindexed "category" column falls back to the original table
+      assertEquals(
+          "Query using an unindexed column should be served from the original table",
+          ImmutableList.of(row(1L, "a", "p"), row(2L, "b", "q"), row(3L, "c", "r")),
+          sql("SELECT id, data, category FROM %s ORDER BY id", baseTable));
+    } finally {
+      sql("DROP TABLE IF EXISTS %s", baseTable);
+      sql("DROP TABLE IF EXISTS %s", indexDataTable);
+    }
   }
 }

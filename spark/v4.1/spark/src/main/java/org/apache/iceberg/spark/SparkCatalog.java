@@ -43,6 +43,7 @@ import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotRef;
 import org.apache.iceberg.Transaction;
 import org.apache.iceberg.catalog.Catalog;
+import org.apache.iceberg.catalog.IndexCatalog;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.SupportsNamespaces;
 import org.apache.iceberg.catalog.TableIdentifier;
@@ -865,7 +866,9 @@ public class SparkCatalog extends BaseCatalog {
 
     try {
       org.apache.iceberg.Table table = icebergCatalog.loadTable(buildIdentifier(ident));
-      return new SparkTable(table, !cacheEnabled);
+      IndexCatalog tableIndexCatalog =
+          icebergCatalog instanceof IndexCatalog ? (IndexCatalog) icebergCatalog : null;
+      return new SparkTable(table, !cacheEnabled, tableIndexCatalog, buildIdentifier(ident));
 
     } catch (org.apache.iceberg.exceptions.NoSuchTableException e) {
       if (ident.namespace().length == 0) {

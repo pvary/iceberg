@@ -23,8 +23,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import javax.annotation.Nullable;
+import org.apache.iceberg.catalog.IndexCatalog;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.metrics.LoggingMetricsReporter;
 import org.apache.iceberg.metrics.MetricsReporter;
 import org.apache.iceberg.metrics.MetricsReporters;
@@ -105,6 +107,12 @@ public abstract class TableScanContext {
 
   @Nullable
   public abstract Long minRowsRequested();
+
+  @Nullable
+  public abstract Collection<IndexDefinition> availableIndexes();
+
+  @Nullable
+  public abstract IndexCatalog indexCatalog();
 
   TableScanContext useSnapshotId(Long scanSnapshotId) {
     return ImmutableTableScanContext.builder().from(this).snapshotId(scanSnapshotId).build();
@@ -198,6 +206,14 @@ public abstract class TableScanContext {
 
   TableScanContext minRowsRequested(long numRows) {
     return ImmutableTableScanContext.builder().from(this).minRowsRequested(numRows).build();
+  }
+
+  TableScanContext availableIndexes(Collection<IndexDefinition> indexes) {
+    return ImmutableTableScanContext.builder().from(this).availableIndexes(indexes).build();
+  }
+
+  TableScanContext indexCatalog(IndexCatalog catalog) {
+    return ImmutableTableScanContext.builder().from(this).indexCatalog(catalog).build();
   }
 
   public static TableScanContext empty() {

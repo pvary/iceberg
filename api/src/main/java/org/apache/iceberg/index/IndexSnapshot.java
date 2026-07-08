@@ -19,6 +19,7 @@
 package org.apache.iceberg.index;
 
 import java.util.Map;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 
 /**
@@ -59,4 +60,14 @@ public interface IndexSnapshot {
    * @return an unmodifiable map of string properties, or empty if none set
    */
   Map<String, String> properties();
+
+  /**
+   * Return the {@link Snapshot} that represents this index snapshot's data.
+   *
+   * <p>The returned snapshot can be scanned in place of the base table snapshot to read index data
+   * instead of table data.
+   *
+   * @return the snapshot for this index snapshot
+   */
+  Snapshot snapshot();
 }

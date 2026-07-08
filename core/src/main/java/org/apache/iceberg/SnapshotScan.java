@@ -18,12 +18,20 @@
  */
 package org.apache.iceberg;
 
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
+import org.apache.iceberg.catalog.IndexCatalog;
 import org.apache.iceberg.events.Listeners;
 import org.apache.iceberg.events.ScanEvent;
+import org.apache.iceberg.expressions.Binder;
 import org.apache.iceberg.expressions.ExpressionUtil;
+import org.apache.iceberg.index.IndexDefinition;
+import org.apache.iceberg.index.IndexSnapshot;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.metrics.DefaultMetricsContext;
 import org.apache.iceberg.metrics.ImmutableScanReport;
@@ -181,7 +189,49 @@ public abstract class SnapshotScan<ThisT, T extends ScanTask, G extends ScanTask
   }
 
   public Snapshot snapshot() {
-    return snapshotId() != null ? table().snapshot(snapshotId()) : table().currentSnapshot();
+    Snapshot snapshot =
+        snapshotId() != null ? table().snapshot(snapshotId()) : table().currentSnapshot();
+    if (snapshot == null) {
+      return null;
+    }
+
+    IndexSnapshot indexSnapshot = applicableIndexSnapshot(snapshot);
+    return indexSnapshot != null ? indexSnapshot.snapshot() : snapshot;
+  }
+
+  private IndexSnapshot applicableIndexSnapshot(Snapshot snapshot) {
+    Collection<IndexDefinition> availableIndexes = context().availableIndexes();
+    IndexCatalog indexCatalog = context().indexCatalog();
+    if (availableIndexes == null || indexCatalog == null) {
+      return null;
+    }
+
+    Set<Integer> filterColumnIds =
+        Binder.boundReferences(
+            schema().asStruct(), Collections.singletonList(filter()), isCaseSensitive());
+    Set<Integer> projectedColumnIds = TypeUtil.getProjectedIds(schema());
+
+    for (IndexDefinition index : availableIndexes) {
+      Set<Integer> optimizedColumnIds = toIdSet(index.optimizedColumnIds());
+      Set<Integer> indexedColumnIds = toIdSet(index.indexColumnIds());
+      indexedColumnIds.addAll(optimizedColumnIds);
+
+      boolean filterCovered = optimizedColumnIds.containsAll(filterColumnIds);
+      boolean projectionCovered = indexedColumnIds.containsAll(projectedColumnIds);
+      boolean snapshotAvailable =
+          Arrays.stream(index.availableTableSnapshots())
+              .anyMatch(id -> id == snapshot.snapshotId());
+
+      if (filterCovered && projectionCovered && snapshotAvailable) {
+        return indexCatalog.loadIndex(index.id()).snapshotForTableSnapshot(snapshot.snapshotId());
+      }
+    }
+
+    return null;
+  }
+
+  private static Set<Integer> toIdSet(int[] ids) {
+    return Arrays.stream(ids).boxed().collect(Collectors.toSet());
   }
 
   @Override

@@ -20,6 +20,8 @@ package org.apache.iceberg.index;
 
 import java.util.Map;
 import javax.annotation.Nullable;
+import org.apache.iceberg.IndexSnapshots;
+import org.apache.iceberg.Snapshot;
 import org.immutables.value.Value;
 
 /**
@@ -39,4 +41,9 @@ interface BaseIndexSnapshot extends IndexSnapshot {
   @Override
   @Nullable
   Map<String, String> properties();
+
+  @Override
+  default Snapshot snapshot() {
+    return IndexSnapshots.toSnapshot(this);
+  }
 }

@@ -40,6 +40,8 @@ import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.TableScan;
 import org.apache.iceberg.TableUtil;
+import org.apache.iceberg.catalog.IndexCatalog;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.ValidationException;
 import org.apache.iceberg.expressions.Evaluator;
 import org.apache.iceberg.expressions.Expression;
@@ -124,12 +126,22 @@ public class SparkTable
   private final boolean refreshEagerly;
   private final Set<TableCapability> capabilities;
   private final boolean isTableRewrite;
+  private final IndexCatalog indexCatalog;
+  private final TableIdentifier identifier;
   private String branch;
   private StructType lazyTableSchema = null;
   private SparkSession lazySpark = null;
 
   public SparkTable(Table icebergTable, boolean refreshEagerly) {
     this(icebergTable, (Long) null, refreshEagerly);
+  }
+
+  public SparkTable(
+      Table icebergTable,
+      boolean refreshEagerly,
+      IndexCatalog indexCatalog,
+      TableIdentifier identifier) {
+    this(icebergTable, null, refreshEagerly, false, indexCatalog, identifier);
   }
 
   public SparkTable(Table icebergTable, String branch, boolean refreshEagerly) {
@@ -149,6 +161,16 @@ public class SparkTable
 
   public SparkTable(
       Table icebergTable, Long snapshotId, boolean refreshEagerly, boolean isTableRewrite) {
+    this(icebergTable, snapshotId, refreshEagerly, isTableRewrite, null, null);
+  }
+
+  public SparkTable(
+      Table icebergTable,
+      Long snapshotId,
+      boolean refreshEagerly,
+      boolean isTableRewrite,
+      IndexCatalog indexCatalog,
+      TableIdentifier identifier) {
     this.icebergTable = icebergTable;
     this.snapshotId = snapshotId;
     this.refreshEagerly = refreshEagerly;
@@ -160,6 +182,8 @@ public class SparkTable
             TableProperties.SPARK_WRITE_ACCEPT_ANY_SCHEMA_DEFAULT);
     this.capabilities = acceptAnySchema ? CAPABILITIES_WITH_ACCEPT_ANY_SCHEMA : CAPABILITIES;
     this.isTableRewrite = isTableRewrite;
+    this.indexCatalog = indexCatalog;
+    this.identifier = identifier;
   }
 
   private SparkSession sparkSession() {
@@ -340,7 +364,13 @@ public class SparkTable
     CaseInsensitiveStringMap scanOptions =
         branch != null ? options : addSnapshotId(options, snapshotId);
     return new SparkScanBuilder(
-        sparkSession(), icebergTable, branch, snapshotSchema(), scanOptions);
+        sparkSession(),
+        icebergTable,
+        branch,
+        snapshotSchema(),
+        scanOptions,
+        indexCatalog,
+        identifier);
   }
 
   @Override

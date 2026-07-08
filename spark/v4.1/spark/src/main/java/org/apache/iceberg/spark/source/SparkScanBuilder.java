@@ -41,12 +41,15 @@ import org.apache.iceberg.SparkDistributedDataScan;
 import org.apache.iceberg.StructLike;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableProperties;
+import org.apache.iceberg.catalog.IndexCatalog;
+import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.expressions.AggregateEvaluator;
 import org.apache.iceberg.expressions.Binder;
 import org.apache.iceberg.expressions.BoundAggregate;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.expressions.ExpressionUtil;
 import org.apache.iceberg.expressions.Expressions;
+import org.apache.iceberg.index.IndexDefinition;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.metrics.InMemoryMetricsReporter;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -100,6 +103,8 @@ public class SparkScanBuilder
   private final SparkReadConf readConf;
   private final List<String> metaColumns = Lists.newArrayList();
   private final InMemoryMetricsReporter metricsReporter;
+  private final IndexCatalog indexCatalog;
+  private final TableIdentifier identifier;
 
   private Schema schema;
   private boolean caseSensitive;
@@ -113,6 +118,17 @@ public class SparkScanBuilder
       String branch,
       Schema schema,
       CaseInsensitiveStringMap options) {
+    this(spark, table, branch, schema, options, null, null);
+  }
+
+  SparkScanBuilder(
+      SparkSession spark,
+      Table table,
+      String branch,
+      Schema schema,
+      CaseInsensitiveStringMap options,
+      IndexCatalog indexCatalog,
+      TableIdentifier identifier) {
     this.spark = spark;
     this.table = table;
     this.schema = schema;
@@ -120,6 +136,8 @@ public class SparkScanBuilder
     this.readConf = new SparkReadConf(spark, table, branch, options);
     this.caseSensitive = readConf.caseSensitive();
     this.metricsReporter = new InMemoryMetricsReporter();
+    this.indexCatalog = indexCatalog;
+    this.identifier = identifier;
   }
 
   SparkScanBuilder(SparkSession spark, Table table, CaseInsensitiveStringMap options) {
@@ -480,6 +498,8 @@ public class SparkScanBuilder
             .project(expectedSchema)
             .metricsReporter(metricsReporter);
 
+    scan = configureIndexes(scan);
+
     if (withStats) {
       scan = scan.includeColumnStats();
     }
@@ -501,6 +521,19 @@ public class SparkScanBuilder
     }
 
     return configureSplitPlanning(scan);
+  }
+
+  private BatchScan configureIndexes(BatchScan scan) {
+    if (indexCatalog == null || identifier == null) {
+      return scan;
+    }
+
+    List<IndexDefinition> availableIndexes = indexCatalog.listIndexes(identifier);
+    if (availableIndexes.isEmpty()) {
+      return scan;
+    }
+
+    return scan.availableIndexes(availableIndexes).indexCatalog(indexCatalog);
   }
 
   private org.apache.iceberg.Scan buildIncrementalAppendScan(
