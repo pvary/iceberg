@@ -61,6 +61,7 @@ class ManifestGroup {
   private boolean ignoreResiduals;
   private List<String> columns;
   private boolean caseSensitive;
+  private boolean immediateDataFileRead;
   private Set<Integer> columnsToKeepStats;
   private ExecutorService executorService;
   private ScanMetrics scanMetrics;
@@ -85,6 +86,7 @@ class ManifestGroup {
     this.ignoreResiduals = false;
     this.columns = ManifestReader.ALL_COLUMNS;
     this.caseSensitive = true;
+    this.immediateDataFileRead = false;
     this.manifestEntryPredicate = e -> true;
     this.scanMetrics = ScanMetrics.noop();
   }
@@ -156,6 +158,11 @@ class ManifestGroup {
     return this;
   }
 
+  ManifestGroup immediateDataFileRead(boolean newImmediateDataFileRead) {
+    this.immediateDataFileRead = newImmediateDataFileRead;
+    return this;
+  }
+
   ManifestGroup planWith(ExecutorService newExecutorService) {
     this.executorService = newExecutorService;
     deleteIndexBuilder.planWith(newExecutorService);
@@ -196,7 +203,13 @@ class ManifestGroup {
                   PartitionSpec spec = specsById.get(specId);
                   ResidualEvaluator residuals = residualCache.get(specId);
                   return new TaskContext(
-                      spec, deleteFiles, residuals, dropStats, columnsToKeepStats, scanMetrics);
+                      spec,
+                      deleteFiles,
+                      residuals,
+                      dropStats,
+                      columnsToKeepStats,
+                      scanMetrics,
+                      immediateDataFileRead);
                 });
 
     Iterable<CloseableIterable<T>> tasks =
@@ -366,7 +379,12 @@ class ManifestGroup {
           DeleteFile[] deleteFiles = ctx.deletes().forEntry(entry);
           ScanMetricsUtil.fileTask(ctx.scanMetrics(), dataFile, deleteFiles);
           return new BaseFileScanTask(
-              dataFile, deleteFiles, ctx.schemaAsString(), ctx.specAsString(), ctx.residuals());
+              dataFile,
+              deleteFiles,
+              ctx.schemaAsString(),
+              ctx.specAsString(),
+              ctx.residuals(),
+              ctx.immediateDataFileRead());
         });
   }
 
@@ -384,6 +402,7 @@ class ManifestGroup {
     private final boolean dropStats;
     private final Set<Integer> columnsToKeepStats;
     private final ScanMetrics scanMetrics;
+    private final boolean immediateDataFileRead;
 
     TaskContext(
         PartitionSpec spec,
@@ -391,7 +410,8 @@ class ManifestGroup {
         ResidualEvaluator residuals,
         boolean dropStats,
         Set<Integer> columnsToKeepStats,
-        ScanMetrics scanMetrics) {
+        ScanMetrics scanMetrics,
+        boolean immediateDataFileRead) {
       this.schemaAsString = SchemaParser.toJson(spec.schema());
       this.specAsString = PartitionSpecParser.toJson(spec);
       this.deletes = deletes;
@@ -399,6 +419,7 @@ class ManifestGroup {
       this.dropStats = dropStats;
       this.columnsToKeepStats = columnsToKeepStats;
       this.scanMetrics = scanMetrics;
+      this.immediateDataFileRead = immediateDataFileRead;
     }
 
     String schemaAsString() {
@@ -427,6 +448,10 @@ class ManifestGroup {
 
     public ScanMetrics scanMetrics() {
       return scanMetrics;
+    }
+
+    boolean immediateDataFileRead() {
+      return immediateDataFileRead;
     }
   }
 }

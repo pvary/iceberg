@@ -164,7 +164,8 @@ class SparkBatch implements Batch {
 
     } else if (task.isFileScanTask() && !task.isDataTask()) {
       FileScanTask fileScanTask = task.asFileScanTask();
-      return fileScanTask.file().format() == FileFormat.PARQUET;
+      return fileScanTask.file().format() == FileFormat.PARQUET
+          && !fileScanTask.immediateDataFileRead();
 
     } else {
       return false;
@@ -204,7 +205,9 @@ class SparkBatch implements Batch {
 
     } else if (task.isFileScanTask() && !task.isDataTask()) {
       FileScanTask fileScanTask = task.asFileScanTask();
-      return fileScanTask.file().format() == FileFormat.ORC && fileScanTask.deletes().isEmpty();
+      return fileScanTask.file().format() == FileFormat.ORC
+          && fileScanTask.deletes().isEmpty()
+          && !fileScanTask.immediateDataFileRead();
 
     } else {
       return false;

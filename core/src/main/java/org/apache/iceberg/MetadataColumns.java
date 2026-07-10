@@ -107,6 +107,20 @@ public class MetadataColumns {
           Types.LongType.get(),
           "Sequence number when the row was last updated");
 
+  public static final NestedField INDEX_FILE_PATH =
+      NestedField.optional(
+          Integer.MAX_VALUE - 109,
+          "_index_file_path",
+          Types.StringType.get(),
+          "Path of the file in which the indexed row is stored");
+
+  public static final NestedField INDEX_ROW_POSITION =
+      NestedField.optional(
+          Integer.MAX_VALUE - 110,
+          "_index_pos",
+          Types.LongType.get(),
+          "Ordinal position of the indexed row in the source data file");
+
   private static final Map<String, NestedField> META_COLUMNS =
       ImmutableMap.of(
           FILE_PATH.name(), FILE_PATH,

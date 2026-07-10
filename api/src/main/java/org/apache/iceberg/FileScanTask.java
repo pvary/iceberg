@@ -35,6 +35,21 @@ public interface FileScanTask extends ContentScanTask<DataFile>, SplittableScanT
     throw new UnsupportedOperationException("Does not support schema getter");
   }
 
+  /**
+   * Whether the data file must be read immediately when processing this task.
+   *
+   * <p>When a skipping index is available for a scan, tasks may be produced from the index instead
+   * of the original data files. Such tasks signal that the reader must open the data file
+   * referenced by the index and return the row at the position identified by the index (for example
+   * using the {@code _index_file_path} and {@code _index_row_position} columns) rather than
+   * scanning the file sequentially.
+   *
+   * @return true if the data file must be read immediately, false to scan the file normally
+   */
+  default boolean immediateDataFileRead() {
+    return false;
+  }
+
   @Override
   default long sizeBytes() {
     return length() + ScanTaskUtil.contentSizeInBytes(deletes());

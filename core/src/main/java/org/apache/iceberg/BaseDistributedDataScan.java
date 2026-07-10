@@ -373,7 +373,8 @@ abstract class BaseDistributedDataScan
               deleteFiles,
               schemaString,
               specString,
-              residuals);
+              residuals,
+              immediateDataFileRead());
         });
   }
 

@@ -23,22 +23,34 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assumptions.assumeThat;
 
+import java.io.IOException;
 import java.sql.Timestamp;
 import java.text.SimpleDateFormat;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import org.apache.iceberg.DataFile;
+import org.apache.iceberg.DataFiles;
+import org.apache.iceberg.FileFormat;
+import org.apache.iceberg.FileScanTask;
 import org.apache.iceberg.IndexSnapshots;
+import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Parameter;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Parameters;
+import org.apache.iceberg.PartitionSpec;
+import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.IndexCatalog;
 import org.apache.iceberg.catalog.IndexIdentifier;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
+import org.apache.iceberg.data.GenericRecord;
+import org.apache.iceberg.data.Record;
+import org.apache.iceberg.data.parquet.GenericParquetReaders;
+import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.events.Listeners;
 import org.apache.iceberg.events.ScanEvent;
 import org.apache.iceberg.exceptions.ValidationException;
@@ -46,12 +58,19 @@ import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.hive.HiveCatalog;
 import org.apache.iceberg.index.IndexType;
 import org.apache.iceberg.inmemory.InMemoryCatalog;
+import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.FileAppender;
+import org.apache.iceberg.io.FileIO;
+import org.apache.iceberg.io.OutputFile;
+import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.CatalogTestBase;
 import org.apache.iceberg.spark.Spark3Util;
 import org.apache.iceberg.spark.SparkCatalog;
 import org.apache.iceberg.spark.SparkCatalogConfig;
 import org.apache.iceberg.spark.SparkReadOptions;
+import org.apache.iceberg.types.Types;
 import org.apache.spark.sql.Dataset;
 import org.apache.spark.sql.Row;
 import org.junit.jupiter.api.AfterEach;
@@ -774,9 +793,7 @@ public class TestSelect extends CatalogTestBase {
 
       // base table holding the original data; "category" (column id 3) is not covered by the index
       sql("CREATE TABLE %s (id bigint, data string, category string) USING iceberg", baseTable);
-      sql(
-          "INSERT INTO %s VALUES (1, 'a', 'p'), (2, 'b', 'q'), (3, 'c', 'r')",
-          baseTable);
+      sql("INSERT INTO %s VALUES (1, 'a', 'p'), (2, 'b', 'q'), (3, 'c', 'r')", baseTable);
 
       // separate table whose data files back the index snapshot (distinguishable rows). It only
       // contains the indexed columns (id, data).
@@ -828,5 +845,150 @@ public class TestSelect extends CatalogTestBase {
       sql("DROP TABLE IF EXISTS %s", baseTable);
       sql("DROP TABLE IF EXISTS %s", indexDataTable);
     }
+  }
+
+  @TestTemplate
+  public void testSelectQueriesWithImmediateDataFileRead() throws IOException {
+    // Register a dedicated Spark catalog backed by an in-memory Iceberg catalog that implements
+    // IndexCatalog so the read path can route the query through an index snapshot.
+    String indexCatalogName = "immediate_read_cat_" + catalogName;
+    spark.conf().set("spark.sql.catalog." + indexCatalogName, SparkCatalog.class.getName());
+    spark
+        .conf()
+        .set(
+            "spark.sql.catalog." + indexCatalogName + ".catalog-impl",
+            InMemoryCatalog.class.getName());
+    spark.conf().set("spark.sql.catalog." + indexCatalogName + ".cache-enabled", "false");
+
+    String namespace = "db";
+    String baseTable = indexCatalogName + "." + namespace + ".indexed";
+
+    try {
+      sql("CREATE NAMESPACE IF NOT EXISTS %s.%s", indexCatalogName, namespace);
+
+      // base table holding the original data; "category" (column id 3) is not covered by the index
+      sql("CREATE TABLE %s (id bigint, data string, category string) USING iceberg", baseTable);
+      sql("INSERT INTO %s VALUES (1, 'a', 'p'), (2, 'b', 'q'), (3, 'c', 'r')", baseTable);
+
+      Catalog icebergCatalog = Spark3Util.loadIcebergCatalog(spark, indexCatalogName);
+      IndexCatalog indexCatalog = (IndexCatalog) icebergCatalog;
+
+      TableIdentifier baseIdent = TableIdentifier.of(Namespace.of(namespace), "indexed");
+      Table base = icebergCatalog.loadTable(baseIdent);
+      long baseSnapshotId = base.currentSnapshot().snapshotId();
+
+      // build an index file that stores the optimized "id" column and maps each indexed row to its
+      // position in the base data files via the _index_file_path and _index_pos metadata columns
+      Schema indexSchema =
+          new Schema(
+              base.schema().findField("id"),
+              MetadataColumns.INDEX_FILE_PATH,
+              MetadataColumns.INDEX_ROW_POSITION);
+      List<Record> indexRecords = Lists.newArrayList();
+      try (CloseableIterable<FileScanTask> tasks = base.newScan().planFiles()) {
+        for (FileScanTask task : tasks) {
+          String dataFileLocation = task.file().location();
+          long position = 0;
+          try (CloseableIterable<Record> baseRows =
+              Parquet.read(base.io().newInputFile(dataFileLocation))
+                  .project(base.schema())
+                  .createReaderFunc(
+                      fileSchema -> GenericParquetReaders.buildReader(base.schema(), fileSchema))
+                  .build()) {
+            for (Record baseRow : baseRows) {
+              Record record = GenericRecord.create(indexSchema);
+              record.setField("id", baseRow.getField("id"));
+              record.setField(MetadataColumns.INDEX_FILE_PATH.name(), dataFileLocation);
+              record.setField(MetadataColumns.INDEX_ROW_POSITION.name(), position);
+              indexRecords.add(record);
+              position++;
+            }
+          }
+        }
+      }
+
+      // an unpartitioned holder table provides a manifest list that references the index file
+      TableIdentifier holderIdent = TableIdentifier.of(Namespace.of(namespace), "index_holder");
+      Table holder =
+          icebergCatalog.createTable(
+              holderIdent,
+              new Schema(Types.NestedField.required(1, "x", Types.StringType.get())),
+              PartitionSpec.unpartitioned());
+      DataFile indexDataFile =
+          writeIndexFile(
+              holder.io(),
+              holder.location() + "/data/index-00000.parquet",
+              indexSchema,
+              indexRecords);
+      holder.newAppend().appendFile(indexDataFile).commit();
+      String manifestList = holder.currentSnapshot().manifestListLocation();
+
+      // the index optimizes "id" (1) for filtering and records the data file location and row
+      // position for each indexed row, so the read path can skip to the matching base rows;
+      // "category" (3) is neither optimized nor indexed
+      IndexIdentifier indexIdent = IndexIdentifier.of(baseIdent, "id_index");
+      indexCatalog
+          .buildIndex(indexIdent)
+          .withTableUuid(base.uuid())
+          .withType(IndexType.BTREE)
+          .withIndexColumnIds(
+              MetadataColumns.INDEX_FILE_PATH.fieldId(),
+              MetadataColumns.INDEX_ROW_POSITION.fieldId())
+          .withOptimizedColumnIds(1)
+          .create();
+
+      long indexSnapshotId = 1L;
+      indexCatalog
+          .loadIndex(indexIdent)
+          .addIndexSnapshot()
+          .withTableSnapshotId(baseSnapshotId)
+          .withIndexSnapshotId(indexSnapshotId)
+          .withSnapshotProperty(IndexSnapshots.MANIFEST_LIST, manifestList)
+          .commit();
+
+      this.scanEventCount = 0;
+      this.lastScanEvent = null;
+
+      // filtering on the optimized "id" column while projecting the unindexed "category" column:
+      // the index locates the matching row, which is then read immediately from the base data file
+      assertEquals(
+          "Filtering on an optimized column while projecting an unindexed column should read the "
+              + "row from the base data file through the index",
+          ImmutableList.of(row(2L, "b", "q")),
+          sql("SELECT id, data, category FROM %s WHERE id = 2 ORDER BY id", baseTable));
+
+      assertThat(scanEventCount).as("Should create only one scan").isEqualTo(1);
+      assertThat(lastScanEvent.snapshotId())
+          .as("Scan should be routed through the index snapshot")
+          .isEqualTo(indexSnapshotId);
+      assertThat(lastScanEvent.snapshotId())
+          .as("Scan should not use the base table snapshot")
+          .isNotEqualTo(baseSnapshotId);
+
+      sql("DROP TABLE IF EXISTS %s", indexCatalogName + "." + namespace + ".index_holder");
+    } finally {
+      sql("DROP TABLE IF EXISTS %s", baseTable);
+      sql("DROP TABLE IF EXISTS %s", indexCatalogName + "." + namespace + ".index_holder");
+    }
+  }
+
+  private static DataFile writeIndexFile(
+      FileIO io, String location, Schema indexSchema, List<Record> records) throws IOException {
+    OutputFile outputFile = io.newOutputFile(location);
+    try (FileAppender<Record> appender =
+        Parquet.write(outputFile)
+            .schema(indexSchema)
+            .createWriterFunc(GenericParquetWriter::create)
+            .overwrite()
+            .build()) {
+      appender.addAll(records);
+    }
+
+    return DataFiles.builder(PartitionSpec.unpartitioned())
+        .withPath(location)
+        .withFormat(FileFormat.PARQUET)
+        .withFileSizeInBytes(io.newInputFile(location).getLength())
+        .withRecordCount(records.size())
+        .build();
   }
 }

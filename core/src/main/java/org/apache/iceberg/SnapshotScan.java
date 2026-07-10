@@ -64,6 +64,7 @@ public abstract class SnapshotScan<ThisT, T extends ScanTask, G extends ScanTask
   private static final Logger LOG = LoggerFactory.getLogger(SnapshotScan.class);
 
   private ScanMetrics scanMetrics;
+  private IndexSelection indexSelection;
 
   protected SnapshotScan(Table table, Schema schema, TableScanContext context) {
     super(table, schema, context);
@@ -189,21 +190,53 @@ public abstract class SnapshotScan<ThisT, T extends ScanTask, G extends ScanTask
   }
 
   public Snapshot snapshot() {
-    Snapshot snapshot =
-        snapshotId() != null ? table().snapshot(snapshotId()) : table().currentSnapshot();
+    Snapshot snapshot = tableSnapshot();
     if (snapshot == null) {
       return null;
     }
 
-    IndexSnapshot indexSnapshot = applicableIndexSnapshot(snapshot);
+    IndexSnapshot indexSnapshot = indexSelection(snapshot).indexSnapshot();
     return indexSnapshot != null ? indexSnapshot.snapshot() : snapshot;
   }
 
-  private IndexSnapshot applicableIndexSnapshot(Snapshot snapshot) {
+  /**
+   * Whether tasks planned for this scan must read the referenced data files immediately.
+   *
+   * <p>This is true when a skipping index is selected: the index serves the scan's filter columns
+   * from its optimized columns and records the data file location and row position for each indexed
+   * row, but does not cover all of the projected columns. In that case the index is used to locate
+   * matching rows and the original data files are read immediately from the positions recorded in
+   * the index. A covering index, which serves both the filter and the projection, does not trigger
+   * an immediate read.
+   *
+   * @return true if planned {@link FileScanTask}s should read data files immediately
+   */
+  protected boolean immediateDataFileRead() {
+    Snapshot snapshot = tableSnapshot();
+    if (snapshot == null) {
+      return false;
+    }
+
+    return indexSelection(snapshot).immediateDataFileRead();
+  }
+
+  private Snapshot tableSnapshot() {
+    return snapshotId() != null ? table().snapshot(snapshotId()) : table().currentSnapshot();
+  }
+
+  private IndexSelection indexSelection(Snapshot snapshot) {
+    if (indexSelection == null) {
+      this.indexSelection = evaluateIndexes(snapshot);
+    }
+
+    return indexSelection;
+  }
+
+  private IndexSelection evaluateIndexes(Snapshot snapshot) {
     Collection<IndexDefinition> availableIndexes = context().availableIndexes();
     IndexCatalog indexCatalog = context().indexCatalog();
     if (availableIndexes == null || indexCatalog == null) {
-      return null;
+      return IndexSelection.NONE;
     }
 
     Set<Integer> filterColumnIds =
@@ -211,27 +244,98 @@ public abstract class SnapshotScan<ThisT, T extends ScanTask, G extends ScanTask
             schema().asStruct(), Collections.singletonList(filter()), isCaseSensitive());
     Set<Integer> projectedColumnIds = TypeUtil.getProjectedIds(schema());
 
+    List<IndexDefinition> applicableIndexes = Lists.newArrayList();
     for (IndexDefinition index : availableIndexes) {
-      Set<Integer> optimizedColumnIds = toIdSet(index.optimizedColumnIds());
-      Set<Integer> indexedColumnIds = toIdSet(index.indexColumnIds());
-      indexedColumnIds.addAll(optimizedColumnIds);
-
-      boolean filterCovered = optimizedColumnIds.containsAll(filterColumnIds);
-      boolean projectionCovered = indexedColumnIds.containsAll(projectedColumnIds);
-      boolean snapshotAvailable =
-          Arrays.stream(index.availableTableSnapshots())
-              .anyMatch(id -> id == snapshot.snapshotId());
-
-      if (filterCovered && projectionCovered && snapshotAvailable) {
-        return indexCatalog.loadIndex(index.id()).snapshotForTableSnapshot(snapshot.snapshotId());
+      if (isApplicable(index, snapshot, filterColumnIds)) {
+        applicableIndexes.add(index);
       }
     }
 
-    return null;
+    // covering indexes are preferred: they serve both the filter and the projection, so the data
+    // files do not need to be read
+    for (IndexDefinition index : applicableIndexes) {
+      if (isCoveringIndex(index, projectedColumnIds)) {
+        return new IndexSelection(loadIndexSnapshot(indexCatalog, index, snapshot), false);
+      }
+    }
+
+    // otherwise a skipping index is used to locate matching rows and the referenced data files are
+    // read immediately from the positions recorded in the index
+    for (IndexDefinition index : applicableIndexes) {
+      if (isSkippingIndex(index, filterColumnIds)) {
+        return new IndexSelection(loadIndexSnapshot(indexCatalog, index, snapshot), true);
+      }
+    }
+
+    return IndexSelection.NONE;
+  }
+
+  /**
+   * Whether the index applies to the current snapshot and serves the scan's filter columns from its
+   * optimized columns. This is a precondition for both covering and skipping indexes.
+   */
+  private static boolean isApplicable(
+      IndexDefinition index, Snapshot snapshot, Set<Integer> filterColumnIds) {
+    boolean snapshotAvailable =
+        Arrays.stream(index.availableTableSnapshots()).anyMatch(id -> id == snapshot.snapshotId());
+    if (!snapshotAvailable) {
+      return false;
+    }
+
+    return toIdSet(index.optimizedColumnIds()).containsAll(filterColumnIds);
+  }
+
+  /**
+   * Whether the index covers the scan: all projected columns are available from the index and
+   * optimized columns. An empty filter is allowed.
+   */
+  private static boolean isCoveringIndex(IndexDefinition index, Set<Integer> projectedColumnIds) {
+    Set<Integer> coveredColumnIds = toIdSet(index.indexColumnIds());
+    coveredColumnIds.addAll(toIdSet(index.optimizedColumnIds()));
+    return coveredColumnIds.containsAll(projectedColumnIds);
+  }
+
+  /**
+   * Whether the index can be used to skip to matching rows: it records the data file location and
+   * row position for each indexed row. A non-empty filter is required.
+   */
+  private static boolean isSkippingIndex(IndexDefinition index, Set<Integer> filterColumnIds) {
+    if (filterColumnIds.isEmpty()) {
+      return false;
+    }
+
+    Set<Integer> indexedColumnIds = toIdSet(index.indexColumnIds());
+    return indexedColumnIds.contains(MetadataColumns.INDEX_FILE_PATH.fieldId())
+        && indexedColumnIds.contains(MetadataColumns.INDEX_ROW_POSITION.fieldId());
+  }
+
+  private static IndexSnapshot loadIndexSnapshot(
+      IndexCatalog indexCatalog, IndexDefinition index, Snapshot snapshot) {
+    return indexCatalog.loadIndex(index.id()).snapshotForTableSnapshot(snapshot.snapshotId());
   }
 
   private static Set<Integer> toIdSet(int[] ids) {
     return Arrays.stream(ids).boxed().collect(Collectors.toSet());
+  }
+
+  private static final class IndexSelection {
+    private static final IndexSelection NONE = new IndexSelection(null, false);
+
+    private final IndexSnapshot indexSnapshot;
+    private final boolean immediateDataFileRead;
+
+    private IndexSelection(IndexSnapshot indexSnapshot, boolean immediateDataFileRead) {
+      this.indexSnapshot = indexSnapshot;
+      this.immediateDataFileRead = immediateDataFileRead;
+    }
+
+    IndexSnapshot indexSnapshot() {
+      return indexSnapshot;
+    }
+
+    boolean immediateDataFileRead() {
+      return immediateDataFileRead;
+    }
   }
 
   @Override

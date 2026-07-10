@@ -77,7 +77,8 @@ public class DataTableScan extends BaseTableScan {
             .specsById(specs())
             .scanMetrics(scanMetrics())
             .ignoreDeleted()
-            .columnsToKeepStats(columnsToKeepStats());
+            .columnsToKeepStats(columnsToKeepStats())
+            .immediateDataFileRead(immediateDataFileRead());
 
     if (shouldIgnoreResiduals()) {
       manifestGroup = manifestGroup.ignoreResiduals();

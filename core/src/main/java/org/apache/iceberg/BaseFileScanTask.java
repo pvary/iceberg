@@ -28,6 +28,7 @@ import org.apache.iceberg.util.ScanTaskUtil;
 public class BaseFileScanTask extends BaseContentScanTask<FileScanTask, DataFile>
     implements FileScanTask {
   private final DeleteFile[] deletes;
+  private final boolean immediateDataFileRead;
   private transient volatile List<DeleteFile> deleteList = null;
   private transient volatile long deletesSizeBytes = 0L;
 
@@ -37,8 +38,19 @@ public class BaseFileScanTask extends BaseContentScanTask<FileScanTask, DataFile
       String schemaString,
       String specString,
       ResidualEvaluator residuals) {
+    this(file, deletes, schemaString, specString, residuals, false);
+  }
+
+  public BaseFileScanTask(
+      DataFile file,
+      DeleteFile[] deletes,
+      String schemaString,
+      String specString,
+      ResidualEvaluator residuals,
+      boolean immediateDataFileRead) {
     super(file, schemaString, specString, residuals);
     this.deletes = deletes != null ? deletes : new DeleteFile[0];
+    this.immediateDataFileRead = immediateDataFileRead;
   }
 
   @Override
@@ -58,6 +70,11 @@ public class BaseFileScanTask extends BaseContentScanTask<FileScanTask, DataFile
     }
 
     return deleteList;
+  }
+
+  @Override
+  public boolean immediateDataFileRead() {
+    return immediateDataFileRead;
   }
 
   @Override
@@ -116,6 +133,11 @@ public class BaseFileScanTask extends BaseContentScanTask<FileScanTask, DataFile
     @Override
     public List<DeleteFile> deletes() {
       return fileScanTask.deletes();
+    }
+
+    @Override
+    public boolean immediateDataFileRead() {
+      return fileScanTask.immediateDataFileRead();
     }
 
     @Override
