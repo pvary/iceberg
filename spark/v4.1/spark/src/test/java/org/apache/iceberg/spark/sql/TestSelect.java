@@ -23,34 +23,28 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.Assumptions.assumeThat;
 
-import java.io.IOException;
 import java.sql.Timestamp;
 import java.text.SimpleDateFormat;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
-import org.apache.iceberg.DataFile;
-import org.apache.iceberg.DataFiles;
-import org.apache.iceberg.FileFormat;
-import org.apache.iceberg.FileScanTask;
+import org.apache.iceberg.HasTableOperations;
 import org.apache.iceberg.IndexSnapshots;
 import org.apache.iceberg.MetadataColumns;
 import org.apache.iceberg.Parameter;
 import org.apache.iceberg.ParameterizedTestExtension;
 import org.apache.iceberg.Parameters;
-import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
+import org.apache.iceberg.TableMetadata;
+import org.apache.iceberg.TableOperations;
 import org.apache.iceberg.catalog.Catalog;
 import org.apache.iceberg.catalog.IndexCatalog;
 import org.apache.iceberg.catalog.IndexIdentifier;
 import org.apache.iceberg.catalog.Namespace;
 import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.data.GenericRecord;
-import org.apache.iceberg.data.Record;
-import org.apache.iceberg.data.parquet.GenericParquetReaders;
-import org.apache.iceberg.data.parquet.GenericParquetWriter;
 import org.apache.iceberg.events.Listeners;
 import org.apache.iceberg.events.ScanEvent;
 import org.apache.iceberg.exceptions.ValidationException;
@@ -58,11 +52,6 @@ import org.apache.iceberg.expressions.Expressions;
 import org.apache.iceberg.hive.HiveCatalog;
 import org.apache.iceberg.index.IndexType;
 import org.apache.iceberg.inmemory.InMemoryCatalog;
-import org.apache.iceberg.io.CloseableIterable;
-import org.apache.iceberg.io.FileAppender;
-import org.apache.iceberg.io.FileIO;
-import org.apache.iceberg.io.OutputFile;
-import org.apache.iceberg.parquet.Parquet;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.spark.CatalogTestBase;
@@ -772,182 +761,83 @@ public class TestSelect extends CatalogTestBase {
   }
 
   @TestTemplate
-  public void testSelectQueriesIndexSnapshot() {
+  public void testSelectQueriesWithCoveringIndex() {
     // Register a dedicated Spark catalog backed by an in-memory Iceberg catalog that implements
     // IndexCatalog so the read path can route the query to an index snapshot.
     String indexCatalogName = "index_cat_" + catalogName;
-    spark.conf().set("spark.sql.catalog." + indexCatalogName, SparkCatalog.class.getName());
-    spark
-        .conf()
-        .set(
-            "spark.sql.catalog." + indexCatalogName + ".catalog-impl",
-            InMemoryCatalog.class.getName());
-    spark.conf().set("spark.sql.catalog." + indexCatalogName + ".cache-enabled", "false");
+    registerIndexCatalog(indexCatalogName);
 
     String namespace = "db";
-    String baseTable = indexCatalogName + "." + namespace + ".indexed";
-    String indexDataTable = indexCatalogName + "." + namespace + ".index_data";
+    String baseTable = fqn(indexCatalogName, namespace, "indexed");
+    String holderTable = fqn(indexCatalogName, namespace, "index_holder");
 
     try {
-      sql("CREATE NAMESPACE IF NOT EXISTS %s.%s", indexCatalogName, namespace);
+      createBaseTable(indexCatalogName, namespace, "indexed");
 
-      // base table holding the original data; "category" (column id 3) is not covered by the index
-      sql("CREATE TABLE %s (id bigint, data string, category string) USING iceberg", baseTable);
-      sql("INSERT INTO %s VALUES (1, 'a', 'p'), (2, 'b', 'q'), (3, 'c', 'r')", baseTable);
+      // the index covers the "id" and "category" columns; its snapshot is backed by a separate
+      // table populated from the source, so a served query is answered from the index snapshot
+      long indexSnapshotId =
+          createCoveringIndex(
+              indexCatalogName,
+              namespace,
+              "indexed",
+              "covering_index",
+              "index_holder",
+              ImmutableList.of("id"),
+              ImmutableList.of("category"));
 
-      // separate table whose data files back the index snapshot (distinguishable rows). It only
-      // contains the indexed columns (id, data).
-      sql("CREATE TABLE %s (id bigint, data string) USING iceberg", indexDataTable);
-      sql("INSERT INTO %s VALUES (4, 'x'), (5, 'y'), (6, 'z')", indexDataTable);
+      resetScanEvents();
 
-      Catalog icebergCatalog = Spark3Util.loadIcebergCatalog(spark, indexCatalogName);
-      IndexCatalog indexCatalog = (IndexCatalog) icebergCatalog;
-
-      TableIdentifier baseIdent = TableIdentifier.of(Namespace.of(namespace), "indexed");
-      TableIdentifier indexDataIdent = TableIdentifier.of(Namespace.of(namespace), "index_data");
-
-      Table base = icebergCatalog.loadTable(baseIdent);
-      Table indexData = icebergCatalog.loadTable(indexDataIdent);
-
-      long baseSnapshotId = base.currentSnapshot().snapshotId();
-      String manifestList = indexData.currentSnapshot().manifestListLocation();
-
-      // the index covers only the id (1) and data (2) columns
-      IndexIdentifier indexIdent = IndexIdentifier.of(baseIdent, "data_index");
-      indexCatalog
-          .buildIndex(indexIdent)
-          .withTableUuid(base.uuid())
-          .withType(IndexType.BTREE)
-          .withIndexColumnIds(2)
-          .withOptimizedColumnIds(1)
-          .create();
-
-      indexCatalog
-          .loadIndex(indexIdent)
-          .addIndexSnapshot()
-          .withTableSnapshotId(baseSnapshotId)
-          .withIndexSnapshotId(1L)
-          .withSnapshotProperty(IndexSnapshots.MANIFEST_LIST, manifestList)
-          .commit();
-
-      // querying only indexed columns is served from the index snapshot's data
+      // querying only covered columns is served from the index snapshot
       assertEquals(
-          "Query using only indexed columns should be served from the index snapshot",
-          ImmutableList.of(row(4L, "x"), row(5L, "y"), row(6L, "z")),
-          sql("SELECT id, data FROM %s ORDER BY id", baseTable));
+          "Query using only covered columns should be served from the index snapshot",
+          ImmutableList.of(row(1L, "p"), row(2L, "q"), row(3L, "r")),
+          sql("SELECT id, category FROM %s ORDER BY id", baseTable));
+      assertThat(lastScanEvent.snapshotId())
+          .as("Scan should be routed through the index snapshot")
+          .isEqualTo(indexSnapshotId);
 
-      // querying the unindexed "category" column falls back to the original table
+      // querying the uncovered "data" column falls back to the original table
       assertEquals(
-          "Query using an unindexed column should be served from the original table",
+          "Query using an uncovered column should be served from the original table",
           ImmutableList.of(row(1L, "a", "p"), row(2L, "b", "q"), row(3L, "c", "r")),
           sql("SELECT id, data, category FROM %s ORDER BY id", baseTable));
+      assertThat(lastScanEvent.snapshotId())
+          .as("Scan using an uncovered column should not use the index snapshot")
+          .isNotEqualTo(indexSnapshotId);
     } finally {
       sql("DROP TABLE IF EXISTS %s", baseTable);
-      sql("DROP TABLE IF EXISTS %s", indexDataTable);
+      sql("DROP TABLE IF EXISTS %s", holderTable);
     }
   }
 
   @TestTemplate
-  public void testSelectQueriesWithImmediateDataFileRead() throws IOException {
+  public void testSelectQueriesWithSkippingIndex() {
     // Register a dedicated Spark catalog backed by an in-memory Iceberg catalog that implements
     // IndexCatalog so the read path can route the query through an index snapshot.
     String indexCatalogName = "immediate_read_cat_" + catalogName;
-    spark.conf().set("spark.sql.catalog." + indexCatalogName, SparkCatalog.class.getName());
-    spark
-        .conf()
-        .set(
-            "spark.sql.catalog." + indexCatalogName + ".catalog-impl",
-            InMemoryCatalog.class.getName());
-    spark.conf().set("spark.sql.catalog." + indexCatalogName + ".cache-enabled", "false");
+    registerIndexCatalog(indexCatalogName);
 
     String namespace = "db";
-    String baseTable = indexCatalogName + "." + namespace + ".indexed";
+    String baseTable = fqn(indexCatalogName, namespace, "indexed");
+    String holderTable = fqn(indexCatalogName, namespace, "index_holder");
 
     try {
-      sql("CREATE NAMESPACE IF NOT EXISTS %s.%s", indexCatalogName, namespace);
+      createBaseTable(indexCatalogName, namespace, "indexed");
 
-      // base table holding the original data; "category" (column id 3) is not covered by the index
-      sql("CREATE TABLE %s (id bigint, data string, category string) USING iceberg", baseTable);
-      sql("INSERT INTO %s VALUES (1, 'a', 'p'), (2, 'b', 'q'), (3, 'c', 'r')", baseTable);
-
-      Catalog icebergCatalog = Spark3Util.loadIcebergCatalog(spark, indexCatalogName);
-      IndexCatalog indexCatalog = (IndexCatalog) icebergCatalog;
-
-      TableIdentifier baseIdent = TableIdentifier.of(Namespace.of(namespace), "indexed");
-      Table base = icebergCatalog.loadTable(baseIdent);
-      long baseSnapshotId = base.currentSnapshot().snapshotId();
-
-      // build an index file that stores the optimized "id" column and maps each indexed row to its
-      // position in the base data files via the _index_file_path and _index_pos metadata columns
-      Schema indexSchema =
-          new Schema(
-              base.schema().findField("id"),
-              MetadataColumns.INDEX_FILE_PATH,
-              MetadataColumns.INDEX_ROW_POSITION);
-      List<Record> indexRecords = Lists.newArrayList();
-      try (CloseableIterable<FileScanTask> tasks = base.newScan().planFiles()) {
-        for (FileScanTask task : tasks) {
-          String dataFileLocation = task.file().location();
-          long position = 0;
-          try (CloseableIterable<Record> baseRows =
-              Parquet.read(base.io().newInputFile(dataFileLocation))
-                  .project(base.schema())
-                  .createReaderFunc(
-                      fileSchema -> GenericParquetReaders.buildReader(base.schema(), fileSchema))
-                  .build()) {
-            for (Record baseRow : baseRows) {
-              Record record = GenericRecord.create(indexSchema);
-              record.setField("id", baseRow.getField("id"));
-              record.setField(MetadataColumns.INDEX_FILE_PATH.name(), dataFileLocation);
-              record.setField(MetadataColumns.INDEX_ROW_POSITION.name(), position);
-              indexRecords.add(record);
-              position++;
-            }
-          }
-        }
-      }
-
-      // an unpartitioned holder table provides a manifest list that references the index file
-      TableIdentifier holderIdent = TableIdentifier.of(Namespace.of(namespace), "index_holder");
-      Table holder =
-          icebergCatalog.createTable(
-              holderIdent,
-              new Schema(Types.NestedField.required(1, "x", Types.StringType.get())),
-              PartitionSpec.unpartitioned());
-      DataFile indexDataFile =
-          writeIndexFile(
-              holder.io(),
-              holder.location() + "/data/index-00000.parquet",
-              indexSchema,
-              indexRecords);
-      holder.newAppend().appendFile(indexDataFile).commit();
-      String manifestList = holder.currentSnapshot().manifestListLocation();
-
-      // the index optimizes "id" (1) for filtering and records the data file location and row
+      // the skipping index optimizes "id" for filtering and records the data file location and row
       // position for each indexed row, so the read path can skip to the matching base rows;
-      // "category" (3) is neither optimized nor indexed
-      IndexIdentifier indexIdent = IndexIdentifier.of(baseIdent, "id_index");
-      indexCatalog
-          .buildIndex(indexIdent)
-          .withTableUuid(base.uuid())
-          .withType(IndexType.BTREE)
-          .withIndexColumnIds(
-              MetadataColumns.INDEX_FILE_PATH.fieldId(),
-              MetadataColumns.INDEX_ROW_POSITION.fieldId())
-          .withOptimizedColumnIds(1)
-          .create();
+      // "category" is neither optimized nor indexed
+      long indexSnapshotId =
+          createSkippingIndex(
+              indexCatalogName,
+              namespace,
+              "indexed",
+              "id_index",
+              "index_holder",
+              ImmutableList.of("id"));
 
-      long indexSnapshotId = 1L;
-      indexCatalog
-          .loadIndex(indexIdent)
-          .addIndexSnapshot()
-          .withTableSnapshotId(baseSnapshotId)
-          .withIndexSnapshotId(indexSnapshotId)
-          .withSnapshotProperty(IndexSnapshots.MANIFEST_LIST, manifestList)
-          .commit();
-
-      this.scanEventCount = 0;
-      this.lastScanEvent = null;
+      resetScanEvents();
 
       // filtering on the optimized "id" column while projecting the unindexed "category" column:
       // the index locates the matching row, which is then read immediately from the base data file
@@ -961,34 +851,257 @@ public class TestSelect extends CatalogTestBase {
       assertThat(lastScanEvent.snapshotId())
           .as("Scan should be routed through the index snapshot")
           .isEqualTo(indexSnapshotId);
-      assertThat(lastScanEvent.snapshotId())
-          .as("Scan should not use the base table snapshot")
-          .isNotEqualTo(baseSnapshotId);
-
-      sql("DROP TABLE IF EXISTS %s", indexCatalogName + "." + namespace + ".index_holder");
     } finally {
       sql("DROP TABLE IF EXISTS %s", baseTable);
-      sql("DROP TABLE IF EXISTS %s", indexCatalogName + "." + namespace + ".index_holder");
+      sql("DROP TABLE IF EXISTS %s", holderTable);
     }
   }
 
-  private static DataFile writeIndexFile(
-      FileIO io, String location, Schema indexSchema, List<Record> records) throws IOException {
-    OutputFile outputFile = io.newOutputFile(location);
-    try (FileAppender<Record> appender =
-        Parquet.write(outputFile)
-            .schema(indexSchema)
-            .createWriterFunc(GenericParquetWriter::create)
-            .overwrite()
-            .build()) {
-      appender.addAll(records);
+  /**
+   * Registers a Spark catalog backed by an in-memory Iceberg catalog that implements {@link
+   * IndexCatalog}, so the read path can route queries through an index snapshot.
+   */
+  private void registerIndexCatalog(String indexCatalogName) {
+    spark.conf().set("spark.sql.catalog." + indexCatalogName, SparkCatalog.class.getName());
+    spark
+        .conf()
+        .set(
+            "spark.sql.catalog." + indexCatalogName + ".catalog-impl",
+            InMemoryCatalog.class.getName());
+    spark.conf().set("spark.sql.catalog." + indexCatalogName + ".cache-enabled", "false");
+  }
+
+  /**
+   * Creates the namespace and the source table {@code (id, data, category)} seeded with three rows.
+   */
+  private void createBaseTable(String indexCatalogName, String namespace, String tableName) {
+    sql("CREATE NAMESPACE IF NOT EXISTS %s.%s", indexCatalogName, namespace);
+    String table = fqn(indexCatalogName, namespace, tableName);
+    sql("CREATE TABLE %s (id bigint, data string, category string) USING iceberg", table);
+    sql("INSERT INTO %s VALUES (1, 'a', 'p'), (2, 'b', 'q'), (3, 'c', 'r')", table);
+  }
+
+  /** Clears the recorded scan events so the following query's routing can be asserted. */
+  private void resetScanEvents() {
+    this.scanEventCount = 0;
+    this.lastScanEvent = null;
+  }
+
+  /**
+   * Creates a covering index over the given source table and registers a snapshot for it.
+   *
+   * <p>A covering index contains every column needed to answer a query on its own: the optimized
+   * columns used for filtering and the index columns that can be projected. When a query touches
+   * only these columns the read path serves it entirely from the index snapshot and never opens the
+   * source table's data files.
+   *
+   * <p>The index snapshot is backed by a separate table holding copies of the covered columns. The
+   * backing table is created by copying the source columns (so their field ids match the source and
+   * the index snapshot can be read against the source schema) and populated from the source with
+   * SQL. The index metadata records the optimized and index column ids, and the registered snapshot
+   * points at the backing table's manifest list.
+   *
+   * @param indexCatalogName the Spark catalog that hosts the source table and the backing table
+   * @param namespace the namespace of the source table and the backing table
+   * @param sourceTableName the indexed source table
+   * @param indexName the name of the index to create on the source table
+   * @param backingName the name of the table that backs the index snapshot
+   * @param optimizedColumnNames the source columns the index optimizes for filtering
+   * @param indexColumnNames the source columns the index can project
+   * @return the registered index snapshot id
+   */
+  private long createCoveringIndex(
+      String indexCatalogName,
+      String namespace,
+      String sourceTableName,
+      String indexName,
+      String backingName,
+      List<String> optimizedColumnNames,
+      List<String> indexColumnNames) {
+    Catalog icebergCatalog = Spark3Util.loadIcebergCatalog(spark, indexCatalogName);
+    IndexCatalog indexCatalog = (IndexCatalog) icebergCatalog;
+
+    TableIdentifier baseIdent = TableIdentifier.of(Namespace.of(namespace), sourceTableName);
+    Table source = icebergCatalog.loadTable(baseIdent);
+    IndexIdentifier indexIdent = IndexIdentifier.of(baseIdent, indexName);
+
+    // the backing table covers the union of the optimized (filter) and index (projected) columns so
+    // a query that touches only these columns can be answered from the index snapshot alone
+    List<String> coveredColumnNames = union(optimizedColumnNames, indexColumnNames);
+    String sourceTable = fqn(indexCatalogName, namespace, sourceTableName);
+    String backingTable = fqn(indexCatalogName, namespace, backingName);
+    copyColumns(sourceTable, backingTable, source, coveredColumnNames);
+    sql(
+        "INSERT INTO %s SELECT %s FROM %s",
+        backingTable, String.join(", ", coveredColumnNames), sourceTable);
+
+    indexCatalog
+        .buildIndex(indexIdent)
+        .withTableUuid(source.uuid())
+        .withType(IndexType.BTREE)
+        .withIndexColumnIds(columnIds(source, indexColumnNames))
+        .withOptimizedColumnIds(columnIds(source, optimizedColumnNames))
+        .create();
+
+    Table backing =
+        icebergCatalog.loadTable(TableIdentifier.of(Namespace.of(namespace), backingName));
+    return registerIndexSnapshot(
+        indexCatalog, indexIdent, source.currentSnapshot().snapshotId(), backing);
+  }
+
+  /**
+   * Creates a skipping index over the given source table and registers a snapshot for it.
+   *
+   * <p>A skipping index stores only the optimized columns used for filtering plus, for every row,
+   * the location of the source data file ({@code _index_file_path}) and the row's position within
+   * it ({@code _index_pos}). A query filters against the index to find the matching rows and then
+   * reads them immediately from the referenced source data files, so columns that are not part of
+   * the index can still be projected without scanning the whole source table.
+   *
+   * <p>The index snapshot is backed by a holder table built in three steps: the optimized columns
+   * are copied from the source (preserving their field ids), the {@code _index_file_path} and
+   * {@code _index_pos} metadata columns are added with their reserved field ids, and the rows are
+   * populated from the source together with its {@code _file} and {@code _pos} metadata columns.
+   * The index metadata records the optimized column ids and the two metadata column ids, and the
+   * registered snapshot points at the holder table's manifest list.
+   *
+   * @param indexCatalogName the Spark catalog that hosts the source table and the holder table
+   * @param namespace the namespace of the source table and the holder table
+   * @param sourceTableName the indexed source table
+   * @param indexName the name of the index to create on the source table
+   * @param holderName the name of the table that backs the index snapshot
+   * @param optimizedColumnNames the source columns the index optimizes for filtering
+   * @return the registered index snapshot id
+   */
+  private long createSkippingIndex(
+      String indexCatalogName,
+      String namespace,
+      String sourceTableName,
+      String indexName,
+      String holderName,
+      List<String> optimizedColumnNames) {
+    Catalog icebergCatalog = Spark3Util.loadIcebergCatalog(spark, indexCatalogName);
+    IndexCatalog indexCatalog = (IndexCatalog) icebergCatalog;
+
+    TableIdentifier baseIdent = TableIdentifier.of(Namespace.of(namespace), sourceTableName);
+    Table source = icebergCatalog.loadTable(baseIdent);
+    IndexIdentifier indexIdent = IndexIdentifier.of(baseIdent, indexName);
+
+    // the holder table keeps the optimized columns from the source with their field ids preserved,
+    // then gains the metadata columns that locate each indexed row in the source data files
+    String sourceTable = fqn(indexCatalogName, namespace, sourceTableName);
+    String holderTable = fqn(indexCatalogName, namespace, holderName);
+    copyColumns(sourceTable, holderTable, source, optimizedColumnNames);
+
+    TableIdentifier holderIdent = TableIdentifier.of(Namespace.of(namespace), holderName);
+    addIndexMetadataColumns(icebergCatalog, holderIdent);
+
+    // populate the optimized columns from the source together with the source data file location
+    // (_file) and row position (_pos) metadata columns that locate each indexed row
+    sql(
+        "INSERT INTO %s SELECT %s, _file, _pos FROM %s",
+        holderTable, String.join(", ", optimizedColumnNames), sourceTable);
+
+    indexCatalog
+        .buildIndex(indexIdent)
+        .withTableUuid(source.uuid())
+        .withType(IndexType.BTREE)
+        .withIndexColumnIds(
+            MetadataColumns.INDEX_FILE_PATH.fieldId(), MetadataColumns.INDEX_ROW_POSITION.fieldId())
+        .withOptimizedColumnIds(columnIds(source, optimizedColumnNames))
+        .create();
+
+    Table holder = icebergCatalog.loadTable(holderIdent);
+    return registerIndexSnapshot(
+        indexCatalog, indexIdent, source.currentSnapshot().snapshotId(), holder);
+  }
+
+  /**
+   * Copies the given columns of the source table into a new backing table, preserving their field
+   * ids.
+   *
+   * <p>The backing table is created as an empty copy of the source ({@code CREATE TABLE ... AS
+   * SELECT ... WHERE false}) so the kept columns retain the source field ids, then the columns that
+   * are not requested are dropped. Dropping columns leaves the remaining field ids unchanged, so
+   * the backing table can be read against the source schema.
+   */
+  private void copyColumns(
+      String sourceTable, String backingTable, Table source, List<String> keptColumnNames) {
+    sql("CREATE TABLE %s USING iceberg AS SELECT * FROM %s WHERE false", backingTable, sourceTable);
+    for (Types.NestedField field : source.schema().columns()) {
+      if (!keptColumnNames.contains(field.name())) {
+        sql("ALTER TABLE %s DROP COLUMN %s", backingTable, field.name());
+      }
+    }
+  }
+
+  /**
+   * Adds the INDEX_FILE_PATH and INDEX_ROW_POSITION metadata columns to the holder table with their
+   * reserved field ids.
+   *
+   * <p>The columns are appended to the holder's current schema through a metadata commit rather
+   * than {@code ALTER TABLE ADD COLUMN}, because adding columns with SQL would assign fresh field
+   * ids instead of the reserved metadata ids the read path expects.
+   */
+  private static void addIndexMetadataColumns(Catalog icebergCatalog, TableIdentifier holderIdent) {
+    TableOperations ops = ((HasTableOperations) icebergCatalog.loadTable(holderIdent)).operations();
+    TableMetadata metadata = ops.current();
+
+    List<Types.NestedField> columns = Lists.newArrayList(metadata.schema().columns());
+    columns.add(MetadataColumns.INDEX_FILE_PATH);
+    columns.add(MetadataColumns.INDEX_ROW_POSITION);
+    Schema indexSchema = new Schema(columns);
+
+    ops.commit(
+        metadata,
+        TableMetadata.buildFrom(metadata)
+            .setCurrentSchema(indexSchema, MetadataColumns.INDEX_FILE_PATH.fieldId())
+            .build());
+  }
+
+  /**
+   * Registers a snapshot for the index that points at the backing table's manifest list.
+   *
+   * @return the registered index snapshot id
+   */
+  private static long registerIndexSnapshot(
+      IndexCatalog indexCatalog, IndexIdentifier indexIdent, long tableSnapshotId, Table backing) {
+    long indexSnapshotId = ThreadLocalRandom.current().nextLong();
+    indexCatalog
+        .loadIndex(indexIdent)
+        .addIndexSnapshot()
+        .withTableSnapshotId(tableSnapshotId)
+        .withIndexSnapshotId(indexSnapshotId)
+        .withSnapshotProperty(
+            IndexSnapshots.MANIFEST_LIST, backing.currentSnapshot().manifestListLocation())
+        .commit();
+    return indexSnapshotId;
+  }
+
+  /** Returns the field ids of the named columns in the table schema. */
+  private static int[] columnIds(Table table, List<String> columnNames) {
+    return columnNames.stream()
+        .mapToInt(name -> table.schema().findField(name).fieldId())
+        .toArray();
+  }
+
+  /**
+   * Returns the columns of {@code first} followed by the columns of {@code second} not already in
+   * it.
+   */
+  private static List<String> union(List<String> first, List<String> second) {
+    List<String> result = Lists.newArrayList(first);
+    for (String value : second) {
+      if (!result.contains(value)) {
+        result.add(value);
+      }
     }
 
-    return DataFiles.builder(PartitionSpec.unpartitioned())
-        .withPath(location)
-        .withFormat(FileFormat.PARQUET)
-        .withFileSizeInBytes(io.newInputFile(location).getLength())
-        .withRecordCount(records.size())
-        .build();
+    return result;
+  }
+
+  /** Returns the fully-qualified {@code catalog.namespace.table} name. */
+  private static String fqn(String indexCatalogName, String namespace, String tableName) {
+    return indexCatalogName + "." + namespace + "." + tableName;
   }
 }
