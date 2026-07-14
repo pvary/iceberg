@@ -38,10 +38,10 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Streams;
+import org.apache.iceberg.util.ManagedThreadPools;
 import org.apache.iceberg.util.SerializableMap;
 import org.apache.iceberg.util.SerializableSupplier;
 import org.apache.iceberg.util.Tasks;
-import org.apache.iceberg.util.ThreadPools;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -212,7 +212,7 @@ public class HadoopFileIO implements HadoopConfigurable, DelegateFileIO {
       synchronized (HadoopFileIO.class) {
         if (executorService == null) {
           executorService =
-              ThreadPools.newExitingWorkerPool(DELETE_FILE_POOL_NAME, deleteThreads());
+              ManagedThreadPools.newExitingWorkerPool(DELETE_FILE_POOL_NAME, deleteThreads());
         }
       }
     }

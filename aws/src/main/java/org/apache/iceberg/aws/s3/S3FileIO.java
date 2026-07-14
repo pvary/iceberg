@@ -59,11 +59,11 @@ import org.apache.iceberg.relocated.com.google.common.collect.Multimaps;
 import org.apache.iceberg.relocated.com.google.common.collect.SetMultimap;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 import org.apache.iceberg.relocated.com.google.common.collect.Streams;
+import org.apache.iceberg.util.ManagedThreadPools;
 import org.apache.iceberg.util.PropertyUtil;
 import org.apache.iceberg.util.SerializableMap;
 import org.apache.iceberg.util.SerializableSupplier;
 import org.apache.iceberg.util.Tasks;
-import org.apache.iceberg.util.ThreadPools;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.core.exception.SdkException;
@@ -482,7 +482,7 @@ public class S3FileIO
       synchronized (S3FileIO.class) {
         if (executorService == null) {
           executorService =
-              ThreadPools.newExitingScheduledPool(
+              ManagedThreadPools.newExitingScheduledPool(
                   "iceberg-s3fileio-tasks",
                   clientForStoragePath(ROOT_PREFIX).s3FileIOProperties().deleteThreads(),
                   Duration.ofSeconds(10));

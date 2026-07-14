@@ -51,9 +51,9 @@ import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterators;
 import org.apache.iceberg.relocated.com.google.common.collect.Streams;
+import org.apache.iceberg.util.ManagedThreadPools;
 import org.apache.iceberg.util.SerializableMap;
 import org.apache.iceberg.util.SerializableSupplier;
-import org.apache.iceberg.util.ThreadPools;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -264,7 +264,7 @@ public class GCSFileIO implements DelegateFileIO, SupportsStorageCredentials {
       synchronized (GCSFileIO.class) {
         if (executorService == null) {
           executorService =
-              ThreadPools.newExitingScheduledPool(
+              ManagedThreadPools.newExitingScheduledPool(
                   "iceberg-gcsfileio-tasks", 1, Duration.ofSeconds(10));
         }
       }

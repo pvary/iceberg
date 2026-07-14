@@ -1,0 +1,196 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+package org.apache.iceberg.util;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class ManagedThreadPools {
+  private static final Logger LOG = LoggerFactory.getLogger(ManagedThreadPools.class);
+
+  private ManagedThreadPools() {}
+
+  private static final Duration DEFAULT_SHUTDOWN_TIMEOUT = Duration.ofSeconds(120);
+
+  private static final ThreadPoolManager THREAD_POOL_MANAGER = new ThreadPoolManager();
+
+  private static Thread shutdownHook;
+
+  static {
+    init();
+  }
+
+  /**
+   * Creates a fixed-size thread pool that uses daemon threads. The pool will be stopped by the
+   * shutdown hook to ensure the pool terminates when the JVM exits - unless {@link
+   * #removeShutdownHook()} is called, in which case it is user's responsibility to stop the
+   * threadpools using the {@link #shutdownThreadPools()} method.
+   */
+  public static ExecutorService newExitingWorkerPool(String namePrefix, int poolSize) {
+    ExecutorService service =
+        Executors.unconfigurableExecutorService(
+            ThreadPools.newFixedThreadPool(namePrefix, poolSize));
+    THREAD_POOL_MANAGER.addThreadPool(service, DEFAULT_SHUTDOWN_TIMEOUT);
+    return service;
+  }
+
+  /**
+   * Create a new {@link ScheduledExecutorService} with the given name and pool size.
+   *
+   * <p>Threads used by this service will be daemon threads.
+   *
+   * <p>The service registers a shutdown hook to ensure that it terminates when the JVM exits. This
+   * is suitable for long-lived thread pools that should be automatically cleaned up on JVM
+   * shutdown.
+   */
+  public static synchronized ScheduledExecutorService newExitingScheduledPool(
+      String namePrefix, int poolSize, Duration terminationTimeout) {
+    ScheduledExecutorService service =
+        Executors.unconfigurableScheduledExecutorService(
+            ThreadPools.newScheduledPool(namePrefix, poolSize));
+    THREAD_POOL_MANAGER.addThreadPool(service, terminationTimeout);
+    return service;
+  }
+
+  /**
+   * Shuts down all thread pools registered via {@link #newExitingWorkerPool(String, int)} or {@link
+   * #newExitingScheduledPool(String, int, Duration)} and removes the JVM shutdown hook.
+   *
+   * <p>This method is useful for:
+   *
+   * <ul>
+   *   <li>Preventing thread pool leaks in hot-reload environments
+   *   <li>Managing graceful application shutdown when the application needs to handle its own
+   *       shutdown hooks (e.g. to commit pending files before exiting)
+   * </ul>
+   *
+   * <p>Only call this method at the end of the intended usage of the iceberg operations. Calling it
+   * earlier will stop thread pools required for normal data export workflows. Intended use cases
+   * are: the application has called {@link #removeShutdownHook()} intending to call this method at
+   * the end of it's own shutdown hook; the application calls this method after stopping all iceberg
+   * operations - before unloading the iceberg jar file in a hot-reload JVM environement.
+   */
+  public static void shutdownThreadPools() {
+    THREAD_POOL_MANAGER.shutdownAll();
+    removeShutdownHook();
+  }
+
+  /**
+   * Initialize a shutdown hook to stop the thread pools created via the {@link
+   * #newExitingWorkerPool(String, int)}.
+   */
+  @SuppressWarnings("ShutdownHook")
+  @VisibleForTesting
+  static synchronized void init() {
+    if (shutdownHook == null) {
+      shutdownHook =
+          Executors.defaultThreadFactory()
+              .newThread(
+                  () -> {
+                    THREAD_POOL_MANAGER.shutdownAll();
+                  });
+
+      try {
+        shutdownHook.setName("DelayedShutdownHook-iceberg");
+      } catch (SecurityException e) {
+        LOG.warn("Cannot set thread name for the shutdown hook", e);
+      }
+
+      try {
+        Runtime.getRuntime().addShutdownHook(shutdownHook);
+      } catch (SecurityException e) {
+        LOG.warn("Cannot install a shutdown hook for thread pools clean up", e);
+      }
+    }
+  }
+
+  /**
+   * Remove the shutdown hook for the thread pools created via the {@link
+   * #newExitingWorkerPool(String, int)}.
+   *
+   * <p>Thread pools can still be stopped manually via the {@link #shutdownThreadPools()} method.
+   */
+  @SuppressWarnings("ShutdownHook")
+  public static synchronized void removeShutdownHook() {
+    if (shutdownHook != null) {
+      try {
+        Runtime.getRuntime().removeShutdownHook(shutdownHook);
+      } catch (SecurityException e) {
+        LOG.warn("Cannot remove the shutdown hook for thread pools clean up", e);
+      }
+
+      shutdownHook = null;
+    }
+  }
+
+  /** Manages the lifecycle of thread pools that need to be shut down gracefully. */
+  private static class ThreadPoolManager {
+    private final List<ExecutorServiceWithTimeout> threadPoolsToShutdown = Lists.newArrayList();
+
+    /**
+     * Add an executor service to the list of thread pools to be shut down.
+     *
+     * @param service the executor service to add
+     * @param timeout the timeout for shutdown operations
+     */
+    private synchronized void addThreadPool(ExecutorService service, Duration timeout) {
+      threadPoolsToShutdown.add(new ExecutorServiceWithTimeout(service, timeout));
+    }
+
+    /** Shut down all registered thread pools. */
+    private synchronized void shutdownAll() {
+      long startTime = System.nanoTime();
+
+      for (ExecutorServiceWithTimeout item : threadPoolsToShutdown) {
+        item.service().shutdown();
+      }
+
+      threadPoolsToShutdown.sort(
+          (a, b) -> Long.compare(a.timeout().toNanos(), b.timeout().toNanos()));
+
+      for (ExecutorServiceWithTimeout item : threadPoolsToShutdown) {
+        long timeElapsed = System.nanoTime() - startTime;
+        long remainingTime = item.timeout().toNanos() - timeElapsed;
+        if (remainingTime > 0) {
+          try {
+            if (!item.service.awaitTermination(remainingTime, TimeUnit.NANOSECONDS)) {
+              item.service().shutdownNow();
+            }
+          } catch (InterruptedException e) {
+            LOG.warn("Interrupted while shutting down, ignoring", e);
+          }
+        } else {
+          item.service().shutdownNow();
+        }
+      }
+
+      threadPoolsToShutdown.clear();
+    }
+  }
+
+  private record ExecutorServiceWithTimeout(ExecutorService service, Duration timeout) {}
+}
