@@ -47,6 +47,7 @@ import org.apache.iceberg.encryption.EncryptingFileIO;
 import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.InputFileResolver;
 import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.mapping.NameMappingParser;
 import org.apache.iceberg.spark.SparkExecutorCache;
@@ -178,6 +179,27 @@ abstract class BaseReader<T, TaskT extends ScanTask> implements Closeable {
 
   protected InputFile getInputFile(String location) {
     return inputFiles().get(location);
+  }
+
+  /**
+   * Returns a resolver for files that a reader must open in addition to the files planned by the
+   * scan, like the files a data file references. Files planned by the scan are served from the
+   * task's input files; any other location is opened through the table's {@link FileIO}, decrypting
+   * it when the caller knows its key metadata.
+   */
+  protected InputFileResolver fileResolver() {
+    return (location, length, keyMetadata) -> {
+      InputFile planned = inputFiles().get(location);
+      if (planned != null) {
+        return planned;
+      } else if (keyMetadata != null) {
+        return length < 0
+            ? fileIO.newDecryptingInputFile(location, keyMetadata)
+            : fileIO.newDecryptingInputFile(location, length, keyMetadata);
+      } else {
+        return length < 0 ? fileIO.newInputFile(location) : fileIO.newInputFile(location, length);
+      }
+    };
   }
 
   private Map<String, InputFile> inputFiles() {

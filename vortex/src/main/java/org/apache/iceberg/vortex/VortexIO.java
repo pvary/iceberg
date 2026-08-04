@@ -22,16 +22,20 @@ import dev.vortex.io.NativeReadable;
 import dev.vortex.io.NativeWritable;
 import java.io.EOFException;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.util.List;
 import java.util.Locale;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import org.apache.iceberg.io.CloseableGroup;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.PositionOutputStream;
 import org.apache.iceberg.io.RangeReadable;
 import org.apache.iceberg.io.SeekableInputStream;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
+import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 
 /**
  * Bridges Iceberg {@link org.apache.iceberg.io.FileIO} streams into Vortex's caller-provided native
@@ -58,6 +62,43 @@ final class VortexIO {
    */
   static NativeReadable readable(InputFile inputFile) {
     return new InputFileReadable(inputFile);
+  }
+
+  /**
+   * Returns a {@link NativeReadable} over every input file, in order. Vortex opens a single data
+   * source over the whole group, so the files are opened together; if any of them fails to open,
+   * the ones already opened are closed before the failure propagates. The caller owns the result
+   * and must pass it to {@link #close(List)} after every data source and scan built on top of it
+   * has been closed.
+   */
+  static List<NativeReadable> readables(List<InputFile> inputFiles) {
+    List<NativeReadable> readables = Lists.newArrayListWithCapacity(inputFiles.size());
+    try {
+      for (InputFile inputFile : inputFiles) {
+        readables.add(readable(inputFile));
+      }
+
+      return readables;
+    } catch (RuntimeException e) {
+      close(readables);
+      throw e;
+    }
+  }
+
+  /**
+   * Closes every readable. Close failures are logged and suppressed so that one failing file cannot
+   * leave the others open.
+   */
+  static void close(List<NativeReadable> readables) {
+    CloseableGroup group = new CloseableGroup();
+    group.setSuppressCloseFailure(true);
+    readables.forEach(group::addCloseable);
+    try {
+      group.close();
+    } catch (IOException e) {
+      // unreachable: the group suppresses close failures instead of throwing them
+      throw new UncheckedIOException("Failed to close Vortex input files", e);
+    }
   }
 
   private static final class OutputFileWritable implements NativeWritable {

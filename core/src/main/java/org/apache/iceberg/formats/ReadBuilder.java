@@ -23,6 +23,7 @@ import org.apache.iceberg.Schema;
 import org.apache.iceberg.deletes.PositionDeleteIndex;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.io.CloseableIterable;
+import org.apache.iceberg.io.InputFileResolver;
 import org.apache.iceberg.mapping.NameMapping;
 
 /**
@@ -119,6 +120,23 @@ public interface ReadBuilder<D, S> {
 
   /** Sets a mapping from external schema names to Iceberg type IDs. */
   ReadBuilder<D, S> withNameMapping(NameMapping nameMapping);
+
+  /**
+   * Sets the resolver used to open files that the file being read references.
+   *
+   * <p>Formats whose files reference other files, like a file that stores parts of its data in
+   * sibling files, use this resolver to open those files. Formats that read a single file ignore
+   * the resolver. Formats that require it must fail in {@link #build()} when it is not set.
+   *
+   * <p>The reader owns every file it opens through the resolver and must close them when the
+   * returned iterable is closed.
+   *
+   * @param resolver resolver returning an input file for a location
+   * @return this for method chaining
+   */
+  default ReadBuilder<D, S> fileResolver(InputFileResolver resolver) {
+    return this;
+  }
 
   /**
    * Whether this reader applies position deletes supplied through {@link

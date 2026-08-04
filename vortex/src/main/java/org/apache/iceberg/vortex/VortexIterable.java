@@ -46,6 +46,7 @@ import org.apache.iceberg.io.CloseableGroup;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.CloseableIterator;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.InputFileResolver;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -56,6 +57,8 @@ public class VortexIterable<T> extends CloseableGroup implements CloseableIterab
   private static final Logger LOG = LoggerFactory.getLogger(VortexIterable.class);
 
   private final InputFile inputFile;
+  private final InputFileResolver fileResolver;
+  private final int additionalFiles;
   private final Optional<Expression> filterPredicate;
   private final long[] splitByteRange;
   private final byte[] posDeleteBitmap;
@@ -73,6 +76,8 @@ public class VortexIterable<T> extends CloseableGroup implements CloseableIterab
 
   VortexIterable(
       InputFile inputFile,
+      InputFileResolver fileResolver,
+      int additionalFiles,
       List<String> projection,
       Optional<Expression> filterPredicate,
       long[] splitByteRange,
@@ -86,6 +91,8 @@ public class VortexIterable<T> extends CloseableGroup implements CloseableIterab
       boolean caseSensitive,
       int workerThreads) {
     this.inputFile = inputFile;
+    this.fileResolver = fileResolver;
+    this.additionalFiles = additionalFiles;
     this.projection = projection;
     this.filterPredicate = filterPredicate;
     this.splitByteRange = splitByteRange;
@@ -110,31 +117,58 @@ public class VortexIterable<T> extends CloseableGroup implements CloseableIterab
 
     Session session = VortexSessions.shared();
     // Read through the table's FileIO instead of Vortex's native storage clients. The returned
-    // iterator owns the readable and closes it when the scan is exhausted or abandoned.
-    NativeReadable readable = VortexIO.readable(inputFile);
+    // iterator owns the readables and closes them when the scan is exhausted or abandoned.
+    List<NativeReadable> readables = VortexIO.readables(inputFiles());
     try {
-      return open(session, readable);
+      return open(session, readables);
     } catch (RuntimeException e) {
-      try {
-        readable.close();
-      } catch (IOException suppressed) {
-        e.addSuppressed(suppressed);
-      }
+      VortexIO.close(readables);
       throw e;
     }
   }
 
-  private CloseableIterator<T> open(Session session, NativeReadable readable) {
-    DataSource dataSource = DataSource.open(session, readable);
+  /**
+   * Returns the file recorded in the manifest along with the files it continues into. The
+   * additional files are not planned by Iceberg, so their locations are derived from the data
+   * file's location and resolved through the caller-supplied {@link InputFileResolver} instead of
+   * coming from the scan's input files.
+   *
+   * <p>Location of the additional files is a placeholder convention until Vortex records the
+   * locations it references in the file itself.
+   */
+  private List<InputFile> inputFiles() {
+    Preconditions.checkState(
+        additionalFiles == 0 || fileResolver != null,
+        "Cannot read %s: reading a file that continues into %s more files requires a file resolver,"
+            + " but the caller did not provide one",
+        inputFile.location(),
+        additionalFiles);
+
+    ImmutableList.Builder<InputFile> inputFileBuilder = ImmutableList.builder();
+    inputFileBuilder.add(inputFile);
+    for (int index = 1; index <= additionalFiles; index += 1) {
+      inputFileBuilder.add(
+          fileResolver.resolve(
+              inputFile.location() + "." + index, InputFileResolver.LENGTH_UNKNOWN, null));
+    }
+
+    return inputFileBuilder.build();
+  }
+
+  private CloseableIterator<T> open(Session session, List<NativeReadable> readables) {
+    DataSource dataSource = DataSource.open(session, readables);
+    Closeable inputSource = () -> VortexIO.close(readables);
 
     long[] rowRange = null;
     if (splitByteRange != null) {
-      rowRange = toRowRange(splitByteRange, readable.length(), dataSource);
+      // The data source spans every opened file, so byte offsets map to rows over their total size.
+      long totalLength = readables.stream().mapToLong(NativeReadable::length).sum();
+      rowRange = toRowRange(splitByteRange, totalLength, dataSource);
       if (rowRange[0] >= rowRange[1]) {
         // The byte range maps to zero rows: skip the scan entirely. An all-zero range must not
         // reach the native scan, which interprets it as "no range set".
         try {
-          readable.close();
+          inputSource.close();
         } catch (IOException e) {
           throw new org.apache.iceberg.exceptions.RuntimeIOException(
               e, "Failed to close input source for %s", inputFile.location());
@@ -224,7 +258,7 @@ public class VortexIterable<T> extends CloseableGroup implements CloseableIterab
     Preconditions.checkNotNull(scan, "scan");
 
     PartitionBatchIterator batchIterator =
-        new PartitionBatchIterator(scan, vortexAllocator, allocator, readable);
+        new PartitionBatchIterator(scan, vortexAllocator, allocator, inputSource);
 
     if (rowReaderFunc != null) {
       VortexRowReader<T> rowFunction = rowReaderFunc.apply(readerArrowSchema);

@@ -51,6 +51,7 @@ import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.DeleteSchemaUtil;
 import org.apache.iceberg.io.FileAppender;
 import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.InputFileResolver;
 import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.types.Types;
@@ -64,6 +65,14 @@ public class VortexFormatModel<D, S, R>
     // buffer classes, which read these properties in static initializers.
     VortexArrowProperties.ensureConfigured();
   }
+
+  /**
+   * Number of files a vortex data file continues into. The reader opens them alongside the file
+   * recorded in the manifest, resolving their locations from that file's location through the
+   * {@link org.apache.iceberg.io.InputFileResolver} set on the read builder. Disabled by default:
+   * the naming convention is a placeholder until vortex records the references itself.
+   */
+  public static final String READ_ADDITIONAL_FILES = "read.vortex.additional-files";
 
   private final boolean isBatchReader;
 
@@ -307,6 +316,8 @@ public class VortexFormatModel<D, S, R>
     private boolean caseSensitive = true;
     private long[] splitByteRange;
     private PositionDeleteIndex posDeletes;
+    private InputFileResolver fileResolver;
+    private int additionalFiles = 0;
     private int workerThreads = TableProperties.VORTEX_WORKER_THREADS_DEFAULT;
     private boolean reuseContainers = false;
 
@@ -366,6 +377,8 @@ public class VortexFormatModel<D, S, R>
     public ReadBuilder<D, S> set(String key, String value) {
       if (TableProperties.READ_VORTEX_WORKER_THREADS.equals(key)) {
         workerThreads = Integer.parseInt(value);
+      } else if (READ_ADDITIONAL_FILES.equals(key)) {
+        additionalFiles = Integer.parseInt(value);
       }
       return this;
     }
@@ -394,6 +407,12 @@ public class VortexFormatModel<D, S, R>
 
     @Override
     public ReadBuilder<D, S> withNameMapping(NameMapping nameMapping) {
+      return this;
+    }
+
+    @Override
+    public ReadBuilder<D, S> fileResolver(InputFileResolver resolver) {
+      this.fileResolver = resolver;
       return this;
     }
 
@@ -449,6 +468,8 @@ public class VortexFormatModel<D, S, R>
 
       return new VortexIterable<>(
           inputFile,
+          fileResolver,
+          additionalFiles,
           projection,
           filterPredicate,
           splitByteRange,

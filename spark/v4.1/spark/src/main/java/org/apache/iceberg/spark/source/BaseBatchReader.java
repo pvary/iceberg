@@ -83,7 +83,8 @@ abstract class BaseBatchReader<T extends ScanTask> extends BaseReader<ColumnarBa
       Map<Integer, ?> idToConstant,
       @Nonnull SparkDeleteFilter deleteFilter) {
     ReadBuilder<ColumnarBatch, ?> readBuilder =
-        FormatModelRegistry.readBuilder(format, ColumnarBatch.class, inputFile);
+        FormatModelRegistry.readBuilder(format, ColumnarBatch.class, inputFile)
+            .fileResolver(fileResolver());
 
     if (parquetConf != null) {
       readBuilder = readBuilder.recordsPerBatch(parquetConf.batchSize());
@@ -280,7 +281,8 @@ abstract class BaseBatchReader<T extends ScanTask> extends BaseReader<ColumnarBa
     int rowPositionIndex = scanSchema.columns().indexOf(MetadataColumns.ROW_POSITION);
 
     ReadBuilder<InternalRow, ?> rowReadBuilder =
-        FormatModelRegistry.readBuilder(FileFormat.VORTEX, InternalRow.class, inputFile);
+        FormatModelRegistry.readBuilder(FileFormat.VORTEX, InternalRow.class, inputFile)
+            .fileResolver(fileResolver());
     try (CloseableIterable<InternalRow> rows =
             rowReadBuilder
                 .project(scanSchema)
