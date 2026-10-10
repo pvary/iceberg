@@ -1206,7 +1206,7 @@ A simple and valid approach is estimate of the number of rows in data files that
 
 #### Table Statistics
 
-Table statistics files are valid [Puffin files](puffin-spec.md). Statistics are informational. A reader can choose to
+Table statistics files are valid [Puffin files](https://iceberg.apache.org/puffin-spec/). Statistics are informational. A reader can choose to
 ignore statistics information. Statistics support is not required to read the table correctly. A table can contain
 many statistics files associated with different table snapshots.
 
@@ -1216,9 +1216,9 @@ Statistics files metadata within `statistics` table metadata field is a struct w
     | v1         | v2 and v3  | Field name                      | Type                  | Description |
     | ---------- | ---------- |---------------------------------|-----------------------|-------------|
     | _required_ | _required_ | **`snapshot-id`**               | `long`                | ID of the Iceberg table's snapshot the statistics file is associated with. |
-    | _required_ | _required_ | **`statistics-path`**           | `string`              | Path of the statistics file. See [Puffin file format](puffin-spec.md). |
+    | _required_ | _required_ | **`statistics-path`**           | `string`              | Path of the statistics file. See [Puffin file format](https://iceberg.apache.org/puffin-spec/). |
     | _required_ | _required_ | **`file-size-in-bytes`**        | `long`                | Size of the statistics file. |
-    | _required_ | _required_ | **`file-footer-size-in-bytes`** | `long`                | Total size of the statistics file's footer (not the footer payload size). See [Puffin file format](puffin-spec.md) for footer definition. |
+    | _required_ | _required_ | **`file-footer-size-in-bytes`** | `long`                | Total size of the statistics file's footer (not the footer payload size). See [Puffin file format](https://iceberg.apache.org/puffin-spec/) for footer definition. |
     | _optional_ | _optional_ | **`key-metadata`**              |                       | Base64-encoded implementation-specific key metadata for encryption. |
     | _required_ | _required_ | **`blob-metadata`**             | `list<blob metadata>` (see below) | A list of the blob metadata for statistics contained in the file with structure described below. |
 

@@ -225,8 +225,8 @@ Note that `year`, `month`, and `hour` transforms produce ordinal values and not 
 | `bucket(N, value)`          | Hash of value, mod `N` (see [table spec details][bucket-ref])         | Any primitive except for `geometry`, `geography`, `boolean`, `float`, or `double` | `int`       |
 | `truncate(W, value)`        | Value truncated to width `W` (see [table spec details][truncate-ref]) | `int`, `long`, `decimal`, `string`, `binary`                                                 | Source type |
 
-[bucket-ref]: spec/#bucket-transform-details
-[truncate-ref]: spec/#truncate-transform-details
+[bucket-ref]: https://iceberg.apache.org/spec/#bucket-transform-details
+[truncate-ref]: https://iceberg.apache.org/spec/#truncate-transform-details
 
 ## Appendix B: JSON serialization
 
