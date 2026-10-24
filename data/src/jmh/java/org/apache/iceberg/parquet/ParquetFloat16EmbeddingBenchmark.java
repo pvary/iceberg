@@ -371,9 +371,7 @@ public class ParquetFloat16EmbeddingBenchmark {
     this.readFile = new File(tempDir, "read.parquet");
     this.writeFile = new File(tempDir, "write.parquet");
 
-    SplittableRandom random = new SplittableRandom(SEED);
-    EmbeddingModel model = EmbeddingModel.random(dimension, random);
-    List<short[]> float16Embeddings = generate(model.generator(random.split()), embeddingCount);
+    List<short[]> float16Embeddings = generate(embeddingGenerator(dimension), embeddingCount);
 
     long heapBefore = usedHeapAfterGc();
     try {
@@ -473,8 +471,18 @@ public class ParquetFloat16EmbeddingBenchmark {
     }
   }
 
+  /**
+   * Returns the generator of the embeddings of the benchmark, as float16 bits: a model drawn with a
+   * fixed seed, so every run generates the same embeddings.
+   */
+  static Supplier<short[]> embeddingGenerator(int dimension) {
+    SplittableRandom random = new SplittableRandom(SEED);
+    EmbeddingModel model = EmbeddingModel.random(dimension, random);
+    return model.generator(random.split());
+  }
+
   /** Generates {@code count} embeddings, as float16 bits. */
-  private static List<short[]> generate(Supplier<short[]> generator, int count) {
+  static List<short[]> generate(Supplier<short[]> generator, int count) {
     Preconditions.checkArgument(count > 0, "Invalid embedding count: %s", count);
     List<short[]> float16Embeddings = Lists.newArrayListWithCapacity(count);
     for (int index = 0; index < count; index += 1) {
