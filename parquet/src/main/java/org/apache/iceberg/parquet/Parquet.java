@@ -65,6 +65,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Function;
@@ -115,8 +116,10 @@ import org.apache.parquet.HadoopReadOptions;
 import org.apache.parquet.ParquetReadOptions;
 import org.apache.parquet.avro.AvroReadSupport;
 import org.apache.parquet.avro.AvroWriteSupport;
+import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.column.ParquetProperties.WriterVersion;
+import org.apache.parquet.compression.CompressionCodecFactory;
 import org.apache.parquet.conf.HadoopParquetConfiguration;
 import org.apache.parquet.conf.ParquetConfiguration;
 import org.apache.parquet.conf.PlainParquetConfiguration;
@@ -130,6 +133,7 @@ import org.apache.parquet.hadoop.ParquetWriter;
 import org.apache.parquet.hadoop.api.ReadSupport;
 import org.apache.parquet.hadoop.api.WriteSupport;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
+import org.apache.parquet.hadoop.util.HadoopCodecs;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.Type.ID;
 import org.slf4j.Logger;
@@ -356,10 +360,40 @@ public class Parquet {
               });
     }
 
+    /**
+     * Optimization: Turns off column and size statistics for columns nested in lists and maps, like
+     * vector columns.
+     *
+     * <p>Configures Parquet column statistics with {@code
+     * write.parquet.stats-enabled.column.<name>}.
+     *
+     * <p>Column statistics and size statistics are disabled for columns nested in lists and maps,
+     * unless statistics are enabled for the column. Iceberg does not keep metrics for values in
+     * lists and maps, so these statistics are not used. Collecting them is a large part of the cost
+     * of writing those columns, because the column statistics compare every value and the size
+     * statistics count the levels of every value.
+     */
     private void setColumnStatsConfig(
+        MessageType type,
         Context context,
         Map<String, String> colNameToParquetPathMap,
-        BiConsumer<String, Boolean> withColumnStatsEnabled) {
+        BiConsumer<String, Boolean> withColumnStatsEnabled,
+        BiConsumer<String, Boolean> withSizeStatsEnabled) {
+      Set<String> statsEnabledColumns =
+          context.columnStatsEnabled().entrySet().stream()
+              .filter(entry -> Boolean.parseBoolean(entry.getValue()))
+              .map(entry -> colNameToParquetPathMap.get(entry.getKey()))
+              .filter(Objects::nonNull)
+              .collect(Collectors.toSet());
+
+      for (ColumnDescriptor column : type.getColumns()) {
+        String parquetColumnPath = String.join(".", column.getPath());
+        if (column.getMaxRepetitionLevel() > 0
+            && !statsEnabledColumns.contains(parquetColumnPath)) {
+          withColumnStatsEnabled.accept(parquetColumnPath, false);
+          withSizeStatsEnabled.accept(parquetColumnPath, false);
+        }
+      }
 
       context
           .columnStatsEnabled()
@@ -393,6 +427,7 @@ public class Parquet {
     }
 
     @Override
+    @SuppressWarnings("checkstyle:MethodLength")
     public <D> FileAppender<D> build() throws IOException {
       Preconditions.checkNotNull(schema, "Schema is required");
       Preconditions.checkNotNull(name, "Table name is required and cannot be null");
@@ -489,7 +524,12 @@ public class Parquet {
             propsBuilder::withBloomFilterFPP,
             propsBuilder::withBloomFilterNDV);
 
-        setColumnStatsConfig(context, colNameToParquetPathMap, propsBuilder::withStatisticsEnabled);
+        setColumnStatsConfig(
+            type,
+            context,
+            colNameToParquetPathMap,
+            propsBuilder::withStatisticsEnabled,
+            propsBuilder::withSizeStatisticsEnabled);
 
         setDictionaryEncodingConfig(
             context, colNameToParquetPathMap, propsBuilder::withDictionaryEncoding);
@@ -535,7 +575,11 @@ public class Parquet {
             parquetWriteBuilder::withBloomFilterNDV);
 
         setColumnStatsConfig(
-            context, colNameToParquetPathMap, parquetWriteBuilder::withStatisticsEnabled);
+            type,
+            context,
+            colNameToParquetPathMap,
+            parquetWriteBuilder::withStatisticsEnabled,
+            parquetWriteBuilder::withSizeStatisticsEnabled);
 
         setDictionaryEncodingConfig(
             context, colNameToParquetPathMap, parquetWriteBuilder::withDictionaryEncoding);
@@ -1532,6 +1576,7 @@ public class Parquet {
           || batchedReaderFuncWithSchema != null
           || readerFunction != null) {
         ParquetReadOptions.Builder optionsBuilder;
+        CompressionCodecFactory codecFactory;
         if (file instanceof HadoopConfigurable) {
           // remove read properties already set that may conflict with this read
           Configuration conf = new Configuration(((HadoopConfigurable) file).getConf());
@@ -1539,9 +1584,14 @@ public class Parquet {
             conf.unset(property);
           }
           optionsBuilder = HadoopReadOptions.builder(conf);
+          codecFactory = HadoopCodecs.newFactory(conf, 0);
         } else {
-          optionsBuilder = ParquetReadOptions.builder(new PlainParquetConfiguration());
+          ParquetConfiguration conf = new PlainParquetConfiguration();
+          optionsBuilder = ParquetReadOptions.builder(conf);
+          codecFactory = HadoopCodecs.newFactory(conf, 0);
         }
+
+        optionsBuilder.withCodecFactory(new ReadCodecFactory(codecFactory));
 
         for (Map.Entry<String, String> entry : properties.entrySet()) {
           optionsBuilder.set(entry.getKey(), entry.getValue());

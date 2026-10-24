@@ -98,6 +98,35 @@ public class ParquetValueReaders {
     return new FloatAsDoubleReader(desc);
   }
 
+  /**
+   * Returns a reader for Parquet FLOAT16 columns that produces single-precision float values.
+   *
+   * @param desc a column descriptor for a FIXED_LEN_BYTE_ARRAY(2) column annotated as FLOAT16
+   * @return a reader that converts half-precision values to {@link Float}
+   */
+  public static ParquetValueReader<Float> float16s(ColumnDescriptor desc) {
+    checkFloat16(desc);
+    return new Float16Reader(desc);
+  }
+
+  /**
+   * Returns a reader for Parquet FLOAT16 columns that produces double-precision values.
+   *
+   * @param desc a column descriptor for a FIXED_LEN_BYTE_ARRAY(2) column annotated as FLOAT16
+   * @return a reader that converts half-precision values to {@link Double}
+   */
+  public static ParquetValueReader<Double> float16sAsDoubles(ColumnDescriptor desc) {
+    checkFloat16(desc);
+    return new Float16AsDoubleReader(desc);
+  }
+
+  private static void checkFloat16(ColumnDescriptor desc) {
+    Preconditions.checkArgument(
+        ParquetConversions.isFloat16(desc.getPrimitiveType()),
+        "Invalid float16 logical type: %s",
+        desc.getPrimitiveType().getLogicalTypeAnnotation());
+  }
+
   public static ParquetValueReader<BigDecimal> bigDecimals(ColumnDescriptor desc) {
     LogicalTypeAnnotation decimal = desc.getPrimitiveType().getLogicalTypeAnnotation();
     Preconditions.checkArgument(
@@ -718,6 +747,39 @@ public class ParquetValueReaders {
     @Override
     public double readDouble() {
       return super.readFloat();
+    }
+  }
+
+  private static class Float16Reader extends UnboxedReader<Float> {
+    private Float16Reader(ColumnDescriptor desc) {
+      super(desc);
+    }
+
+    @Override
+    public Float read(Float ignored) {
+      return readFloat();
+    }
+
+    @Override
+    public float readFloat() {
+      // decoded from the page by Float16ValuesReader, without allocating a Binary
+      return column.nextFloat();
+    }
+  }
+
+  private static class Float16AsDoubleReader extends UnboxedReader<Double> {
+    private Float16AsDoubleReader(ColumnDescriptor desc) {
+      super(desc);
+    }
+
+    @Override
+    public Double read(Double ignored) {
+      return readDouble();
+    }
+
+    @Override
+    public double readDouble() {
+      return column.nextFloat();
     }
   }
 

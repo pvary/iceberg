@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.parquet;
 
+import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.io.api.Binary;
 
@@ -95,6 +96,31 @@ public abstract class ColumnIterator<T> extends BaseColumnIterator implements Tr
     this.pageIterator = PageIterator.newIterator(desc, writerVersion);
   }
 
+  /**
+   * Optimization: Depend on the caller to know the size of every list in a column.
+   *
+   * <p>Declares that every list of this column has exactly {@code size} non-null elements, so that
+   * repetition and definition levels are derived instead of decoded for every value.
+   *
+   * <p>Parquet has no fixed-size list type, so readers find where each list ends by decoding the
+   * levels of all of its elements. When every list is known to have the same size, like the
+   * embeddings of one model, the levels follow from the position of a value in its page, and bulk
+   * reads such as {@link #nextFloat16s(short[], int, int)} read whole lists without touching the
+   * levels.
+   *
+   * <p>This is only valid for a list column with no other repeated levels, where no list is null or
+   * empty, every list has exactly {@code size} elements and no element is null. Pages that do not
+   * hold whole lists are rejected, but other violations are not detected and lead to incorrect
+   * results. The setting takes effect from the next page, so it should be set before reading.
+   *
+   * @param size the number of elements of every list, or 0 to decode the levels
+   * @throws IllegalArgumentException if the size is negative, or the column is not a list of
+   *     primitive values with a single repeated level
+   */
+  public void setFixedListSize(int size) {
+    pageIterator.setFixedListSize(size);
+  }
+
   @Override
   public int currentDefinitionLevel() {
     advance();
@@ -147,6 +173,59 @@ public abstract class ColumnIterator<T> extends BaseColumnIterator implements Tr
     this.triplesRead += 1;
     advance();
     return pageIterator.nextBinary();
+  }
+
+  @Override
+  public short nextFloat16() {
+    this.triplesRead += 1;
+    advance();
+    return pageIterator.nextFloat16();
+  }
+
+  @Override
+  public int nextFloat16s(short[] values, int offset, int maxCount) {
+    Preconditions.checkPositionIndexes(offset, offset + maxCount, values.length);
+    int count = 0;
+    int read;
+    do {
+      advance();
+      // a run that reached the end of a page continues only with values of the same list
+      if (count > 0 && !continuesList()) {
+        break;
+      }
+
+      read = pageIterator.nextFloat16s(values, offset + count, maxCount - count);
+      this.triplesRead += read;
+      count += read;
+    } while (read > 0 && count < maxCount);
+
+    return count;
+  }
+
+  @Override
+  public int nextFloats(float[] values, int offset, int maxCount) {
+    Preconditions.checkPositionIndexes(offset, offset + maxCount, values.length);
+    int count = 0;
+    int read;
+    do {
+      advance();
+      // a run that reached the end of a page continues only with values of the same list
+      if (count > 0 && !continuesList()) {
+        break;
+      }
+
+      read = pageIterator.nextFloats(values, offset + count, maxCount - count);
+      this.triplesRead += read;
+      count += read;
+    } while (read > 0 && count < maxCount);
+
+    return count;
+  }
+
+  /** Returns whether the next value continues the current innermost list. */
+  private boolean continuesList() {
+    // past the last value, the repetition level is -1
+    return pageIterator.currentRepetitionLevel() == desc.getMaxRepetitionLevel();
   }
 
   @Override

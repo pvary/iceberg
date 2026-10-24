@@ -121,6 +121,62 @@ interface TripleIterator<T> extends Iterator<T> {
   }
 
   /**
+   * Optimization: Read a FLOAT16 value without allocating a Binary.
+   *
+   * <p>Returns the next value of a Parquet FLOAT16 column as IEEE 754 half-precision bits.
+   *
+   * <p>This method has the same behavior as {@link #next()} and will advance this iterator. Unlike
+   * {@link #nextBinary()}, this reads the value directly from the page and does not allocate. Use
+   * {@link #nextFloat()} to read the value as a single-precision float.
+   *
+   * @return the bits of the next half-precision value
+   * @throws java.util.NoSuchElementException if there are no more elements
+   * @throws UnsupportedOperationException if the column is not a FLOAT16 column
+   */
+  default short nextFloat16() {
+    throw new UnsupportedOperationException("Not a float16 column");
+  }
+
+  /**
+   * Optimization: Read the values of a list in bulk, instead of one call per value.
+   *
+   * <p>Reads a run of non-null values of a Parquet FLOAT16 column as IEEE 754 half-precision bits.
+   *
+   * <p>The values are decoded in bulk, page by page, instead of one call per value. The run starts
+   * at the next value and stops before a null value, or before a value that starts a new innermost
+   * list, so that for a repeated column it reads the rest of the current list. Every value of a
+   * non-repeated column continues the run. Reads stop after {@code maxCount} values, so a caller
+   * can detect a list that is longer than expected by checking the next repetition level.
+   *
+   * @param values array to fill
+   * @param offset index in {@code values} of the first value
+   * @param maxCount maximum number of values to read
+   * @return the number of values read, which is 0 if the next value is null or there is none
+   * @throws UnsupportedOperationException if the column is not a FLOAT16 column
+   */
+  default int nextFloat16s(short[] values, int offset, int maxCount) {
+    throw new UnsupportedOperationException("Not a float16 column");
+  }
+
+  /**
+   * Optimization: Read the values of a list in bulk, instead of one call per value.
+   *
+   * <p>Reads a run of non-null values of a Parquet FLOAT or FLOAT16 column as floats.
+   *
+   * <p>The run is read like {@link #nextFloat16s(short[], int, int)}, and FLOAT16 values are
+   * converted to single precision.
+   *
+   * @param values array to fill
+   * @param offset index in {@code values} of the first value
+   * @param maxCount maximum number of values to read
+   * @return the number of values read, which is 0 if the next value is null or there is none
+   * @throws UnsupportedOperationException if the column is not a FLOAT or FLOAT16 column
+   */
+  default int nextFloats(float[] values, int offset, int maxCount) {
+    throw new UnsupportedOperationException("Not a float or float16 column");
+  }
+
+  /**
    * Returns null and advances the iterator.
    *
    * <p>This method has the same behavior as {@link #next()} and will advance this iterator.

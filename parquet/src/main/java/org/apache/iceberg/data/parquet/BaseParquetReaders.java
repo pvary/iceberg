@@ -225,6 +225,20 @@ abstract class BaseParquetReaders<T> {
         LogicalTypeAnnotation.UUIDLogicalTypeAnnotation uuidLogicalType) {
       return Optional.of(ParquetValueReaders.uuids(desc));
     }
+
+    @Override
+    public Optional<ParquetValueReader<?>> visit(
+        LogicalTypeAnnotation.Float16LogicalTypeAnnotation float16LogicalType) {
+      switch (expected.typeId()) {
+        case DOUBLE:
+          return Optional.of(ParquetValueReaders.float16sAsDoubles(desc));
+        case FIXED:
+          // float16 columns were converted to fixed[2] before float16 support was added
+          return Optional.of(fixedReader(desc));
+        default:
+          return Optional.of(ParquetValueReaders.float16s(desc));
+      }
+    }
   }
 
   private class ReadBuilder extends TypeWithSchemaVisitor<ParquetValueReader<?>> {

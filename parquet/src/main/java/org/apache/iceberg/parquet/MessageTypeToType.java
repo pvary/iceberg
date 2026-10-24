@@ -258,6 +258,12 @@ class MessageTypeToType extends ParquetTypeVisitor<Type> {
     }
 
     @Override
+    public Optional<Type> visit(LogicalTypeAnnotation.Float16LogicalTypeAnnotation float16Type) {
+      // Iceberg has no half-precision type; every float16 value is exactly representable as float
+      return Optional.of(Types.FloatType.get());
+    }
+
+    @Override
     public Optional<Type> visit(LogicalTypeAnnotation.GeometryLogicalTypeAnnotation geometryType) {
       // a null crs resolves to the Iceberg default in GeometryType.of
       return Optional.of(Types.GeometryType.of(geometryType.getCrs()));

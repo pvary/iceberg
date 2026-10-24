@@ -48,7 +48,9 @@ import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
@@ -71,6 +73,7 @@ import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.mapping.MappingUtil;
 import org.apache.iceberg.mapping.NameMapping;
 import org.apache.iceberg.relocated.com.google.common.base.Strings;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -99,6 +102,8 @@ import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 public class TestParquet {
 
@@ -345,6 +350,106 @@ public class TestParquet {
           }
         }
       }
+    }
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  public void testNestedColumnStatisticsDisabledByDefault(boolean useWriterFunc)
+      throws IOException {
+    File file = writeNestedColumns(ImmutableMap.of(), useWriterFunc);
+
+    assertColumnStatistics(
+        file,
+        ImmutableMap.of(
+            "id", true,
+            "values.list.element", false,
+            "props.key_value.key", false,
+            "props.key_value.value", false,
+            "point.x", true));
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {true, false})
+  public void testNestedColumnStatisticsEnabled(boolean useWriterFunc) throws IOException {
+    File file =
+        writeNestedColumns(
+            ImmutableMap.of(
+                PARQUET_COLUMN_STATS_ENABLED_PREFIX + "values.element",
+                "true",
+                PARQUET_COLUMN_STATS_ENABLED_PREFIX + "props.value",
+                "false"),
+            useWriterFunc);
+
+    assertColumnStatistics(
+        file,
+        ImmutableMap.of(
+            "id", true,
+            "values.list.element", true,
+            "props.key_value.key", false,
+            "props.key_value.value", false,
+            "point.x", true));
+  }
+
+  private File writeNestedColumns(Map<String, String> properties, boolean useWriterFunc)
+      throws IOException {
+    Schema schema =
+        new Schema(
+            required(1, "id", IntegerType.get()),
+            required(2, "values", Types.ListType.ofRequired(3, Types.FloatType.get())),
+            required(
+                4,
+                "props",
+                Types.MapType.ofRequired(5, 6, Types.StringType.get(), IntegerType.get())),
+            required(7, "point", Types.StructType.of(required(8, "x", Types.DoubleType.get()))));
+
+    org.apache.avro.Schema avroSchema = AvroSchemaUtil.convert(schema.asStruct());
+    org.apache.avro.Schema pointSchema = avroSchema.getField("point").schema();
+    GenericData.Record[] records = new GenericData.Record[10];
+    for (int i = 0; i < records.length; i += 1) {
+      GenericData.Record point = new GenericData.Record(pointSchema);
+      point.put("x", i * 1.5);
+      GenericData.Record record = new GenericData.Record(avroSchema);
+      record.put("id", i);
+      record.put("values", ImmutableList.of(i * 0.5f, i * 2.0f));
+      record.put("props", ImmutableMap.of("key" + i, i));
+      record.put("point", point);
+      records[i] = record;
+    }
+
+    // with a writer function, Iceberg's Parquet writer writes the file, otherwise parquet-mr's
+    Function<MessageType, ParquetValueWriter<?>> writerFunc =
+        useWriterFunc ? ParquetAvroWriter::buildWriter : null;
+    File file = createTempFile(temp);
+    write(file, schema, properties, writerFunc, records);
+    return file;
+  }
+
+  /**
+   * Checks which columns have column statistics, by Parquet column path. Size statistics are only
+   * checked for columns nested in lists and maps, which are the only columns with repetition
+   * levels.
+   */
+  private static void assertColumnStatistics(File file, Map<String, Boolean> expectedStats)
+      throws IOException {
+    try (ParquetFileReader reader = ParquetFileReader.open(ParquetIO.file(localInput(file)))) {
+      Map<String, ColumnChunkMetaData> columns =
+          getOnlyElement(reader.getFooter().getBlocks()).getColumns().stream()
+              .collect(Collectors.toMap(column -> column.getPath().toDotString(), c -> c));
+      assertThat(columns).containsOnlyKeys(expectedStats.keySet());
+
+      expectedStats.forEach(
+          (path, enabled) -> {
+            ColumnChunkMetaData column = columns.get(path);
+            assertThat(column.getStatistics().isEmpty())
+                .as("Column statistics of %s should be empty", path)
+                .isEqualTo(!enabled);
+            if (path.startsWith("values.") || path.startsWith("props.")) {
+              assertThat(column.getSizeStatistics() != null)
+                  .as("Size statistics of %s should be present", path)
+                  .isEqualTo(enabled);
+            }
+          });
     }
   }
 
