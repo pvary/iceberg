@@ -21,7 +21,6 @@ package org.apache.iceberg.parquet;
 import static org.apache.iceberg.types.Types.NestedField.required;
 
 import com.sun.management.HotSpotDiagnosticMXBean;
-import java.io.File;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
 import java.lang.ref.Reference;
@@ -33,12 +32,13 @@ import java.util.Set;
 import java.util.SplittableRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
-import org.apache.iceberg.Files;
 import org.apache.iceberg.MetricsConfig;
 import org.apache.iceberg.Schema;
 import org.apache.iceberg.TableProperties;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.FileAppender;
+import org.apache.iceberg.io.InputFile;
+import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
@@ -58,7 +58,6 @@ import org.apache.parquet.hadoop.metadata.BlockMetaData;
 import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 import org.apache.parquet.internal.column.columnindex.OffsetIndex;
-import org.apache.parquet.io.LocalInputFile;
 import org.apache.parquet.io.api.Binary;
 import org.apache.parquet.schema.LogicalTypeAnnotation;
 import org.apache.parquet.schema.LogicalTypeAnnotation.Float16LogicalTypeAnnotation;
@@ -122,7 +121,7 @@ import org.slf4j.LoggerFactory;
  *       ColumnIterator#setFixedListSize}, straight into the array of the embedding when the array
  *       holds the decoded type (see {@link #directDecode}). With {@link #reuseContainers}, every
  *       embedding is read into the array of the previous one
- *   <li>{@code sizes:fileBytes}: size of the Parquet file on disk
+ *   <li>{@code sizes:fileBytes}: size of the Parquet file
  *   <li>{@code sizes:heapBytes}: retained heap size of the embeddings in the source representation,
  *       which is also the representation produced by the reader
  * </ul>
@@ -148,6 +147,20 @@ import org.slf4j.LoggerFactory;
  * sizes default to Iceberg's defaults, and can be changed with {@code -p pageSizeBytes=...}, {@code
  * -p rowGroupSizeBytes=...}, and {@code -p sizeCheckMinRows=...}; the log of the setup reports the
  * resulting row groups and pages.
+ *
+ * <p>The Parquet files are local files by default. To write and read them on an object store, like
+ * Azure Blob Storage, pass a base location with {@code -p location=...}, and the properties of the
+ * {@code FileIO}, like credentials, in a local properties file with {@code -p fileIOProperties=...}
+ * (see {@link BenchmarkFiles}). The times then include the transfers to and from the object store,
+ * every write uploads a whole file and every read downloads it. JMH parameters are passed to the
+ * benchmark jar, for example:
+ *
+ * <pre>
+ * ./gradlew :iceberg-data:jmhJar
+ * java -jar data/build/libs/iceberg-data-*-jmh.jar ParquetFloat16EmbeddingBenchmark
+ *     -p location=abfss://container@account.dfs.core.windows.net/benchmarks
+ *     -p fileIOProperties=azure.properties
+ * </pre>
  */
 // -Xmx31g overrides the -Xmx32g default to keep compressed oops, so the references to the
 // embeddings are measured with the 4 byte references used by most JVMs
@@ -174,6 +187,8 @@ public class ParquetFloat16EmbeddingBenchmark {
 
   private static final long SEED = 42L;
   private static final int GC_ROUNDS = 5;
+  private static final String READ_FILE = "read.parquet";
+  private static final String WRITE_FILE = "write.parquet";
 
   /** In-memory representation of an embedding. */
   public enum SourceType {
@@ -343,12 +358,29 @@ public class ParquetFloat16EmbeddingBenchmark {
   @Param("true")
   private boolean consumeValues;
 
+  /**
+   * Base location of the Parquet files, or empty for a local temporary directory. Every trial
+   * writes its files in a new directory under the location, and deletes them at the end. Locations
+   * are resolved by Iceberg's {@code ResolvingFileIO}, for example Azure Blob Storage and ADLS Gen2
+   * locations, like {@code abfss://<container>@<account>.dfs.core.windows.net/<path>} or {@code
+   * wasbs://<container>@<account>.blob.core.windows.net/<path>} (see {@link BenchmarkFiles}).
+   */
+  @Param("")
+  private String location;
+
+  /**
+   * Path of a local Java properties file with the properties of the {@code FileIO} of the {@link
+   * #location}, like credentials, or empty for none (see {@link BenchmarkFiles}).
+   */
+  @Param("")
+  private String fileIOProperties;
+
   private Embeddings<?> embeddings;
   private WriteOptions writeOptions;
   private ReadOptions readOptions;
-  private File tempDir;
-  private File readFile;
-  private File writeFile;
+  private BenchmarkFiles files;
+  private InputFile readFile;
+  private OutputFile writeFile;
   private long fileBytes;
   private long heapBytes;
 
@@ -367,9 +399,6 @@ public class ParquetFloat16EmbeddingBenchmark {
             rowGroupSizeBytes,
             sizeCheckMinRows);
     this.readOptions = new ReadOptions(true, reuseContainers, directDecode);
-    this.tempDir = java.nio.file.Files.createTempDirectory("float16-embedding-bench").toFile();
-    this.readFile = new File(tempDir, "read.parquet");
-    this.writeFile = new File(tempDir, "write.parquet");
 
     List<short[]> float16Embeddings = generate(embeddingGenerator(dimension), embeddingCount);
 
@@ -382,8 +411,29 @@ public class ParquetFloat16EmbeddingBenchmark {
       Reference.reachabilityFence(float16Embeddings);
     }
 
-    embeddings.write(readFile, writeOptions);
-    this.fileBytes = readFile.length();
+    this.files = BenchmarkFiles.create(location, fileIOProperties, "float16-embedding-bench");
+    try {
+      setupFiles();
+    } catch (IOException | RuntimeException e) {
+      // JMH does not tear down trials that fail in the setup
+      try {
+        files.close();
+      } catch (IOException | RuntimeException closeFailure) {
+        e.addSuppressed(closeFailure);
+      }
+
+      throw e;
+    }
+  }
+
+  /** Writes the file of the read benchmark, and checks it. */
+  private void setupFiles() throws IOException {
+    this.writeFile = files.newOutputFile(WRITE_FILE);
+    embeddings.write(files.newOutputFile(READ_FILE), writeOptions);
+    this.fileBytes = files.newInputFile(READ_FILE).getLength();
+    // the read benchmark reads the file with its known length, like Iceberg reads data files with
+    // the lengths from the manifests, without looking up the length in the object store
+    this.readFile = files.newInputFile(READ_FILE, fileBytes);
 
     // checks that the file holds exactly the embeddings of the source representation, every one
     // with dimension values, which the read benchmark relies on to skip the levels, and that the
@@ -397,7 +447,7 @@ public class ParquetFloat16EmbeddingBenchmark {
 
     LOG.info(
         "Embeddings: source={}, {}, {}, count={}, dimension={}, fileBytes={}, "
-            + "heapBytes={}, maxHeap={}, UseCompressedOops={}, file: {}",
+            + "heapBytes={}, maxHeap={}, UseCompressedOops={}, files: {}, file: {}",
         source,
         writeOptions,
         readOptions,
@@ -407,14 +457,13 @@ public class ParquetFloat16EmbeddingBenchmark {
         heapBytes,
         Runtime.getRuntime().maxMemory(),
         vmOption("UseCompressedOops"),
+        files,
         describeElementColumn(readFile));
   }
 
   @TearDown(Level.Trial)
   public void tearDownBenchmark() throws IOException {
-    java.nio.file.Files.deleteIfExists(readFile.toPath());
-    java.nio.file.Files.deleteIfExists(writeFile.toPath());
-    java.nio.file.Files.deleteIfExists(tempDir.toPath());
+    files.close();
   }
 
   @Benchmark
@@ -579,8 +628,8 @@ public class ParquetFloat16EmbeddingBenchmark {
    * sizes. Page sizes are averages over the data pages, in KB; the uncompressed size includes the
    * page headers and the dictionary page, if any.
    */
-  private static String describeElementColumn(File file) throws IOException {
-    try (ParquetFileReader reader = ParquetFileReader.open(new LocalInputFile(file.toPath()))) {
+  private static String describeElementColumn(InputFile file) throws IOException {
+    try (ParquetFileReader reader = ParquetFileReader.open(ParquetIO.file(file))) {
       ColumnDescriptor desc =
           reader.getFileMetaData().getSchema().getColumnDescription(ELEMENT_PATH);
       List<Integer> dictionaryEntries = Lists.newArrayList();
@@ -620,8 +669,8 @@ public class ParquetFloat16EmbeddingBenchmark {
   }
 
   /** Returns the encodings of the data pages of the embedding values. */
-  private static Set<Encoding> dataEncodings(File file) throws IOException {
-    try (ParquetFileReader reader = ParquetFileReader.open(new LocalInputFile(file.toPath()))) {
+  private static Set<Encoding> dataEncodings(InputFile file) throws IOException {
+    try (ParquetFileReader reader = ParquetFileReader.open(ParquetIO.file(file))) {
       return dataEncodings(reader);
     }
   }
@@ -681,7 +730,7 @@ public class ParquetFloat16EmbeddingBenchmark {
    * benchmark uses to write FLOAT16 values.
    */
   private static <T> FileAppender<T> newWriter(
-      File file, WriteOptions options, Representation<T> representation, int dimension) {
+      OutputFile file, WriteOptions options, Representation<T> representation, int dimension) {
     boolean dictionary = options.encoding() == EncodingType.DICTIONARY;
     boolean byteStreamSplit = options.encoding() == EncodingType.BYTE_STREAM_SPLIT;
     ParquetProperties properties =
@@ -704,7 +753,7 @@ public class ParquetFloat16EmbeddingBenchmark {
             .build();
     return new ParquetWriter<>(
         options.conf(),
-        Files.localOutput(file),
+        file,
         SCHEMA,
         embeddingSchema(options.storage()),
         options.rowGroupSize(),
@@ -725,9 +774,9 @@ public class ParquetFloat16EmbeddingBenchmark {
 
   /** Creates a reader of the embeddings in a file. */
   private static <T> CloseableIterable<T> newReader(
-      File file, Representation<T> representation, int dimension, ReadOptions options) {
+      InputFile file, Representation<T> representation, int dimension, ReadOptions options) {
     Parquet.ReadBuilder builder =
-        Parquet.read(Files.localInput(file))
+        Parquet.read(file)
             .project(SCHEMA)
             .createReaderFunc(
                 fileSchema -> embeddingReader(fileSchema, representation, dimension, options));
@@ -790,7 +839,7 @@ public class ParquetFloat16EmbeddingBenchmark {
     }
 
     /** Writes all embeddings to a Parquet file. */
-    void write(File file, WriteOptions options) throws IOException {
+    void write(OutputFile file, WriteOptions options) throws IOException {
       try (FileAppender<T> writer = newWriter(file, options, representation, dimension)) {
         for (T embedding : values) {
           writer.add(embedding);
@@ -803,7 +852,7 @@ public class ParquetFloat16EmbeddingBenchmark {
      * consumeValues}, every value is read back before the embeddings are discarded, like a consumer
      * would.
      */
-    void read(File file, ReadOptions options, boolean consumeValues, Blackhole blackhole)
+    void read(InputFile file, ReadOptions options, boolean consumeValues, Blackhole blackhole)
         throws IOException {
       try (CloseableIterable<T> reader = newReader(file, representation, dimension, options)) {
         for (T embedding : reader) {
@@ -821,12 +870,12 @@ public class ParquetFloat16EmbeddingBenchmark {
      * Parquet levels, which checks the length of every embedding, then with the reader of the read
      * benchmark.
      */
-    void verify(File file, ReadOptions options) throws IOException {
+    void verify(InputFile file, ReadOptions options) throws IOException {
       verifyWith(file, options.decodingLevels());
       verifyWith(file, options);
     }
 
-    private void verifyWith(File file, ReadOptions options) throws IOException {
+    private void verifyWith(InputFile file, ReadOptions options) throws IOException {
       int index = 0;
       T previous = null;
       try (CloseableIterable<T> reader = newReader(file, representation, dimension, options)) {

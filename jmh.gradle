@@ -90,4 +90,23 @@ configure(jmhProjects) {
   }
 
   tasks.jmh.finalizedBy tasks.jmhReport
+
+  tasks.named('jmhJar') {
+    // dnsjava, a Hadoop dependency, registers an InetAddress resolver provider, but its class is in
+    // META-INF/versions, which the jar does not enable as a multi-release jar, so the forked JVMs
+    // fail to resolve addresses on Java 18+
+    exclude 'META-INF/services/java.net.spi.InetAddressResolverProvider'
+  }
+}
+
+// FileIO implementations to run the benchmarks against object stores, like Azure Blob Storage
+project(':iceberg-data') {
+  dependencies {
+    jmhRuntimeOnly project(':iceberg-azure')
+    // the Azure SDK with its own, relocated Netty and Jackson, like in deployments, without the
+    // unshaded dependencies that the bundle project exposes
+    jmhRuntimeOnly(project(':iceberg-azure-bundle')) {
+      transitive = false
+    }
+  }
 }
