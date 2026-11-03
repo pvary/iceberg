@@ -27,6 +27,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Properties;
 import java.util.UUID;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.LocalFileSystem;
 import org.apache.iceberg.Files;
@@ -72,6 +74,9 @@ import org.slf4j.LoggerFactory;
  */
 final class BenchmarkFiles implements Closeable {
   private static final Logger LOG = LoggerFactory.getLogger(BenchmarkFiles.class);
+  // the URL of a container, like https://<account>.blob.core.windows.net/<container>/<path>
+  private static final Pattern CONTAINER_URL =
+      Pattern.compile("^https?://([^/?#]+)/([^/?#]+)/?([^?#]*)$");
 
   // null for local files
   private final ResolvingFileIO io;
@@ -99,6 +104,7 @@ final class BenchmarkFiles implements Closeable {
       return new BenchmarkFiles(null, directory.getPath());
     }
 
+    checkNotUrl(location);
     ResolvingFileIO io = new ResolvingFileIO();
     // for HadoopFileIO, which ResolvingFileIO uses for the locations of Hadoop file systems
     Configuration conf = new Configuration();
@@ -110,6 +116,28 @@ final class BenchmarkFiles implements Closeable {
     String directory =
         LocationUtil.stripTrailingSlash(location) + "/" + prefix + "-" + UUID.randomUUID();
     return new BenchmarkFiles(io, directory);
+  }
+
+  /**
+   * Rejects HTTP URLs, like the ones Azure shows for containers, which are not FileIO locations,
+   * and suggests the location of the container.
+   */
+  private static void checkNotUrl(String location) {
+    Matcher url = CONTAINER_URL.matcher(location);
+    if (url.matches()) {
+      throw new IllegalArgumentException(
+          String.format(
+              "Invalid location: %s, use a FileIO location, like wasbs://%s@%s/%s for Azure Blob "
+                  + "Storage, or abfss://<container>@<account>.dfs.core.windows.net/<path> for ADLS "
+                  + "Gen2",
+              location, url.group(2), url.group(1), url.group(3)));
+    } else if (location.startsWith("http://") || location.startsWith("https://")) {
+      throw new IllegalArgumentException(
+          String.format(
+              "Invalid location: %s, use a FileIO location, like "
+                  + "wasbs://<container>@<account>.blob.core.windows.net/<path> for Azure Blob Storage",
+              location));
+    }
   }
 
   private static Map<String, String> loadProperties(String propertiesFile) throws IOException {
