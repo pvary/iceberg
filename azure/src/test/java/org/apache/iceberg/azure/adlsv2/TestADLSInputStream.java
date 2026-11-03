@@ -19,22 +19,37 @@
 package org.apache.iceberg.azure.adlsv2;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.azure.storage.file.datalake.DataLakeFileClient;
 import com.azure.storage.file.datalake.implementation.models.InternalDataLakeFileOpenInputStreamResult;
+import com.azure.storage.file.datalake.models.DataLakeStorageException;
 import com.azure.storage.file.datalake.models.PathProperties;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import org.apache.iceberg.azure.AzureProperties;
+import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.io.FileIOMetricsContext;
+import org.apache.iceberg.io.FileRange;
 import org.apache.iceberg.metrics.CachingMetricsContext;
 import org.apache.iceberg.metrics.Counter;
 import org.apache.iceberg.metrics.MetricsContext;
+import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -44,6 +59,8 @@ import org.mockito.junit.jupiter.MockitoExtension;
 @ExtendWith(MockitoExtension.class)
 class TestADLSInputStream {
   private static final int EOF = -1;
+  private static final String LOCATION =
+      "abfs://container@account.dfs.core.windows.net/path/to/file";
 
   @Mock private DataLakeFileClient fileClient;
   @Mock private InputStream inputStream;
@@ -111,6 +128,96 @@ class TestADLSInputStream {
 
       assertThat(in.read(actual, 0, 10)).isEqualTo(EOF);
       assertThat(in.getPos()).isEqualTo(8);
+    }
+  }
+
+  @Test
+  void testParallelVectoredReadDownloadsChunks() throws Exception {
+    byte[] data = new byte[100];
+    for (int i = 0; i < data.length; i += 1) {
+      data[i] = (byte) i;
+    }
+
+    when(fileClient.readWithResponse(any(), any(), any(), any(), anyBoolean(), any(), any()))
+        .thenAnswer(
+            invocation -> {
+              OutputStream out = invocation.getArgument(0);
+              com.azure.storage.file.datalake.models.FileRange range = invocation.getArgument(1);
+              out.write(data, (int) range.getOffset(), range.getCount().intValue());
+              return null;
+            });
+
+    CachingMetricsContext metrics = new CachingMetricsContext();
+    Counter readBytes = metrics.counter(FileIOMetricsContext.READ_BYTES, MetricsContext.Unit.BYTES);
+    Counter readOperations = metrics.counter(FileIOMetricsContext.READ_OPERATIONS);
+    AzureProperties properties =
+        new AzureProperties(
+            ImmutableMap.of(
+                AzureProperties.ADLS_READ_VECTORED_PARALLELISM, "4",
+                AzureProperties.ADLS_READ_VECTORED_CHUNK_SIZE, "7"));
+
+    try (ADLSInputStream in =
+        new ADLSInputStream(LOCATION, fileClient, (long) data.length, properties, metrics)) {
+      FileRange last = new FileRange(new CompletableFuture<>(), 50, 30);
+      FileRange first = new FileRange(new CompletableFuture<>(), 3, 20);
+      FileRange empty = new FileRange(new CompletableFuture<>(), 90, 0);
+      in.readVectored(Arrays.asList(last, first, empty), ByteBuffer::allocate);
+
+      assertThat(last.byteBuffer().get(10, TimeUnit.SECONDS).array())
+          .isEqualTo(Arrays.copyOfRange(data, 50, 80));
+      assertThat(first.byteBuffer().get(10, TimeUnit.SECONDS).array())
+          .isEqualTo(Arrays.copyOfRange(data, 3, 23));
+      assertThat(empty.byteBuffer().get(10, TimeUnit.SECONDS).remaining()).isZero();
+
+      // 20 bytes in 3 chunks, and 30 bytes in 5 chunks, of up to 7 bytes
+      verify(fileClient, times(8))
+          .readWithResponse(any(), any(), any(), any(), anyBoolean(), any(), any());
+      assertThat(readBytes.value()).isEqualTo(50);
+      assertThat(readOperations.value()).isEqualTo(8);
+    }
+  }
+
+  @Test
+  void testParallelVectoredReadFailsTheRangesOfAMissingFile() throws Exception {
+    DataLakeStorageException notFound = mock(DataLakeStorageException.class);
+    when(notFound.getErrorCode()).thenReturn("PathNotFound");
+    when(fileClient.readWithResponse(any(), any(), any(), any(), anyBoolean(), any(), any()))
+        .thenThrow(notFound);
+    AzureProperties properties =
+        new AzureProperties(ImmutableMap.of(AzureProperties.ADLS_READ_VECTORED_PARALLELISM, "2"));
+
+    try (ADLSInputStream in =
+        new ADLSInputStream(LOCATION, fileClient, 100L, properties, MetricsContext.nullMetrics())) {
+      FileRange range = new FileRange(new CompletableFuture<>(), 0, 10);
+      in.readVectored(List.of(range), ByteBuffer::allocate);
+
+      assertThatThrownBy(() -> range.byteBuffer().get(10, TimeUnit.SECONDS))
+          .isInstanceOf(ExecutionException.class)
+          .hasCauseInstanceOf(NotFoundException.class)
+          .hasMessageContaining("Location does not exist: " + LOCATION);
+    }
+  }
+
+  @Test
+  void testVectoredReadWithoutParallelismReadsRangesWithStreams() throws Exception {
+    byte[] data = new byte[] {1, 2, 3, 4, 5, 6, 7, 8};
+    when(fileClient.openInputStream(any()))
+        .thenReturn(
+            new InternalDataLakeFileOpenInputStreamResult(new ByteArrayInputStream(data), mock()));
+
+    try (ADLSInputStream in =
+        new ADLSInputStream(
+            LOCATION,
+            fileClient,
+            (long) data.length,
+            new AzureProperties(),
+            MetricsContext.nullMetrics())) {
+      FileRange range = new FileRange(new CompletableFuture<>(), 0, data.length);
+      in.readVectored(List.of(range), ByteBuffer::allocate);
+
+      assertThat(range.byteBuffer().get(10, TimeUnit.SECONDS).array()).isEqualTo(data);
+      verify(fileClient, never())
+          .readWithResponse(any(), any(), any(), any(), anyBoolean(), any(), any());
     }
   }
 

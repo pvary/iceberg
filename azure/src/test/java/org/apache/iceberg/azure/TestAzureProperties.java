@@ -72,6 +72,8 @@ public class TestAzureProperties {
                 .put(ADLS_CONNECTION_STRING_PREFIX + "foo", "bar")
                 .put(ADLS_READ_BLOCK_SIZE, "42")
                 .put(ADLS_WRITE_BLOCK_SIZE, "42")
+                .put(AzureProperties.ADLS_READ_VECTORED_PARALLELISM, "8")
+                .put(AzureProperties.ADLS_READ_VECTORED_CHUNK_SIZE, "4096")
                 .put(ADLS_SHARED_KEY_ACCOUNT_NAME, "me")
                 .put(ADLS_SHARED_KEY_ACCOUNT_KEY, "secret")
                 .put(AzureProperties.ADLS_TOKEN_CREDENTIAL_PROVIDER, "provider")
@@ -85,6 +87,35 @@ public class TestAzureProperties {
     assertThat(serdedProps.adlsWriteBlockSize()).isEqualTo(props.adlsWriteBlockSize());
     assertThat(serdedProps.keyVaultUrl()).isEqualTo(props.keyVaultUrl());
     assertThat(serdedProps.keyWrapAlgorithm()).isEqualTo(props.keyWrapAlgorithm());
+    assertThat(serdedProps.adlsReadVectoredParallelism()).isEqualTo(8);
+    assertThat(serdedProps.adlsReadVectoredChunkSize()).isEqualTo(4096);
+  }
+
+  @Test
+  public void testReadVectoredDefaults() {
+    AzureProperties props = new AzureProperties(ImmutableMap.of());
+    assertThat(props.adlsReadVectoredParallelism()).isEqualTo(1);
+    assertThat(props.adlsReadVectoredChunkSize()).isEqualTo(8 * 1024 * 1024);
+
+    AzureProperties emptyProps = new AzureProperties();
+    assertThat(emptyProps.adlsReadVectoredParallelism()).isEqualTo(1);
+    assertThat(emptyProps.adlsReadVectoredChunkSize()).isEqualTo(8 * 1024 * 1024);
+  }
+
+  @Test
+  public void testInvalidReadVectoredProperties() {
+    assertThatIllegalArgumentException()
+        .isThrownBy(
+            () ->
+                new AzureProperties(
+                    ImmutableMap.of(AzureProperties.ADLS_READ_VECTORED_PARALLELISM, "0")))
+        .withMessage("Invalid adls.read.vectored.parallelism: 0, must be positive");
+    assertThatIllegalArgumentException()
+        .isThrownBy(
+            () ->
+                new AzureProperties(
+                    ImmutableMap.of(AzureProperties.ADLS_READ_VECTORED_CHUNK_SIZE, "-1")))
+        .withMessage("Invalid adls.read.vectored.chunk-size-bytes: -1, must be positive");
   }
 
   @Test

@@ -18,6 +18,7 @@
  */
 package org.apache.iceberg.azure.adlsv2;
 
+import com.azure.core.util.Context;
 import com.azure.storage.blob.models.BlobErrorCode;
 import com.azure.storage.blob.models.BlobStorageException;
 import com.azure.storage.file.datalake.DataLakeFileClient;
@@ -25,9 +26,20 @@ import com.azure.storage.file.datalake.models.DataLakeFileOpenInputStreamResult;
 import com.azure.storage.file.datalake.models.DataLakeStorageException;
 import com.azure.storage.file.datalake.models.FileRange;
 import com.azure.storage.file.datalake.options.DataLakeFileInputStreamOptions;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.List;
+import java.util.Queue;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.IntFunction;
 import org.apache.iceberg.azure.AzureProperties;
 import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.io.FileIOMetricsContext;
@@ -40,6 +52,7 @@ import org.apache.iceberg.metrics.MetricsContext.Unit;
 import org.apache.iceberg.relocated.com.google.common.base.Joiner;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.io.ByteStreams;
+import org.apache.iceberg.relocated.com.google.common.util.concurrent.ThreadFactoryBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -48,6 +61,14 @@ class ADLSInputStream extends SeekableInputStream implements RangeReadable {
 
   // max skip size, if skip is larger, then the stream will be reopened at new position
   private static final int SKIP_SIZE = 1024 * 1024;
+
+  // downloads the chunks of vectored reads, the parallelism of every read limits its requests
+  private static final ExecutorService VECTORED_READ_POOL =
+      Executors.newCachedThreadPool(
+          new ThreadFactoryBuilder()
+              .setDaemon(true)
+              .setNameFormat("iceberg-adls-vectored-read-%d")
+              .build());
 
   private final StackTraceElement[] createStack;
   private final String location;
@@ -205,6 +226,88 @@ class ADLSInputStream extends SeekableInputStream implements RangeReadable {
     }
   }
 
+  /**
+   * Reads the ranges with concurrent requests when {@link
+   * AzureProperties#ADLS_READ_VECTORED_PARALLELISM} is greater than 1, otherwise one after the
+   * other.
+   *
+   * <p>A concurrent read splits the ranges into chunks of {@link
+   * AzureProperties#ADLS_READ_VECTORED_CHUNK_SIZE} bytes, and downloads up to parallelism chunks at
+   * the same time, every chunk with a single request into its part of the buffer of its range. The
+   * chunks are downloaded in the order of their offsets, so the first ranges complete first.
+   */
+  @Override
+  public void readVectored(
+      List<org.apache.iceberg.io.FileRange> ranges, IntFunction<ByteBuffer> allocate)
+      throws IOException {
+    int parallelism = azureProperties.adlsReadVectoredParallelism();
+    if (parallelism <= 1) {
+      RangeReadable.super.readVectored(ranges, allocate);
+      return;
+    }
+
+    long chunkSize = azureProperties.adlsReadVectoredChunkSize();
+    Queue<VectoredChunk> chunks = new ConcurrentLinkedQueue<>();
+    for (org.apache.iceberg.io.FileRange range : RangeReadable.sortRanges(ranges)) {
+      ByteBuffer buffer = allocate.apply(range.length());
+      if (range.length() == 0) {
+        range.byteBuffer().complete(buffer);
+        continue;
+      }
+
+      AtomicInteger remaining =
+          new AtomicInteger((int) ((range.length() + chunkSize - 1) / chunkSize));
+      for (long start = 0; start < range.length(); start += chunkSize) {
+        int length = (int) Math.min(chunkSize, range.length() - start);
+        chunks.add(new VectoredChunk(range, buffer, remaining, (int) start, length));
+      }
+    }
+
+    int workers = Math.min(parallelism, chunks.size());
+    for (int worker = 0; worker < workers; worker += 1) {
+      VECTORED_READ_POOL.execute(() -> downloadChunks(chunks));
+    }
+  }
+
+  private void downloadChunks(Queue<VectoredChunk> chunks) {
+    for (VectoredChunk chunk = chunks.poll(); chunk != null; chunk = chunks.poll()) {
+      download(chunk);
+    }
+  }
+
+  private void download(VectoredChunk chunk) {
+    CompletableFuture<ByteBuffer> future = chunk.range.byteBuffer();
+    if (future.isDone()) {
+      // another chunk of the range failed
+      return;
+    }
+
+    try {
+      ByteBuffer target = chunk.buffer.duplicate();
+      target.position(chunk.start);
+      target.limit(chunk.start + chunk.length);
+      ByteBuffer part = target.slice();
+      FileRange range = new FileRange(chunk.range.offset() + chunk.start, (long) chunk.length);
+      fileClient.readWithResponse(
+          new ByteBufferOutputStream(part), range, null, null, false, null, Context.NONE);
+      if (part.hasRemaining()) {
+        throw new EOFException(
+            String.format("Reached the end of %s before the end of range %s", location, range));
+      }
+
+      readBytes.increment(chunk.length);
+      readOperations.increment();
+      if (chunk.remaining.decrementAndGet() == 0) {
+        future.complete(chunk.buffer);
+      }
+    } catch (IOException | RuntimeException e) {
+      future.completeExceptionally(
+          isFileNotFoundException(e)
+              ? new NotFoundException(e, "Location does not exist: %s", location)
+              : e);
+    }
+  }
+
   private DataLakeFileOpenInputStreamResult openRange(FileRange range) {
     try {
       return fileClient.openInputStream(getInputOptions(range));
@@ -250,5 +353,47 @@ class ADLSInputStream extends SeekableInputStream implements RangeReadable {
       return "PathNotFound".equals(dataLakeStorageException.getErrorCode());
     }
     return false;
+  }
+
+  /** A part of a range of a vectored read, which is downloaded with a single request. */
+  private static class VectoredChunk {
+    private final org.apache.iceberg.io.FileRange range;
+    private final ByteBuffer buffer;
+    // the number of chunks of the range that are not downloaded yet
+    private final AtomicInteger remaining;
+    private final int start;
+    private final int length;
+
+    private VectoredChunk(
+        org.apache.iceberg.io.FileRange range,
+        ByteBuffer buffer,
+        AtomicInteger remaining,
+        int start,
+        int length) {
+      this.range = range;
+      this.buffer = buffer;
+      this.remaining = remaining;
+      this.start = start;
+      this.length = length;
+    }
+  }
+
+  /** Writes into a buffer, and fails when the buffer has no room left. */
+  private static class ByteBufferOutputStream extends OutputStream {
+    private final ByteBuffer buffer;
+
+    private ByteBufferOutputStream(ByteBuffer buffer) {
+      this.buffer = buffer;
+    }
+
+    @Override
+    public void write(int value) {
+      buffer.put((byte) value);
+    }
+
+    @Override
+    public void write(byte[] bytes, int offset, int length) {
+      buffer.put(bytes, offset, length);
+    }
   }
 }

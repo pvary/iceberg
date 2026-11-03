@@ -88,11 +88,28 @@ public class AzureProperties implements Serializable {
   /** Controls whether vended credentials should be refreshed or not. Defaults to true. */
   public static final String ADLS_REFRESH_CREDENTIALS_ENABLED = "adls.refresh-credentials-enabled";
 
+  /**
+   * Number of concurrent requests of a vectored read, like Parquet's reads of the column chunks of
+   * row groups. With more than 1, a vectored read splits its ranges into chunks of {@link
+   * #ADLS_READ_VECTORED_CHUNK_SIZE} bytes, and downloads up to this many chunks at the same time.
+   * Defaults to 1, which reads the ranges one after the other, with a stream for each range.
+   */
+  public static final String ADLS_READ_VECTORED_PARALLELISM = "adls.read.vectored.parallelism";
+
+  public static final int ADLS_READ_VECTORED_PARALLELISM_DEFAULT = 1;
+
+  /** Size of the chunks that a vectored read downloads concurrently, in bytes. */
+  public static final String ADLS_READ_VECTORED_CHUNK_SIZE = "adls.read.vectored.chunk-size-bytes";
+
+  public static final int ADLS_READ_VECTORED_CHUNK_SIZE_DEFAULT = 8 * 1024 * 1024;
+
   private Map<String, String> adlsSasTokens = Collections.emptyMap();
   private Map<String, String> adlsConnectionStrings = Collections.emptyMap();
   private Map.Entry<String, String> namedKeyCreds;
   private Integer adlsReadBlockSize;
   private Long adlsWriteBlockSize;
+  private int adlsReadVectoredParallelism = ADLS_READ_VECTORED_PARALLELISM_DEFAULT;
+  private int adlsReadVectoredChunkSize = ADLS_READ_VECTORED_CHUNK_SIZE_DEFAULT;
   private String adlsRefreshCredentialsEndpoint;
   private boolean adlsRefreshCredentialsEnabled;
   private String token;
@@ -124,6 +141,22 @@ public class AzureProperties implements Serializable {
     if (properties.containsKey(ADLS_WRITE_BLOCK_SIZE)) {
       this.adlsWriteBlockSize = Long.parseLong(properties.get(ADLS_WRITE_BLOCK_SIZE));
     }
+    this.adlsReadVectoredParallelism =
+        PropertyUtil.propertyAsInt(
+            properties, ADLS_READ_VECTORED_PARALLELISM, ADLS_READ_VECTORED_PARALLELISM_DEFAULT);
+    Preconditions.checkArgument(
+        adlsReadVectoredParallelism > 0,
+        "Invalid %s: %s, must be positive",
+        ADLS_READ_VECTORED_PARALLELISM,
+        adlsReadVectoredParallelism);
+    this.adlsReadVectoredChunkSize =
+        PropertyUtil.propertyAsInt(
+            properties, ADLS_READ_VECTORED_CHUNK_SIZE, ADLS_READ_VECTORED_CHUNK_SIZE_DEFAULT);
+    Preconditions.checkArgument(
+        adlsReadVectoredChunkSize > 0,
+        "Invalid %s: %s, must be positive",
+        ADLS_READ_VECTORED_CHUNK_SIZE,
+        adlsReadVectoredChunkSize);
     this.adlsRefreshCredentialsEndpoint =
         RESTUtil.resolveEndpoint(
             properties.get(CatalogProperties.URI),
@@ -147,6 +180,14 @@ public class AzureProperties implements Serializable {
 
   public Optional<Long> adlsWriteBlockSize() {
     return Optional.ofNullable(adlsWriteBlockSize);
+  }
+
+  public int adlsReadVectoredParallelism() {
+    return adlsReadVectoredParallelism;
+  }
+
+  public int adlsReadVectoredChunkSize() {
+    return adlsReadVectoredChunkSize;
   }
 
   public Optional<VendedAdlsCredentialProvider> vendedAdlsCredentialProvider() {
