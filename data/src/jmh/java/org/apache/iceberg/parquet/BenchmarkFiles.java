@@ -70,7 +70,12 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Without credentials, {@code ADLSFileIO} authenticates with Azure's {@code
  * DefaultAzureCredential}, for example with the {@code AZURE_CLIENT_ID}, {@code AZURE_TENANT_ID}
- * and {@code AZURE_CLIENT_SECRET} environment variables, or with the login of the Azure CLI.
+ * and {@code AZURE_CLIENT_SECRET} environment variables, with the managed identity of the node, or
+ * with the login of the Azure CLI.
+ *
+ * <p>For remote locations, the setup logs how the files are accessed, and checks that a small file
+ * can be written, read, and deleted, so that a location that does not work fails before the
+ * benchmark, with the causes of the failure (see {@link BenchmarkFilesDiagnostics}).
  */
 final class BenchmarkFiles implements Closeable {
   private static final Logger LOG = LoggerFactory.getLogger(BenchmarkFiles.class);
@@ -105,6 +110,9 @@ final class BenchmarkFiles implements Closeable {
     }
 
     checkNotUrl(location);
+    // before the Azure SDK creates its loggers
+    BenchmarkFilesDiagnostics.configureAzureLogging();
+    Map<String, String> properties = loadProperties(propertiesFile);
     ResolvingFileIO io = new ResolvingFileIO();
     // for HadoopFileIO, which ResolvingFileIO uses for the locations of Hadoop file systems
     Configuration conf = new Configuration();
@@ -112,10 +120,24 @@ final class BenchmarkFiles implements Closeable {
     // does not register the local file system
     conf.setIfUnset("fs.file.impl", LocalFileSystem.class.getName());
     io.setConf(conf);
-    io.initialize(loadProperties(propertiesFile));
+    io.initialize(properties);
     String directory =
         LocationUtil.stripTrailingSlash(location) + "/" + prefix + "-" + UUID.randomUUID();
-    return new BenchmarkFiles(io, directory);
+    BenchmarkFiles files = new BenchmarkFiles(io, directory);
+    try {
+      BenchmarkFilesDiagnostics.logSetup(location, directory, propertiesFile, properties, io);
+      BenchmarkFilesDiagnostics.checkAccess(io, directory);
+    } catch (IOException | RuntimeException e) {
+      try {
+        files.close();
+      } catch (IOException | RuntimeException closeFailure) {
+        e.addSuppressed(closeFailure);
+      }
+
+      throw e;
+    }
+
+    return files;
   }
 
   /**
@@ -212,8 +234,13 @@ final class BenchmarkFiles implements Closeable {
       try {
         // deletes the directory, for file systems that have directories, like ADLS Gen2
         io.deletePrefix(directory);
+        LOG.info("Deleted the benchmark files in {}", directory);
       } catch (RuntimeException e) {
-        LOG.warn("Failed to delete directory: {}", directory, e);
+        LOG.warn(
+            "Failed to delete directory {}: {}",
+            directory,
+            BenchmarkFilesDiagnostics.describe(e),
+            e);
       }
     } finally {
       io.close();
