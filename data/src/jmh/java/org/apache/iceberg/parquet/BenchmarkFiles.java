@@ -33,7 +33,6 @@ import org.apache.iceberg.Files;
 import org.apache.iceberg.io.InputFile;
 import org.apache.iceberg.io.OutputFile;
 import org.apache.iceberg.io.ResolvingFileIO;
-import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableMap;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
@@ -89,16 +88,13 @@ final class BenchmarkFiles implements Closeable {
    *
    * @param location base location of the directory, or empty for a local temporary directory
    * @param propertiesFile path of a local Java properties file with the properties of the {@code
-   *     FileIO} of the location, or empty for none
+   *     FileIO} of the location, or empty for none; ignored for local files, so that local and
+   *     remote locations can be compared in the same run
    * @param prefix prefix of the name of the directory
    */
   static BenchmarkFiles create(String location, String propertiesFile, String prefix)
       throws IOException {
     if (location.isEmpty()) {
-      Preconditions.checkArgument(
-          propertiesFile.isEmpty(),
-          "Invalid FileIO properties for local files, without a location: %s",
-          propertiesFile);
       File directory = java.nio.file.Files.createTempDirectory(prefix).toFile();
       return new BenchmarkFiles(null, directory.getPath());
     }
